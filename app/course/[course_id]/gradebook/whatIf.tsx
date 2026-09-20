@@ -1,3 +1,4 @@
+import { buildGroupedColumns, formatGroupWeight, sortColumnsForDisplay } from "@/lib/gradebookColumnGroups";
 import Markdown from "@/components/ui/markdown";
 import { Tooltip } from "@/components/ui/tooltip";
 import { useClassProfiles } from "@/hooks/useClassProfiles";
@@ -5,6 +6,7 @@ import { useGradebookWhatIfFeatureEnabled } from "@/hooks/useCourseFeatures";
 import {
   useGradebookColumn,
   useGradebookColumns,
+  useGradebookColumnGroups,
   useGradebookColumnStudent,
   useGradebookController,
   useLinkToAssignment,
@@ -440,11 +442,13 @@ function GradebookCard({
 function GroupHeader({
   groupName,
   columnCount,
+  weightLabel,
   isCollapsed,
   onToggle
 }: {
   groupName: string;
   columnCount: number;
+  weightLabel: string | null;
   isCollapsed: boolean;
   onToggle: () => void;
 }) {
@@ -474,6 +478,11 @@ function GroupHeader({
               {columnCount} {pluralize(groupName.charAt(0).toUpperCase() + groupName.slice(1))}...
             </Text>
           </HStack>
+          {weightLabel ? (
+            <Text as="span" fontSize="sm" color="fg.muted">
+              {weightLabel} of the course
+            </Text>
+          ) : null}
         </HStack>
       </button>
     </Card.Root>
@@ -532,104 +541,45 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
   // State for collapsible groups - use base group name as key for stability
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
 
-  // Sort columns by sort order
-  const sortedColumns = useMemo(() => {
-    const cols = [...columns];
-    cols.sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
-    return cols;
-  }, [columns]);
+  const columnGroups = useGradebookColumnGroups();
 
-  // Group gradebook columns by slug prefix, with special handling for assignment sub-groups
-  const groupedColumns = useMemo(() => {
-    const groups: Record<string, { groupName: string; columns: GradebookColumn[] }> = {};
+  // Display order is the group's position in the gradebook, then the column's position inside it.
+  const sortedColumns = useMemo(() => sortColumnsForDisplay(columns, columnGroups), [columns, columnGroups]);
 
-    let currentGroupKey = "";
-    let currentGroupIndex = 0;
-    let lastSortOrder = -1;
+  // Groups come from the gradebook_column_groups table. This file used to carry a character-for-
+  // character copy of the instructor table's grouping memo, including the sort_order contiguity
+  // test. That test was worse here than there: useGradebookColumns filters out columns a student
+  // is not allowed to see, which removed positions from the middle of the sequence and split the
+  // surrounding group in two, so students saw groups that no instructor ever saw.
+  const groupedColumns = useMemo(() => buildGroupedColumns(sortedColumns, columnGroups), [sortedColumns, columnGroups]);
 
-    sortedColumns.forEach((col) => {
-      const slugParts = col.slug.split("-");
-      let baseGroupName: string;
-
-      // Special handling for assignment columns
-      if (slugParts[0] === "assignment" && slugParts.length >= 3) {
-        // For assignment-assignment-*, assignment-lab-*, etc., use "assignment-{type}" as the base group
-        baseGroupName = `${slugParts[0]}-${slugParts[1]}`;
-      } else {
-        // For all other columns, use the first part as the base group
-        baseGroupName = slugParts[0] || "other";
-      }
-
-      // Check if this column is contiguous with the previous one
-      const currentSortOrder = col.sort_order ?? 0;
-      const isContiguous = lastSortOrder === -1 || currentSortOrder === lastSortOrder + 1;
-
-      // If not contiguous or different prefix, start a new group
-      if (!isContiguous || baseGroupName !== currentGroupKey) {
-        currentGroupKey = baseGroupName;
-        currentGroupIndex++;
-      }
-
-      const groupKey = `${baseGroupName}-${currentGroupIndex}`;
-
-      if (!groups[groupKey]) {
-        // Format group name for display
-        let displayName: string;
-        if (baseGroupName === "other") {
-          displayName = "Other";
-        } else if (baseGroupName.startsWith("assignment-")) {
-          // For assignment sub-groups, capitalize and format nicely
-          const subType = baseGroupName.split("-")[1];
-          displayName = `${subType.charAt(0).toUpperCase() + subType.slice(1)}`;
-        } else {
-          displayName = baseGroupName.charAt(0).toUpperCase() + baseGroupName.slice(1);
-        }
-
-        groups[groupKey] = {
-          groupName: displayName,
-          columns: []
-        };
-      }
-
-      groups[groupKey].columns.push(col);
-      lastSortOrder = currentSortOrder;
-    });
-
-    return groups;
-  }, [sortedColumns]);
+  const groupById = useMemo(() => new Map(columnGroups.map((g) => [g.id, g])), [columnGroups]);
 
   // Initialize all groups as collapsed by default, but preserve existing collapsed state
   useEffect(() => {
-    const allGroupKeys = Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1);
-    const baseGroupNames = [...new Set(allGroupKeys.map((key) => groupedColumns[key].groupName))];
+    const collapsibleKeys = Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1);
 
     setCollapsedGroups((prev) => {
-      const newSet = new Set<string>();
-
-      // Preserve existing collapsed state for groups that still exist
-      baseGroupNames.forEach((baseGroupName) => {
-        if (prev.has(baseGroupName)) {
-          newSet.add(baseGroupName);
-        }
-      });
+      const newSet = new Set<string>(collapsibleKeys.filter((key) => prev.has(key)));
 
       // If no groups were previously collapsed, collapse all by default
-      if (newSet.size === 0 && baseGroupNames.length > 0) {
-        baseGroupNames.forEach((baseGroupName) => newSet.add(baseGroupName));
+      if (newSet.size === 0 && collapsibleKeys.length > 0) {
+        collapsibleKeys.forEach((key) => newSet.add(key));
       }
 
       return newSet;
     });
   }, [groupedColumns]);
 
-  // Toggle group collapse/expand using base group name
-  const toggleGroup = useCallback((baseGroupName: string) => {
+  // Keyed on the group's id, not its header text, so two groups that read the same do not toggle
+  // together.
+  const toggleGroup = useCallback((key: string) => {
     setCollapsedGroups((prev) => {
       const newSet = new Set(prev);
-      if (newSet.has(baseGroupName)) {
-        newSet.delete(baseGroupName);
+      if (newSet.has(key)) {
+        newSet.delete(key);
       } else {
-        newSet.add(baseGroupName);
+        newSet.add(key);
       }
       return newSet;
     });
@@ -642,9 +592,7 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
 
   // Collapse all groups
   const collapseAll = useCallback(() => {
-    const allGroupKeys = Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1);
-    const baseGroupNames = [...new Set(allGroupKeys.map((key) => groupedColumns[key].groupName))];
-    setCollapsedGroups(new Set(baseGroupNames));
+    setCollapsedGroups(new Set(Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1)));
   }, [groupedColumns]);
 
   // Build the rendered items
@@ -664,8 +612,10 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
           />
         );
       } else {
-        // Multiple columns - handle collapsed state using base group name
-        const isCollapsed = collapsedGroups.has(group.groupName);
+        const isCollapsed = collapsedGroups.has(groupKey);
+        const weightLabel = formatGroupWeight(
+          groupById.get(group.columns[0].gradebook_column_group_id)?.weight ?? null
+        );
 
         // Add group header
         items.push(
@@ -673,8 +623,9 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
             key={`header-${groupKey}`}
             groupName={group.groupName}
             columnCount={group.columns.length}
+            weightLabel={weightLabel}
             isCollapsed={isCollapsed}
-            onToggle={() => toggleGroup(group.groupName)}
+            onToggle={() => toggleGroup(groupKey)}
           />
         );
 

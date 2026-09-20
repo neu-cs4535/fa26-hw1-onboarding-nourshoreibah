@@ -951,6 +951,15 @@ ALTER TABLE public.gradebook_columns
   ALTER COLUMN gradebook_column_group_id SET NOT NULL,
   ALTER COLUMN position_in_group SET NOT NULL;
 
+-- A sentinel default, so that a caller who does not care where the column lands can leave it out
+-- and the enforce trigger will append it to the end of its group. The column stays NOT NULL: a
+-- BEFORE INSERT trigger runs before NOT NULL is checked, so the trigger always gets to fill it.
+-- The default also makes the generated TypeScript mark the field optional, which is the truth;
+-- without it the types claim every insert must state a position when the database does not
+-- require one.
+ALTER TABLE public.gradebook_columns
+  ALTER COLUMN position_in_group SET DEFAULT -1;
+
 -- The composite reference is the point. Pointing at (id, gradebook_id) rather than at id alone
 -- means a column filed under another gradebook's group is not a bug to be caught in review, it
 -- is a row Postgres refuses to write.

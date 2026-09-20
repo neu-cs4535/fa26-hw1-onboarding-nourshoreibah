@@ -63,6 +63,12 @@ END $$;
 COMMENT ON FUNCTION public.gradebook_column_group_for_slug(bigint, bigint, text) IS
   'Picks the group a newly created column belongs to, by the slug base the group advertises in auto_assign_slug_base.';
 
+-- Callable from the app so that code creating a column can ask where it should go, rather than
+-- reimplementing the routing rule in TypeScript. The rule lives in one place.
+REVOKE ALL ON FUNCTION public.gradebook_column_group_for_slug(bigint, bigint, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.gradebook_column_group_for_slug(bigint, bigint, text)
+  TO authenticated, service_role;
+
 CREATE OR REPLACE FUNCTION public.gradebook_columns_assign_default_group()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -116,14 +122,14 @@ BEGIN
 
   PERFORM pg_advisory_xact_lock(NEW.gradebook_id);
 
-  IF NEW.position_in_group IS NULL THEN
+  -- Negative means "wherever, put it at the end", which is what the column's DEFAULT of -1
+  -- produces when a caller omits the field. An explicit caller never passes a negative.
+  IF NEW.position_in_group IS NULL OR NEW.position_in_group < 0 THEN
     SELECT COALESCE(MAX(position_in_group), -1) + 1
       INTO NEW.position_in_group
       FROM public.gradebook_columns
      WHERE gradebook_column_group_id = NEW.gradebook_column_group_id
        AND id <> NEW.id;
-  ELSIF NEW.position_in_group < 0 THEN
-    NEW.position_in_group := 0;
   END IF;
 
   IF TG_OP = 'INSERT' THEN

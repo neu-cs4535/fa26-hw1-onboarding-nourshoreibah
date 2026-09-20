@@ -99,10 +99,11 @@ export default function StudentPage() {
   const { course_id, student_id } = useParams();
   const router = useRouter();
   const controller = useCourseController();
-  const { client, gradebookColumns, assignmentGroupsWithMembers } = controller;
+  const { client, gradebookColumns, gradebookColumnGroups, assignmentGroupsWithMembers } = controller;
   const { realRole, isViewingAsStudent, enterViewAs } = useClassProfiles();
   const [studentSummary, setStudentSummary] = useState<StudentSummary | null>(null);
   const columns = useTableControllerTableValues(gradebookColumns);
+  const columnGroups = useTableControllerTableValues(gradebookColumnGroups);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const studentProfile = useUserProfile(
     typeof student_id === "string" ? student_id : Array.isArray(student_id) ? student_id[0] : ""
@@ -244,17 +245,31 @@ export default function StudentPage() {
     return byId;
   }, [columns]);
 
+  const groupOrderById = useMemo(() => new Map(columnGroups.map((g) => [g.id, g.sort_order])), [columnGroups]);
+
   const sortedPrivateGrades = useMemo(() => {
     if (!studentSummary) return [] as PrivateGrade[];
     const list = [...studentSummary.grades_private];
+    // Two columns here can sit in different groups, so both levels matter and both need a
+    // sentinel: a column whose group has not loaded sorts to the end rather than to position
+    // zero of an imaginary first group.
+    const rank = (columnId: number): [number, number] => {
+      const col = columnsById.get(columnId);
+      if (!col) return [Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER];
+      return [
+        groupOrderById.get(col.gradebook_column_group_id) ?? Number.MAX_SAFE_INTEGER,
+        col.position_in_group ?? Number.MAX_SAFE_INTEGER
+      ];
+    };
     list.sort((a, b) => {
-      const sa = columnsById.get(a.gradebook_column_id)?.sort_order ?? Number.MAX_SAFE_INTEGER;
-      const sb = columnsById.get(b.gradebook_column_id)?.sort_order ?? Number.MAX_SAFE_INTEGER;
-      if (sa !== sb) return sa - sb;
+      const [ga, pa] = rank(a.gradebook_column_id);
+      const [gb, pb] = rank(b.gradebook_column_id);
+      if (ga !== gb) return ga - gb;
+      if (pa !== pb) return pa - pb;
       return a.gradebook_column_id - b.gradebook_column_id;
     });
     return list;
-  }, [studentSummary, columnsById]);
+  }, [studentSummary, columnsById, groupOrderById]);
 
   const canEnterViewAs =
     realRole === "instructor" &&

@@ -45,6 +45,7 @@ type ChannelType =
  * Tables NOT in this set will skip refetch on reconnection unless enableAutoRefetch flag is explicitly set.
  */
 const TABLES_WITH_UPDATED_AT = new Set<TablesThatHaveAnIDField>([
+  "gradebook_column_groups",
   "notifications",
   "discussion_topics",
   "discussion_topic_followers",
@@ -124,6 +125,7 @@ const TABLE_TO_CHANNEL_MAP: Partial<Record<TablesThatHaveAnIDField, ChannelType[
   discussion_threads: ["staff", "students", "discussion_thread_root"],
   discussion_topics: ["staff", "students"],
   gradebook_columns: ["staff", "students"],
+  gradebook_column_groups: ["staff", "students"],
   gradebook_column_students: ["staff", "user"], // Also to individual users when not private
   help_queue_assignments: ["help_queue"],
   help_queues: ["help_queue"],

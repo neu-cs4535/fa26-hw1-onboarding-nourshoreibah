@@ -626,6 +626,7 @@ export class CourseController {
   private _repositories?: TableController<"repositories">;
   private _notifications?: TableController<"notifications">;
   private _gradebookColumns?: TableController<"gradebook_columns">;
+  private _gradebookColumnGroups?: TableController<"gradebook_column_groups">;
   private _discussionThreadLikes?: TableController<"discussion_thread_likes">;
   private _discussionTopics?: TableController<"discussion_topics">;
   /**
@@ -1124,6 +1125,19 @@ export class CourseController {
       });
     }
     return this._gradebookColumns;
+  }
+
+  /** Column groups for this class, for pages outside the gradebook that need display order. */
+  get gradebookColumnGroups(): TableController<"gradebook_column_groups"> {
+    if (!this._gradebookColumnGroups) {
+      this._gradebookColumnGroups = new TableController({
+        client: this.client,
+        table: "gradebook_column_groups",
+        query: this.client.from("gradebook_column_groups").select("*").eq("class_id", this.courseId),
+        classRealTimeController: this.classRealTimeController
+      });
+    }
+    return this._gradebookColumnGroups;
   }
 
   get discussionThreadLikes(): TableController<"discussion_thread_likes"> {

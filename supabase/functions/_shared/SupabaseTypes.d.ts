@@ -3793,7 +3793,7 @@ export type Database = {
           instructor_only?: boolean;
           max_score?: number | null;
           name: string;
-          position_in_group: number;
+          position_in_group?: number;
           released?: boolean;
           render_expression?: string | null;
           score_expression?: string | null;

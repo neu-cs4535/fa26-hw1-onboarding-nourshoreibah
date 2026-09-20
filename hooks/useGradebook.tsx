@@ -1,5 +1,6 @@
 "use client";
 import { ClassRealTimeController } from "@/lib/ClassRealTimeController";
+import { sortColumnsForDisplay, type GradebookColumnGroup } from "@/lib/gradebookColumnGroups";
 import TableController, {
   fetchPostgrestAllPages,
   type BroadcastMessage,
@@ -133,6 +134,27 @@ export function useGradebookColumns() {
   }, [gradebookController]);
 
   return columns;
+}
+
+/**
+ * The gradebook's column groups, in display order.
+ *
+ * Unlike columns, groups are not filtered for students: a group carries no scores, and a group
+ * whose every column is hidden simply renders no header because nothing is left to put under it.
+ */
+export function useGradebookColumnGroups() {
+  const gradebookController = useGradebookController();
+  const [groups, setGroups] = useState<GradebookColumnGroup[]>(
+    () => gradebookController.gradebook_column_groups.rows ?? []
+  );
+
+  useEffect(() => {
+    return gradebookController.gradebook_column_groups.list((data) => {
+      setGroups([...data].sort((a, b) => a.sort_order - b.sort_order || a.id - b.id));
+    }).unsubscribe;
+  }, [gradebookController]);
+
+  return groups;
 }
 
 /**
@@ -1401,6 +1423,7 @@ export class GradebookController {
   /** Single-row controller for this gradebook (hydrates expression_prefix, etc.). */
   readonly gradebook_row: TableController<"gradebooks">;
   readonly gradebook_columns: TableController<"gradebook_columns">;
+  readonly gradebook_column_groups: TableController<"gradebook_column_groups">;
   readonly table: GradebookCellController;
   readonly assignments_table: TableController<"assignments">;
 
@@ -1444,6 +1467,12 @@ export class GradebookController {
       client,
       table: "gradebook_columns",
       query: client.from("gradebook_columns").select("*").eq("gradebook_id", gradebook_id),
+      classRealTimeController
+    });
+    this.gradebook_column_groups = new TableController({
+      client,
+      table: "gradebook_column_groups",
+      query: client.from("gradebook_column_groups").select("*").eq("gradebook_id", gradebook_id),
       classRealTimeController
     });
     const { unsubscribe: gradebookRowUnsubscribe } = this.gradebook_row.list(() => {
@@ -1978,8 +2007,9 @@ export class GradebookController {
   exportGradebook(courseController: CourseController, options?: { useRenderExpressions?: boolean }) {
     const useRenderExpressions = options?.useRenderExpressions ?? false;
     const roster = courseController.getRosterWithUserInfo().data;
-    const columns = [...this.gradebook_columns.rows];
-    columns.sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
+    // Export follows the on-screen order, which is now two levels: the group's position in the
+    // gradebook, then the column's position inside it.
+    const columns = sortColumnsForDisplay(this.gradebook_columns.rows, this.gradebook_column_groups.rows ?? []);
 
     // Get class sections and lab sections for lookups
     const classSections = courseController.classSections.list().data;
