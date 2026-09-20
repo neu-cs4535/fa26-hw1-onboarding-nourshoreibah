@@ -136,6 +136,10 @@ export function useGradebookColumns() {
   return columns;
 }
 
+function sortGroups(rows: readonly GradebookColumnGroup[]): GradebookColumnGroup[] {
+  return [...rows].sort((a, b) => a.sort_order - b.sort_order || a.id - b.id);
+}
+
 /**
  * The gradebook's column groups, in display order.
  *
@@ -144,14 +148,20 @@ export function useGradebookColumns() {
  */
 export function useGradebookColumnGroups() {
   const gradebookController = useGradebookController();
-  const [groups, setGroups] = useState<GradebookColumnGroup[]>(
-    () => gradebookController.gradebook_column_groups.rows ?? []
+  const [groups, setGroups] = useState<GradebookColumnGroup[]>(() =>
+    sortGroups(gradebookController.gradebook_column_groups.rows ?? [])
   );
 
   useEffect(() => {
-    return gradebookController.gradebook_column_groups.list((data) => {
-      setGroups([...data].sort((a, b) => a.sort_order - b.sort_order || a.id - b.id));
-    }).unsubscribe;
+    // list() hands back the rows it already has and calls the listener only on later changes, so
+    // seed from the return value as well as subscribing. Reading rows at useState time is not
+    // enough: that snapshot is taken when the component first renders, which can be before the
+    // controller's initial fetch has landed.
+    const { data, unsubscribe } = gradebookController.gradebook_column_groups.list((rows) => {
+      setGroups(sortGroups(rows));
+    });
+    setGroups(sortGroups(data));
+    return unsubscribe;
   }, [gradebookController]);
 
   return groups;
@@ -1427,7 +1437,7 @@ export class GradebookController {
   readonly table: GradebookCellController;
   readonly assignments_table: TableController<"assignments">;
 
-  readonly readyPromise: Promise<[void, void, void, void]>;
+  readonly readyPromise: Promise<[void, void, void, void, void]>;
 
   public studentSubmissions: Map<string, Database["public"]["Views"]["active_submissions_for_class"]["Row"][]> =
     new Map();
@@ -1499,6 +1509,10 @@ export class GradebookController {
     this.readyPromise = Promise.all([
       this.gradebook_row.readyPromise,
       this.gradebook_columns.readyPromise,
+      // Groups have to be loaded before anything renders. Columns without their groups sort as
+      // though every group started at position zero, which interleaves them, and the grouped
+      // view comes out empty rather than merely unsorted.
+      this.gradebook_column_groups.readyPromise,
       this.table.readyPromise,
       this.assignments_table.readyPromise
     ]);
