@@ -777,8 +777,12 @@ SELECT unnest(s.column_ids) AS column_id,
        public._cg_ensure_group(
          s.gradebook_id, s.class_id,
          'derived-' || md5(s.dep_set::text),
-         COALESCE(s.common_name,
-                  NULLIF(s.dep_group_name, '') || ' Summary',
+         -- Prefer naming the cohort after what it summarises. The members' common prefix is
+         -- often a near-duplicate of the input group's own header (twelve columns called
+         -- "Skill #N" and three called "Skills ... Expectations" give "Skill" and "Skills"),
+         -- and two headers a reader has to squint at is the thing this change exists to stop.
+         COALESCE(NULLIF(s.dep_group_name, '') || ' Summary',
+                  s.common_name,
                   'Computed'),
          NULL) AS new_group_id
   FROM scattered s
@@ -820,6 +824,16 @@ SELECT gc.id, 'C4 header renamed from the column names instead of the slug'
   JOIN public.gradebook_columns gc ON gc.gradebook_column_group_id = p.group_id
  WHERE p.common_name IS NOT NULL
    AND p.common_name IS DISTINCT FROM p.current_name
+   AND NOT EXISTS (
+     -- Do not rename a group into a header another group in this gradebook already wears.
+     -- Singular and plural count as the same header: twelve columns named "Skill #N" and three
+     -- named "Skills ... Expectations" would otherwise produce "Skill" next to "Skills".
+     SELECT 1 FROM public.gradebook_column_groups o
+      WHERE o.gradebook_id = (SELECT gradebook_id FROM public.gradebook_column_groups WHERE id = p.group_id)
+        AND o.id <> p.group_id
+        AND lower(regexp_replace(btrim(o.name), 's$', ''))
+            = lower(regexp_replace(btrim(p.common_name), 's$', ''))
+   )
 ON CONFLICT (column_id) DO NOTHING;
 
 UPDATE public.gradebook_column_groups g
@@ -836,7 +850,17 @@ UPDATE public.gradebook_column_groups g
   ) p
  WHERE g.id = p.group_id
    AND p.common_name IS NOT NULL
-   AND p.common_name IS DISTINCT FROM p.current_name;
+   AND p.common_name IS DISTINCT FROM p.current_name
+   AND NOT EXISTS (
+     -- Do not rename a group into a header another group in this gradebook already wears.
+     -- Singular and plural count as the same header: twelve columns named "Skill #N" and three
+     -- named "Skills ... Expectations" would otherwise produce "Skill" next to "Skills".
+     SELECT 1 FROM public.gradebook_column_groups o
+      WHERE o.gradebook_id = (SELECT gradebook_id FROM public.gradebook_column_groups WHERE id = p.group_id)
+        AND o.id <> p.group_id
+        AND lower(regexp_replace(btrim(o.name), 's$', ''))
+            = lower(regexp_replace(btrim(p.common_name), 's$', ''))
+   );
 
 -- --- Tidy up ordering after the corrections ---------------------------------------------------
 

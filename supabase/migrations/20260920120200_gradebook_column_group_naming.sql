@@ -85,6 +85,20 @@ BEGIN
 
   v_derived := public.gradebook_column_group_common_name(p_group_id);
 
+  -- Never rename a group into a header another group in the same gradebook already wears. Two
+  -- headers reading the same thing, or near enough that a reader has to compare them letter by
+  -- letter, is the confusion this whole change exists to remove; re-introducing it by deriving a
+  -- name would be a poor trade. Singular and plural count as the same header.
+  IF v_derived IS NOT NULL AND EXISTS (
+    SELECT 1 FROM public.gradebook_column_groups o
+     WHERE o.gradebook_id = v_group.gradebook_id
+       AND o.id <> p_group_id
+       AND lower(regexp_replace(btrim(o.name), 's$', ''))
+           = lower(regexp_replace(btrim(v_derived), 's$', ''))
+  ) THEN
+    RETURN;
+  END IF;
+
   IF v_derived IS NOT NULL AND v_derived IS DISTINCT FROM v_group.name THEN
     UPDATE public.gradebook_column_groups
        SET name = v_derived
