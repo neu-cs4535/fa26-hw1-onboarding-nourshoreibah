@@ -2882,7 +2882,7 @@ export default function GradebookTable() {
         });
       } else {
         // Multiple columns - handle collapsed state using base group name
-        const isCollapsed = collapsedGroups.has(group.groupName);
+        const isCollapsed = collapsedGroups.has(groupKey);
         const columnsToShow = isCollapsed ? [findBestColumnToShow(group.columns)] : group.columns;
 
         columnsToShow.forEach((col) => {
@@ -3316,7 +3316,7 @@ export default function GradebookTable() {
                 left={0}
                 top={0}
                 bottom={0}
-                onClick={() => toggleGroup((cell.column.columnDef.meta as { groupName?: string })?.groupName || "")}
+                onClick={() => toggleGroup((cell.column.columnDef.meta as { groupKey?: string })?.groupKey || "")}
                 aria-label="Expand group"
                 colorPalette="blue"
                 opacity={0.8}
@@ -3673,7 +3673,7 @@ export default function GradebookTable() {
                           minH="36px"
                           bg={seg.isCollapsed ? "bg.warning" : "bg.emphasized"}
                           cursor="pointer"
-                          onClick={() => toggleGroup(seg.groupName)}
+                          onClick={() => toggleGroup(seg.groupKey)}
                           _hover={{ bg: "bg.info" }}
                           borderBottom="1px solid"
                           borderColor="border.emphasized"
@@ -3683,7 +3683,7 @@ export default function GradebookTable() {
                         >
                           <HStack gap={2} justifyContent="center" alignItems="center" py={1}>
                             <Icon
-                              as={collapsedGroups.has(seg.groupName) ? LuChevronRight : LuChevronDown}
+                              as={collapsedGroups.has(seg.groupKey) ? LuChevronRight : LuChevronDown}
                               boxSize={3}
                               color="fg.muted"
                             />
@@ -3692,6 +3692,11 @@ export default function GradebookTable() {
                               {pluralize(seg.groupName.charAt(0).toUpperCase() + seg.groupName.slice(1))}
                               ...
                             </Text>
+                            {formatGroupWeight(seg.groupWeight) ? (
+                              <Text fontSize="xs" color="fg.muted">
+                                {formatGroupWeight(seg.groupWeight)}
+                              </Text>
+                            ) : null}
                           </HStack>
                         </Box>
                       ))}

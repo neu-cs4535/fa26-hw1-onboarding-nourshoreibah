@@ -83,7 +83,6 @@ export default function ImportGradebookColumns() {
       const touchedGradebookColumnIds = new Set<number>();
       // 1. For new columns, insert them and get their IDs
       const newCols = previewData.previewCols.filter((col) => col.isNew);
-      let sortOrder = existingColumnsNotFromHook.length;
       for (const col of newCols) {
         const randomChars = Math.random().toString(36).substring(2, 10);
         const slug =

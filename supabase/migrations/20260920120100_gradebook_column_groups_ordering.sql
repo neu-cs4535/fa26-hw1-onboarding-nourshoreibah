@@ -195,9 +195,12 @@ SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
 BEGIN
+  -- Parked at the far right. Real groups are numbered from 0 upwards as they are created, so a
+  -- default group sitting at 0 would collide with the first of them on the
+  -- (gradebook_id, sort_order) unique. Reorder and delete both renumber it back into range.
   INSERT INTO public.gradebook_column_groups
          (class_id, gradebook_id, name, slug, sort_order, is_default)
-  VALUES (NEW.class_id, NEW.id, 'Ungrouped', 'ungrouped', 0, true)
+  VALUES (NEW.class_id, NEW.id, 'Ungrouped', 'ungrouped', 2147483647, true)
   ON CONFLICT (gradebook_id, slug) DO NOTHING;
   RETURN NEW;
 END $$;
