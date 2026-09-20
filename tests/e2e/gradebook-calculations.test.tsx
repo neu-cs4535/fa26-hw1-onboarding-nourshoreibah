@@ -44,10 +44,20 @@ async function createColumn(opts: {
   max_score: number;
   score_expression?: string | null;
   instructor_only?: boolean;
-  sort_order?: number;
+  position_in_group?: number;
   dependencies?: { gradebook_columns?: number[]; assignments?: number[] } | null;
 }): Promise<number> {
   const gbId = await getGradebookId(opts.class_id);
+  // The database routes the column to a group by its slug, the same way it routes an
+  // assignment-backed one.
+  const { data: groupId, error: groupError } = await supabase.rpc("gradebook_column_group_for_slug", {
+    p_gradebook_id: gbId,
+    p_class_id: opts.class_id,
+    p_slug: opts.slug
+  });
+  if (groupError || typeof groupId !== "number") {
+    throw new Error(`Failed to resolve a column group for ${opts.slug}: ${groupError?.message}`);
+  }
   const { data, error } = await supabase
     .from("gradebook_columns")
     .insert({
@@ -58,7 +68,8 @@ async function createColumn(opts: {
       max_score: opts.max_score,
       score_expression: opts.score_expression ?? null,
       instructor_only: opts.instructor_only ?? false,
-      sort_order: opts.sort_order ?? 0,
+      position_in_group: opts.position_in_group,
+      gradebook_column_group_id: groupId,
       released: false,
       dependencies: opts.dependencies ?? null
     })
@@ -392,15 +403,15 @@ test.describe("Fixture 1: Weighted Average Course", () => {
     instructor = users[2];
 
     // Create manual leaf columns
-    await createColumn({ class_id: course.id, name: "HW 1", slug: "leaf-hw1", max_score: 100, sort_order: 1 });
-    await createColumn({ class_id: course.id, name: "HW 2", slug: "leaf-hw2", max_score: 100, sort_order: 2 });
-    await createColumn({ class_id: course.id, name: "HW 3", slug: "leaf-hw3", max_score: 100, sort_order: 3 });
+    await createColumn({ class_id: course.id, name: "HW 1", slug: "leaf-hw1", max_score: 100, position_in_group: 1 });
+    await createColumn({ class_id: course.id, name: "HW 2", slug: "leaf-hw2", max_score: 100, position_in_group: 2 });
+    await createColumn({ class_id: course.id, name: "HW 3", slug: "leaf-hw3", max_score: 100, position_in_group: 3 });
     await createColumn({
       class_id: course.id,
       name: "Participation",
       slug: "leaf-part",
       max_score: 100,
-      sort_order: 4
+      position_in_group: 4
     });
 
     // Wait for student rows to be created by the insert trigger
@@ -419,7 +430,7 @@ test.describe("Fixture 1: Weighted Average Course", () => {
       max_score: 100,
       score_expression: "mean(gradebook_columns('leaf-hw*'))",
       dependencies: { gradebook_columns: hwDepIds },
-      sort_order: 5
+      position_in_group: 5
     });
 
     const finalDepIds = await resolveColumnIds(course.id, ["calc-hw-avg", "leaf-part"]);
@@ -430,7 +441,7 @@ test.describe("Fixture 1: Weighted Average Course", () => {
       max_score: 100,
       score_expression: "gradebook_columns('calc-hw-avg') * 0.7 + gradebook_columns('leaf-part') * 0.3",
       dependencies: { gradebook_columns: finalDepIds },
-      sort_order: 6
+      position_in_group: 6
     });
 
     // Wait for calculated column rows
@@ -805,28 +816,28 @@ test.describe("Fixture 2: Topic Max Score", () => {
       name: "Quiz: Classes Attempt 1",
       slug: "classes-1",
       max_score: 4,
-      sort_order: 1
+      position_in_group: 1
     });
     await createColumn({
       class_id: course.id,
       name: "Quiz: Classes Attempt 2",
       slug: "classes-2",
       max_score: 4,
-      sort_order: 2
+      position_in_group: 2
     });
     await createColumn({
       class_id: course.id,
       name: "Quiz: Lists Attempt 1",
       slug: "lists-1",
       max_score: 4,
-      sort_order: 3
+      position_in_group: 3
     });
     await createColumn({
       class_id: course.id,
       name: "Quiz: Lists Attempt 2",
       slug: "lists-2",
       max_score: 4,
-      sort_order: 4
+      position_in_group: 4
     });
 
     for (const student of [alice, bob]) {
@@ -844,7 +855,7 @@ test.describe("Fixture 2: Topic Max Score", () => {
       max_score: 4,
       score_expression: "max(gradebook_columns('classes*'))",
       dependencies: { gradebook_columns: classesDepIds },
-      sort_order: 5
+      position_in_group: 5
     });
 
     const listsDepIds = await resolveColumnIds(course.id, ["lists-*"]);
@@ -855,7 +866,7 @@ test.describe("Fixture 2: Topic Max Score", () => {
       max_score: 4,
       score_expression: "max(gradebook_columns('lists*'))",
       dependencies: { gradebook_columns: listsDepIds },
-      sort_order: 6
+      position_in_group: 6
     });
 
     const topicDepIds = await resolveColumnIds(course.id, ["topic-classes", "topic-lists"]);
@@ -866,7 +877,7 @@ test.describe("Fixture 2: Topic Max Score", () => {
       max_score: 4,
       score_expression: "(gradebook_columns('topic-classes').score + gradebook_columns('topic-lists').score) / 2",
       dependencies: { gradebook_columns: topicDepIds },
-      sort_order: 7
+      position_in_group: 7
     });
 
     for (const student of [alice, bob]) {
@@ -1175,12 +1186,18 @@ test.describe("Fixture 3: Countif Lab + Skill Tracking", () => {
 
     // Lab columns
     for (let i = 1; i <= 4; i++) {
-      await createColumn({ class_id: course.id, name: `Lab ${i}`, slug: `lab-${i}`, max_score: 1, sort_order: i });
+      await createColumn({
+        class_id: course.id,
+        name: `Lab ${i}`,
+        slug: `lab-${i}`,
+        max_score: 1,
+        position_in_group: i
+      });
     }
     // Skill columns
-    await createColumn({ class_id: course.id, name: "Skill A", slug: "skill-a", max_score: 2, sort_order: 5 });
-    await createColumn({ class_id: course.id, name: "Skill B", slug: "skill-b", max_score: 2, sort_order: 6 });
-    await createColumn({ class_id: course.id, name: "Skill C", slug: "skill-c", max_score: 2, sort_order: 7 });
+    await createColumn({ class_id: course.id, name: "Skill A", slug: "skill-a", max_score: 2, position_in_group: 5 });
+    await createColumn({ class_id: course.id, name: "Skill B", slug: "skill-b", max_score: 2, position_in_group: 6 });
+    await createColumn({ class_id: course.id, name: "Skill C", slug: "skill-c", max_score: 2, position_in_group: 7 });
 
     for (const student of [alice, bob]) {
       for (const slug of ["lab-1", "lab-2", "lab-3", "lab-4", "skill-a", "skill-b", "skill-c"]) {
@@ -1197,7 +1214,7 @@ test.describe("Fixture 3: Countif Lab + Skill Tracking", () => {
       max_score: 4,
       score_expression: "countif(gradebook_columns('lab*'), f(x) = x.score > 0)",
       dependencies: { gradebook_columns: labDepIds },
-      sort_order: 8
+      position_in_group: 8
     });
 
     const skillDepIds = await resolveColumnIds(course.id, ["skill-*"]);
@@ -1208,7 +1225,7 @@ test.describe("Fixture 3: Countif Lab + Skill Tracking", () => {
       max_score: 3,
       score_expression: "countif(gradebook_columns('skill*'), f(x) = x.score == 2)",
       dependencies: { gradebook_columns: skillDepIds },
-      sort_order: 9
+      position_in_group: 9
     });
     await createColumn({
       class_id: course.id,
@@ -1217,7 +1234,7 @@ test.describe("Fixture 3: Countif Lab + Skill Tracking", () => {
       max_score: 3,
       score_expression: "countif(gradebook_columns('skill*'), f(x) = x.score == 1)",
       dependencies: { gradebook_columns: skillDepIds },
-      sort_order: 10
+      position_in_group: 10
     });
 
     for (const student of [alice, bob]) {
@@ -1489,7 +1506,13 @@ test.describe("Fixture 4: Instructor-Only Columns", () => {
     bob = users[1];
     instructor = users[2];
 
-    await createColumn({ class_id: course.id, name: "HW Total", slug: "hw-total", max_score: 100, sort_order: 1 });
+    await createColumn({
+      class_id: course.id,
+      name: "HW Total",
+      slug: "hw-total",
+      max_score: 100,
+      position_in_group: 1
+    });
 
     curveAdjColId = await createColumn({
       class_id: course.id,
@@ -1497,7 +1520,7 @@ test.describe("Fixture 4: Instructor-Only Columns", () => {
       slug: "curve-adj",
       max_score: 20,
       instructor_only: true,
-      sort_order: 2
+      position_in_group: 2
     });
 
     for (const student of [alice, bob]) {
@@ -1514,7 +1537,7 @@ test.describe("Fixture 4: Instructor-Only Columns", () => {
       score_expression: "gradebook_columns('hw-total').score + gradebook_columns('curve-adj').score",
       instructor_only: true,
       dependencies: { gradebook_columns: depIds },
-      sort_order: 3
+      position_in_group: 3
     });
 
     for (const student of [alice, bob]) {
@@ -1793,8 +1816,8 @@ test.describe("Fixture 5: Score Override Precedence", () => {
     bob = users[1];
     instructor = users[2];
 
-    await createColumn({ class_id: course.id, name: "Quiz 1", slug: "quiz-1", max_score: 100, sort_order: 1 });
-    await createColumn({ class_id: course.id, name: "Quiz 2", slug: "quiz-2", max_score: 100, sort_order: 2 });
+    await createColumn({ class_id: course.id, name: "Quiz 1", slug: "quiz-1", max_score: 100, position_in_group: 1 });
+    await createColumn({ class_id: course.id, name: "Quiz 2", slug: "quiz-2", max_score: 100, position_in_group: 2 });
 
     for (const student of [alice, bob]) {
       await waitForRow(course.id, "quiz-1", student.private_profile_id, true);
@@ -1809,7 +1832,7 @@ test.describe("Fixture 5: Score Override Precedence", () => {
       max_score: 100,
       score_expression: "mean(gradebook_columns('quiz*'))",
       dependencies: { gradebook_columns: quizDepIds },
-      sort_order: 3
+      position_in_group: 3
     });
 
     const bonusDepIds = await resolveColumnIds(course.id, ["calc-quiz-avg"]);
@@ -1820,7 +1843,7 @@ test.describe("Fixture 5: Score Override Precedence", () => {
       max_score: 100,
       score_expression: "gradebook_columns('calc-quiz-avg') * 0.9 + 10",
       dependencies: { gradebook_columns: bonusDepIds },
-      sort_order: 4
+      position_in_group: 4
     });
 
     for (const student of [alice, bob]) {

@@ -406,13 +406,25 @@ async function createGradebookColumn(
   gradebookId: number,
   column: PlannedGradebookColumn
 ): Promise<void> {
+  // The database decides which group this belongs to, by the same rule the assignment trigger
+  // uses, rather than this script carrying its own copy of it.
+  const { data: groupId, error: groupError } = await supabase.rpc("gradebook_column_group_for_slug", {
+    p_gradebook_id: gradebookId,
+    p_class_id: classId,
+    p_slug: column.slug
+  });
+  if (groupError || typeof groupId !== "number") {
+    throw new Error(`Failed to resolve a column group for "${column.slug}": ${groupError?.message}`);
+  }
+
   const { error } = await supabase.from("gradebook_columns").insert({
     class_id: classId,
     gradebook_id: gradebookId,
     name: column.title,
     slug: column.slug,
     max_score: column.points,
-    released: false
+    released: false,
+    gradebook_column_group_id: groupId
   });
 
   if (error) {

@@ -635,11 +635,17 @@ test.describe("Gradebook Page - Comprehensive", () => {
       throw new Error("Failed to resolve gradebook id for instructor-only column test");
     }
     const ioSlug = "e2e-instructor-only-participation-mirror";
+    const { data: ioGroupId } = await supabase.rpc("gradebook_column_group_for_slug", {
+      p_gradebook_id: gbRow.id,
+      p_class_id: course.id,
+      p_slug: ioSlug
+    });
     const { data: ioCol, error: ioColErr } = await supabase
       .from("gradebook_columns")
       .insert({
         class_id: course.id,
         gradebook_id: gbRow.id,
+        gradebook_column_group_id: ioGroupId as number,
         name: "E2E Instructor Only",
         slug: ioSlug,
         max_score: 100,
@@ -647,7 +653,7 @@ test.describe("Gradebook Page - Comprehensive", () => {
         dependencies: null,
         released: false,
         instructor_only: true,
-        sort_order: 9999
+        position_in_group: 9999
       })
       .select("id")
       .single();
@@ -1469,7 +1475,9 @@ test.describe("Gradebook Page - CSV Render Export", () => {
         score_expression: "gradebook_columns('final-grade')",
         render_expression: "letter(score)",
         dependencies: { gradebook_columns: [finalGradebookColumn.id] },
-        sort_order: (finalGradebookColumn.sort_order ?? 0) + 1
+        // Immediately to the right of the column it renders, inside that column's group.
+        gradebook_column_group_id: finalGradebookColumn.gradebook_column_group_id,
+        position_in_group: finalGradebookColumn.position_in_group + 1
       })
       .select("*")
       .single();
@@ -1635,17 +1643,31 @@ test.describe("Gradebook column reorder (issue #531)", () => {
     await region.getByRole("button", { name: "Expand all groups" }).click();
     await waitForVirtualizerIdle(page);
 
-    const colName = "Test Assignment 4 (Group)";
-
-    // Get sort_order from DB before move
-    const { data: colBefore } = await supabase
+    // Move Left swaps a column with its neighbour *inside its group*; at the edge of a group it
+    // moves the whole group instead. So the target has to be a column with a left neighbour in
+    // the same group, and picking one by name would depend on how the fixture happened to lay
+    // out. Derive it: take a group with at least two columns and use its second one.
+    const { data: allCols } = await supabase
       .from("gradebook_columns")
-      .select("id, sort_order")
-      .eq("class_id", reorderCourse.id)
-      .eq("name", colName)
-      .single();
-    expect(colBefore).toBeTruthy();
-    const sortOrderBefore = colBefore!.sort_order!;
+      .select("id, name, position_in_group, gradebook_column_group_id")
+      .eq("class_id", reorderCourse.id);
+    expect(allCols).toBeTruthy();
+
+    const byGroup = new Map<number, typeof allCols>();
+    for (const c of allCols!) {
+      const list = byGroup.get(c.gradebook_column_group_id) ?? [];
+      list.push(c);
+      byGroup.set(c.gradebook_column_group_id, list);
+    }
+    const populated = [...byGroup.values()]
+      .filter((list) => list!.length >= 2)
+      .map((list) => [...list!].sort((a, b) => a.position_in_group - b.position_in_group))[0];
+    expect(populated, "the reorder fixture needs a group with at least two columns in it").toBeTruthy();
+
+    const colBefore = populated![1];
+    const colName = colBefore.name;
+    const positionBefore = colBefore.position_in_group;
+    const groupBefore = colBefore.gradebook_column_group_id;
 
     const headerCell = region
       .locator("thead tr")
@@ -1656,14 +1678,16 @@ test.describe("Gradebook column reorder (issue #531)", () => {
     await page.getByRole("menuitem", { name: "Move Left", exact: true }).click();
     await expect(page.getByText("Column moved left").first()).toBeAttached();
 
-    // Verify sort_order decreased by 1 in the database
+    // Position decreased by one, and — the part that matters — the column is still in the group
+    // it started in. A reorder that moved a column between groups would be a bug, not a reorder.
     await expect(async () => {
       const { data: colAfterLeft } = await supabase
         .from("gradebook_columns")
-        .select("sort_order")
-        .eq("id", colBefore!.id)
+        .select("position_in_group, gradebook_column_group_id")
+        .eq("id", colBefore.id)
         .single();
-      expect(colAfterLeft!.sort_order).toBe(sortOrderBefore - 1);
+      expect(colAfterLeft!.position_in_group).toBe(positionBefore - 1);
+      expect(colAfterLeft!.gradebook_column_group_id).toBe(groupBefore);
     }).toPass({ timeout: 5000 });
 
     await waitForVirtualizerIdle(page);
@@ -1698,10 +1722,10 @@ test.describe("Gradebook column reorder (issue #531)", () => {
       // as a no-op).
       const { data: colNow } = await supabase
         .from("gradebook_columns")
-        .select("sort_order")
-        .eq("id", colBefore!.id)
+        .select("position_in_group")
+        .eq("id", colBefore.id)
         .single();
-      if (colNow?.sort_order === sortOrderBefore) {
+      if (colNow?.position_in_group === positionBefore) {
         return;
       }
       await waitForVirtualizerIdle(page);
@@ -1721,21 +1745,22 @@ test.describe("Gradebook column reorder (issue #531)", () => {
       await expect(async () => {
         const { data: colAfterClick } = await supabase
           .from("gradebook_columns")
-          .select("sort_order")
-          .eq("id", colBefore!.id)
+          .select("position_in_group")
+          .eq("id", colBefore.id)
           .single();
-        expect(colAfterClick?.sort_order).toBe(sortOrderBefore);
+        expect(colAfterClick?.position_in_group).toBe(positionBefore);
       }).toPass({ timeout: 5_000, intervals: [250, 500] });
     }).toPass({ timeout: 30_000, intervals: [250, 500, 1000] });
 
-    // Verify sort_order restored to original
+    // Back where it started, still in the same group.
     await expect(async () => {
       const { data: colRestored } = await supabase
         .from("gradebook_columns")
-        .select("sort_order")
-        .eq("id", colBefore!.id)
+        .select("position_in_group, gradebook_column_group_id")
+        .eq("id", colBefore.id)
         .single();
-      expect(colRestored!.sort_order).toBe(sortOrderBefore);
+      expect(colRestored!.position_in_group).toBe(positionBefore);
+      expect(colRestored!.gradebook_column_group_id).toBe(groupBefore);
     }).toPass({ timeout: 5000 });
   });
 });

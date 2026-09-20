@@ -4918,8 +4918,7 @@ export class DatabaseSeeder {
         name: `Skill #${i}`,
         description: `Score for skill #${i}`,
         slug: `skill-${i}`,
-        max_score: 2,
-        sort_order: 1 + i
+        max_score: 2
       });
 
       // Update render expression separately
@@ -4939,8 +4938,7 @@ export class DatabaseSeeder {
       slug: "meets-expectations",
       score_expression: 'countif(gradebook_columns("skill-*"), f(x) = x.score == 2)',
       max_score: 12,
-      dependencies: { gradebook_columns: skillColumnIds },
-      sort_order: 14
+      dependencies: { gradebook_columns: skillColumnIds }
     });
 
     await this.createGradebookColumn({
@@ -4950,8 +4948,7 @@ export class DatabaseSeeder {
       slug: "approaching-expectations",
       score_expression: 'countif(gradebook_columns("skill-*"), f(x) = x.score == 1)',
       max_score: 12,
-      dependencies: { gradebook_columns: skillColumnIds },
-      sort_order: 15
+      dependencies: { gradebook_columns: skillColumnIds }
     });
 
     await this.createGradebookColumn({
@@ -4961,8 +4958,7 @@ export class DatabaseSeeder {
       slug: "does-not-meet-expectations",
       score_expression: 'countif(gradebook_columns("skill-*"), f(x) = not x.is_missing and x.score == 0)',
       max_score: 12,
-      dependencies: { gradebook_columns: skillColumnIds },
-      sort_order: 16
+      dependencies: { gradebook_columns: skillColumnIds }
     });
 
     await this.createGradebookColumn({
@@ -4981,8 +4977,7 @@ export class DatabaseSeeder {
       // Non-lab assignments are slugged `assignment-assignment-*` by the assignment→column trigger.
       slug: "average.hw",
       score_expression: "mean(gradebook_columns('assignment-assignment-*'))",
-      max_score: 100,
-      sort_order: 17
+      max_score: 100
     });
 
     // Drop-lowest: average the lab scores after dropping the lowest two.
@@ -4992,8 +4987,7 @@ export class DatabaseSeeder {
       description: "Average of lab scores after dropping each student's two lowest labs",
       slug: "labs-drop-lowest",
       score_expression: "mean(drop_lowest(gradebook_columns('assignment-lab-*'), 2))",
-      max_score: 100,
-      sort_order: 18
+      max_score: 100
     });
 
     // Instructor-only column: hidden from students (e.g. a manual curve adjustment).
@@ -5003,8 +4997,7 @@ export class DatabaseSeeder {
       description: "Manual curve points applied by the instructor. Hidden from students until released.",
       slug: "curve-adjustment",
       max_score: 5,
-      instructor_only: true,
-      sort_order: 19
+      instructor_only: true
     });
 
     // A released, frozen snapshot column students can already see.
@@ -5015,8 +5008,7 @@ export class DatabaseSeeder {
       slug: "midterm-standing",
       score_expression: 'countif(gradebook_columns("skill-*"), f(x) = x.score == 2)',
       max_score: 12,
-      released: true,
-      sort_order: 20
+      released: true
     });
     await supabase
       .from("gradebook_columns")
@@ -5051,8 +5043,7 @@ CriteriaMinus, -3;
 true, 0])
 final = max(letter + mod, 0)
 final;`,
-      max_score: 100,
-      sort_order: 34
+      max_score: 100
     });
 
     // Update render expression separately
@@ -5196,7 +5187,7 @@ final;`,
     });
     scoreTargets.push({ id: finalProject.id, averageScore: 83, maxScore: 100 });
 
-    await this.renumberGradebookColumnsForGrouping(class_id);
+    await this.orderColumnGroupsForReading(class_id);
     await this.deleteGradebookColumnBySlug(class_id, "quiz-3");
 
     // Quiz scores are set after the delete so quiz-3 never gets any (the delete path has to
@@ -5221,88 +5212,102 @@ final;`,
       });
     }
 
+    // Printed as the groups now read, left to right, so a run's output can be compared against a
+    // screenshot of the gradebook without having to decode a list of integers.
     const { data: layout } = await supabase
-      .from("gradebook_columns")
-      .select("slug, sort_order")
+      .from("gradebook_column_groups")
+      .select("name, sort_order, gradebook_columns(slug, position_in_group)")
       .eq("class_id", class_id)
       .order("sort_order", { ascending: true });
-    console.log(`   ✓ Column-group fixtures in place. Layout (${layout?.length ?? 0} columns):`);
-    console.log(`     ${(layout ?? []).map((c) => `${c.sort_order}:${c.slug}`).join(" ")}`);
+    const totalColumns = (layout ?? []).reduce((n, g) => n + (g.gradebook_columns?.length ?? 0), 0);
+    console.log(
+      `   ✓ Column-group fixtures in place. Layout (${totalColumns} columns in ${layout?.length ?? 0} groups):`
+    );
+    for (const group of layout ?? []) {
+      const slugs = [...(group.gradebook_columns ?? [])]
+        .sort((a, b) => a.position_in_group - b.position_in_group)
+        .map((c) => c.slug)
+        .join(" ");
+      console.log(`     ${group.sort_order}. ${group.name}: ${slugs || "(empty)"}`);
+    }
   }
 
   /**
-   * Give every column in a class a deterministic sort_order, grouping each slug family together.
+   * Put the column groups in the order an instructor would read them.
    *
-   * Assignment-backed columns arrive in whatever order createAssignments made them, which
-   * interleaves labs and homework, and the columns the grading-scheme helpers add carry
-   * hard-coded sort_orders that collide with those. The result is stable within one run and
-   * different across runs, which is no use to an assignment graded on a backfill.
+   * This used to renumber every column in the gradebook, because grouping was inferred from a
+   * slug prefix plus a contiguity check, so the only way to make a family look like a family was
+   * to pack its members into consecutive global positions. Columns belong to a group by foreign
+   * key now, so nothing has to be packed: the families list below says which groups exist and in
+   * what order they should read, which is one integer per group.
    *
-   * The rewrite goes one column at a time rather than in bulk because
-   * gradebook_columns_enforce_sort_order treats an UPDATE of sort_order as a move: it opens a
-   * slot at the target and closes the gap left behind. Placing columns in order means each one
-   * moves down into a position below every column already placed, which is the case that
-   * trigger handles correctly.
+   * Anything unmatched, a code-walk column for instance, sorts after the named families and keeps
+   * its existing relative order.
    */
-  private async renumberGradebookColumnsForGrouping(class_id: number) {
-    const { data: columns, error } = await supabase
-      .from("gradebook_columns")
-      .select("id, slug, sort_order")
+  private async orderColumnGroupsForReading(class_id: number) {
+    const { data: groups, error } = await supabase
+      .from("gradebook_column_groups")
+      .select("id, slug, name, sort_order, is_default, auto_assign_slug_base")
       .eq("class_id", class_id);
-    if (error || !columns) {
-      throw new Error(`Failed to read gradebook columns for class ${class_id}: ${error?.message}`);
+    if (error || !groups) {
+      throw new Error(`Failed to read gradebook column groups for class ${class_id}: ${error?.message}`);
     }
 
-    // Families in the left-to-right order an instructor would read them. Anything unmatched
-    // (code-walk columns, say) sorts to the end and keeps its relative order.
-    const families: Array<(slug: string) => boolean> = [
-      (slug) => /^assignment-lab-\d+$/.test(slug),
-      (slug) => /^assignment-assignment-\d+$/.test(slug),
-      (slug) => /^exam-\d+$/.test(slug),
-      (slug) => /^quiz-\d+$/.test(slug),
-      (slug) => /^skill-\d+$/.test(slug),
-      (slug) => ["meets-expectations", "approaching-expectations", "does-not-meet-expectations"].includes(slug),
-      (slug) => ["average.hw", "labs-drop-lowest", "total-labs"].includes(slug),
-      (slug) => ["curve-adjustment", "midterm-standing"].includes(slug),
-      (slug) => slug === "attendance",
-      (slug) => /^ai-usage-log-\d+$/.test(slug),
-      (slug) => slug === "assignment-final",
-      (slug) => slug === "final"
+    // Matched against the group's auto-assign base, which is the slug family it accepts, falling
+    // back to the group's own slug for groups that do not auto-receive anything.
+    const families: Array<(base: string) => boolean> = [
+      (base) => base === "assignment-lab",
+      (base) => base === "assignment-group",
+      (base) => base === "assignment-individual",
+      (base) => base === "exam",
+      (base) => base === "quiz",
+      (base) => base === "skill",
+      (base) => base.startsWith("derived-"),
+      (base) => ["average.hw", "labs", "total"].includes(base),
+      (base) => ["curve", "midterm"].includes(base),
+      (base) => base === "attendance",
+      (base) => base === "ai",
+      (base) => base === "final"
     ];
-    const familyRank = (slug: string) => {
-      const index = families.findIndex((matches) => matches(slug));
+    const familyRank = (base: string) => {
+      const index = families.findIndex((matches) => matches(base));
       return index === -1 ? families.length : index;
     };
-    const trailingNumber = (slug: string) => {
-      const match = slug.match(/-(\d+)$/);
-      return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
-    };
 
-    const ordered = [...columns].sort((a, b) => {
-      const slugA = a.slug ?? "";
-      const slugB = b.slug ?? "";
-      return (
-        familyRank(slugA) - familyRank(slugB) ||
-        trailingNumber(slugA) - trailingNumber(slugB) ||
-        (a.sort_order ?? 0) - (b.sort_order ?? 0) ||
-        a.id - b.id
-      );
-    });
+    const ordered = [...groups]
+      .filter((g) => !g.is_default)
+      .sort((a, b) => {
+        const baseA = a.auto_assign_slug_base ?? a.slug;
+        const baseB = b.auto_assign_slug_base ?? b.slug;
+        return familyRank(baseA) - familyRank(baseB) || (a.sort_order ?? 0) - (b.sort_order ?? 0) || a.id - b.id;
+      });
 
-    for (const [position, column] of ordered.entries()) {
-      const { data: current } = await supabase
-        .from("gradebook_columns")
-        .select("sort_order")
-        .eq("id", column.id)
-        .single();
-      if (current?.sort_order === position) continue;
-      const { error: updateError } = await supabase
-        .from("gradebook_columns")
-        .update({ sort_order: position })
-        .eq("id", column.id);
-      if (updateError) {
-        throw new Error(`Failed to set sort_order ${position} on column ${column.slug}: ${updateError.message}`);
+    // Two passes, offset well past the end, because (gradebook_id, sort_order) is unique and a
+    // straight renumber would collide with a group that has not moved yet.
+    const offset = groups.length + 1000;
+    for (const [position, group] of ordered.entries()) {
+      const { error: parkError } = await supabase
+        .from("gradebook_column_groups")
+        .update({ sort_order: offset + position })
+        .eq("id", group.id);
+      if (parkError) {
+        throw new Error(`Failed to park group ${group.name}: ${parkError.message}`);
       }
+    }
+    for (const [position, group] of ordered.entries()) {
+      const { error: setError } = await supabase
+        .from("gradebook_column_groups")
+        .update({ sort_order: position })
+        .eq("id", group.id);
+      if (setError) {
+        throw new Error(`Failed to set sort_order ${position} on group ${group.name}: ${setError.message}`);
+      }
+    }
+
+    // The default group sits to the right of everything else.
+    const defaultGroup = groups.find((g) => g.is_default);
+    if (defaultGroup) {
+      await supabase.from("gradebook_column_groups").update({ sort_order: ordered.length }).eq("id", defaultGroup.id);
     }
   }
 
@@ -5362,8 +5367,7 @@ final;`,
           name: columnName,
           description: `Manual grading column ${i}`,
           slug: columnSlug,
-          max_score: 100,
-          sort_order: 1000 + i
+          max_score: 100
         });
 
         manualGradedColumns.push(manualColumn);
@@ -5377,8 +5381,7 @@ final;`,
       name: "Participation",
       description: "Overall class participation score",
       slug: "participation",
-      max_score: 100,
-      sort_order: 1000
+      max_score: 100
     });
 
     await this.createGradebookColumn({
@@ -5387,8 +5390,7 @@ final;`,
       description: "Average of all homework assignments",
       slug: "average.hw",
       score_expression: "mean(gradebook_columns('assignment-assignment-*'))",
-      max_score: 100,
-      sort_order: 2
+      max_score: 100
     });
 
     await this.createGradebookColumn({
@@ -5397,8 +5399,7 @@ final;`,
       description: "Average of all lab assignments",
       slug: "average-lab-assignments",
       score_expression: "mean(gradebook_columns('assignment-lab-*'))",
-      max_score: 100,
-      sort_order: 3
+      max_score: 100
     });
 
     await this.createGradebookColumn({
@@ -5408,8 +5409,7 @@ final;`,
       slug: "final-grade",
       score_expression:
         "gradebook_columns('average-lab-assignments') * 0.4 + gradebook_columns('average-assignments') * 0.5 + gradebook_columns('participation') * 0.1",
-      max_score: 100,
-      sort_order: 999
+      max_score: 100
     });
 
     console.log(
@@ -5462,7 +5462,7 @@ final;`,
     dependencies,
     released = false,
     instructor_only = false,
-    sort_order
+    gradebook_column_group_id
   }: {
     class_id: number;
     name: string;
@@ -5473,7 +5473,9 @@ final;`,
     dependencies?: { assignments?: number[]; gradebook_columns?: number[] };
     released?: boolean;
     instructor_only?: boolean;
-    sort_order?: number;
+    /** Omit to let the database route the column by its slug, which is what it does for
+     *  assignment-backed columns too. */
+    gradebook_column_group_id?: number;
   }): Promise<{
     id: number;
     name: string;
@@ -5492,6 +5494,21 @@ final;`,
       throw new Error(`Failed to find gradebook for class ${class_id}: ${gradebookError?.message}`);
     }
 
+    // Where the column goes is the database's decision, taken by the same routing function the
+    // assignment trigger uses. The seed does not get its own copy of the rule.
+    let groupId = gradebook_column_group_id;
+    if (groupId === undefined) {
+      const { data: resolved, error: resolveError } = await supabase.rpc("gradebook_column_group_for_slug", {
+        p_gradebook_id: gradebook.id,
+        p_class_id: class_id,
+        p_slug: slug
+      });
+      if (resolveError || typeof resolved !== "number") {
+        throw new Error(`Failed to resolve a column group for ${slug}: ${resolveError?.message}`);
+      }
+      groupId = resolved;
+    }
+
     // Create the gradebook column
     const { data: column, error: columnError } = await this.rateLimitManager.trackAndLimit("gradebook_columns", () =>
       supabase
@@ -5507,7 +5524,7 @@ final;`,
           dependencies,
           released,
           instructor_only,
-          sort_order
+          gradebook_column_group_id: groupId
         })
         .select("id, name, slug, max_score, score_expression")
     );

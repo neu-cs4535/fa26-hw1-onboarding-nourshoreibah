@@ -4,6 +4,7 @@ import { toaster } from "@/components/ui/toaster";
 import { useClassProfiles } from "@/hooks/useClassProfiles";
 import { useCourseController, useStudentRoster } from "@/hooks/useCourseController";
 import { getScore, useGradebookColumns, useGradebookController } from "@/hooks/useGradebook";
+import { resolveGroupForSlug } from "@/lib/gradebookColumnGroups";
 import { createClient } from "@/utils/supabase/client";
 import { GradebookColumn, UserProfile } from "@/utils/supabase/DatabaseTypes";
 import { Box, Button, Dialog, HStack, Icon, NativeSelect, Portal, Table, Text, VStack } from "@chakra-ui/react";
@@ -108,7 +109,14 @@ export default function ImportGradebookColumns() {
           description: null,
           dependencies: null,
           slug,
-          sort_order: sortOrder++
+          // Imported columns are routed by their slug like any other, so a CSV of `quiz-*`
+          // columns lands in the quiz group rather than in a block of its own.
+          gradebook_column_group_id: await resolveGroupForSlug(
+            supabase,
+            gradebookController.gradebook_id,
+            gradebookController.class_id,
+            slug
+          )
         };
         const { data, error } = await supabase.from("gradebook_columns").insert(insertObj).select().single();
         if (error) {

@@ -2723,7 +2723,7 @@ export async function createAssignmentsAndGradebookColumns({
     slug: string;
     max_score: number | null;
     score_expression: string | null;
-    sort_order: number | null;
+    position_in_group: number | null;
   }>;
   manualGradedColumns: Array<{
     id: number;
@@ -2731,7 +2731,7 @@ export async function createAssignmentsAndGradebookColumns({
     slug: string;
     max_score: number | null;
     score_expression: string | null;
-    sort_order: number | null;
+    position_in_group: number | null;
   }>;
 }> {
   // Import required dependencies
@@ -2836,7 +2836,8 @@ export async function createAssignmentsAndGradebookColumns({
     dependencies,
     released = false,
     instructor_only = false,
-    sort_order,
+    position_in_group,
+    gradebook_column_group_id,
     rateLimitManager
   }: {
     class_id: number;
@@ -2848,7 +2849,10 @@ export async function createAssignmentsAndGradebookColumns({
     dependencies?: { assignments?: number[]; gradebook_columns?: number[] };
     released?: boolean;
     instructor_only?: boolean;
-    sort_order?: number;
+    /** Position inside the column's group. Omit to append. */
+    position_in_group?: number;
+    /** Omit to let the database route the column by its slug. */
+    gradebook_column_group_id?: number;
     rateLimitManager?: RateLimitManager;
   }): Promise<{
     id: number;
@@ -2856,7 +2860,8 @@ export async function createAssignmentsAndGradebookColumns({
     slug: string;
     max_score: number | null;
     score_expression: string | null;
-    sort_order: number | null;
+    position_in_group: number;
+    gradebook_column_group_id: number;
   }> {
     // Get the gradebook for this class
     const { data: gradebookList, error: gradebookError } = await (
@@ -2898,6 +2903,21 @@ export async function createAssignmentsAndGradebookColumns({
       }
     }
 
+    // Which group the column belongs to is the database's call, using the same routing function
+    // the assignment trigger uses.
+    let resolvedGroupId = gradebook_column_group_id;
+    if (resolvedGroupId === undefined) {
+      const { data: routed, error: routeError } = await supabase.rpc("gradebook_column_group_for_slug", {
+        p_gradebook_id: gradebook.id,
+        p_class_id: class_id,
+        p_slug: slug
+      });
+      if (routeError || typeof routed !== "number") {
+        throw new Error(`Failed to resolve a column group for ${slug}: ${routeError?.message}`);
+      }
+      resolvedGroupId = routed;
+    }
+
     // Create the gradebook column
     const { data: columnList, error: columnError } = await (
       rateLimitManager ?? DEFAULT_RATE_LIMIT_MANAGER
@@ -2915,9 +2935,10 @@ export async function createAssignmentsAndGradebookColumns({
           dependencies: finalDependencies ? finalDependencies : null,
           released,
           instructor_only: score_expression ? instructor_only : false,
-          sort_order
+          position_in_group,
+          gradebook_column_group_id: resolvedGroupId
         })
-        .select("id, name, slug, max_score, score_expression, sort_order")
+        .select("id, name, slug, max_score, score_expression, position_in_group, gradebook_column_group_id")
     );
 
     if (columnError) {
@@ -3419,7 +3440,7 @@ export async function createAssignmentsAndGradebookColumns({
       description: `Manual grading column ${i}`,
       slug: columnSlug,
       max_score: 100,
-      sort_order: 1000 + i,
+      position_in_group: 1000 + i,
       rateLimitManager: DEFAULT_RATE_LIMIT_MANAGER
     });
 
@@ -3434,7 +3455,7 @@ export async function createAssignmentsAndGradebookColumns({
     description: "Overall class participation score",
     slug: "participation",
     max_score: 100,
-    sort_order: 1000,
+    position_in_group: 1000,
     rateLimitManager: DEFAULT_RATE_LIMIT_MANAGER
   });
 
@@ -3445,7 +3466,7 @@ export async function createAssignmentsAndGradebookColumns({
     slug: "average-assignments",
     score_expression: "mean(gradebook_columns('assignment-assignment-*'))",
     max_score: 100,
-    sort_order: numAssignments,
+    position_in_group: numAssignments,
     rateLimitManager: DEFAULT_RATE_LIMIT_MANAGER
   });
 
@@ -3467,7 +3488,7 @@ export async function createAssignmentsAndGradebookColumns({
     slug: "final-grade",
     score_expression: "gradebook_columns('average-assignments') * 0.9 + gradebook_columns('participation') * 0.1",
     max_score: 100,
-    sort_order: 999,
+    position_in_group: 999,
     rateLimitManager: DEFAULT_RATE_LIMIT_MANAGER
   });
 
