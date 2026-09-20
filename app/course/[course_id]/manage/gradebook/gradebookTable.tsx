@@ -30,11 +30,13 @@ import {
 import { GradebookWhatIfProvider } from "@/hooks/useGradebookWhatIf";
 import {
   buildColumnGroupKeyMap,
+  planColumnDrag,
   resolveGroupForSlug,
   buildGroupedColumns,
   formatGroupWeight,
   sortColumnsForDisplay
 } from "@/lib/gradebookColumnGroups";
+import ManageColumnGroupsDialog from "./manageColumnGroups";
 import { createClient } from "@/utils/supabase/client";
 import {
   ClassSection,
@@ -55,6 +57,7 @@ import {
   Input,
   Link,
   List,
+  NativeSelect,
   Portal,
   Spinner,
   Table,
@@ -385,6 +388,7 @@ function effectiveInstructorOnlyForSubmit(scoreExpression: string | undefined, i
 }
 
 function AddColumnDialog() {
+  const addDialogGroups = useGradebookColumnGroups();
   const [isOpen, setIsOpen] = useState(false);
   const gradebookController = useGradebookController();
 
@@ -554,6 +558,24 @@ function AddColumnDialog() {
                       {errors.description.message as string}
                     </Text>
                   )}
+                </Box>
+                <Box>
+                  <Label htmlFor="gradebookColumnGroupId">Group</Label>
+                  <NativeSelect.Root size="sm">
+                    <NativeSelect.Field id="gradebookColumnGroupId" {...register("gradebookColumnGroupId")}>
+                      <option value="">Choose automatically from the slug</option>
+                      {addDialogGroups.map((g) => (
+                        <option key={g.id} value={String(g.id)}>
+                          {g.name}
+                        </option>
+                      ))}
+                    </NativeSelect.Field>
+                    <NativeSelect.Indicator />
+                  </NativeSelect.Root>
+                  <Text fontSize="xs" color="fg.muted" mt={1}>
+                    Left blank, the column joins whichever group already takes columns with this slug, or starts a new
+                    one.
+                  </Text>
                 </Box>
                 <Box>
                   <Label htmlFor="maxScore">
@@ -3046,15 +3068,60 @@ export default function GradebookTable() {
         merged.every((id, i) => id === fullGradeColumnIdsOrdered[i]);
       if (unchanged) return;
 
+      const plan = planColumnDrag({
+        orderedColumnIds: merged,
+        groupIdByColumnId: new Map(gradebookColumns.map((c) => [c.id, c.gradebook_column_group_id])),
+        currentGroupOrder: columnGroups.filter((g) => !g.is_default).map((g) => g.id),
+        draggedColumnId
+      });
+      if (plan.kind === "noop") return;
+
       setIsReorderingColumns(true);
       try {
-        const { error } = await supabaseForGradebook.rpc("gradebook_columns_reorder", {
-          p_ordered_column_ids: merged
-        });
-        if (error) throw error;
-        await gradebookController.gradebook_columns.refetchAll();
+        // One retry on a version conflict. Losing a drag because someone else was also editing
+        // the layout is worth one silent retry; losing it twice is worth telling the user about.
+        const apply = async (): Promise<void> => {
+          const version = gradebookController.gradebook_row.rows[0]?.column_layout_version ?? 0;
+          if (plan.kind === "reorder-groups") {
+            const { error } = await supabaseForGradebook.rpc("gradebook_column_groups_reorder", {
+              p_gradebook_id: gradebookController.gradebook_id,
+              p_ordered_group_ids: plan.orderedGroupIds,
+              p_expected_version: version
+            });
+            if (error) throw error;
+          } else if (plan.kind === "reorder-in-group") {
+            const { error } = await supabaseForGradebook.rpc("gradebook_columns_reorder_in_group", {
+              p_group_id: plan.groupId,
+              p_ordered_column_ids: plan.orderedColumnIds,
+              p_expected_version: version
+            });
+            if (error) throw error;
+          } else {
+            const { error } = await supabaseForGradebook.rpc("gradebook_column_assign_group", {
+              p_column_id: plan.columnId,
+              p_group_id: plan.groupId,
+              p_position: plan.position
+            });
+            if (error) throw error;
+          }
+        };
+
+        try {
+          await apply();
+        } catch (e) {
+          const conflict = typeof e === "object" && e !== null && "code" in e && e.code === "40001";
+          if (!conflict) throw e;
+          await gradebookController.gradebook_row.refetchAll();
+          await apply();
+        }
+
+        await Promise.all([
+          gradebookController.gradebook_columns.refetchAll(),
+          gradebookController.gradebook_column_groups.refetchAll(),
+          gradebookController.gradebook_row.refetchAll()
+        ]);
         toaster.create({
-          title: "Columns reordered",
+          title: plan.kind === "move-column" ? "Column moved to another group" : "Columns reordered",
           type: "success"
         });
       } catch (e) {
@@ -3067,7 +3134,15 @@ export default function GradebookTable() {
         setIsReorderingColumns(false);
       }
     },
-    [isInstructor, visibleReorderUnits, fullGradeColumnIdsOrdered, supabaseForGradebook, gradebookController]
+    [
+      isInstructor,
+      visibleReorderUnits,
+      fullGradeColumnIdsOrdered,
+      supabaseForGradebook,
+      gradebookController,
+      gradebookColumns,
+      columnGroups
+    ]
   );
 
   const dragOverlayColumn = useMemo(() => {
@@ -3939,6 +4014,7 @@ export default function GradebookTable() {
               </PopoverContent>
             </PopoverRoot>
             <ImportGradebookColumn />
+            <ManageColumnGroupsDialog />
             <AddColumnDialog />
           </HStack>
         )}

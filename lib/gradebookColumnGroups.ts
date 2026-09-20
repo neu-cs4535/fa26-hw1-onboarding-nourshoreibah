@@ -151,3 +151,83 @@ export async function resolveGroupForSlug(
   }
   return data;
 }
+
+/**
+ * What a drag turned out to mean.
+ *
+ * With one flat sequence a drag was always the same operation: write a new integer. With two
+ * levels it is one of three different things, and they are genuinely different — reordering
+ * cannot change what a column belongs to, so moving a column into another group has to be a
+ * separate call that says so.
+ */
+export type ColumnDragPlan =
+  | { kind: "noop" }
+  | { kind: "reorder-groups"; orderedGroupIds: number[] }
+  | { kind: "reorder-in-group"; groupId: number; orderedColumnIds: number[] }
+  | { kind: "move-column"; columnId: number; groupId: number; position: number };
+
+/**
+ * Work out which of the three a drag was, from the flat order the table produced.
+ *
+ * The table hands back one list of every column in its new left-to-right order, because that is
+ * what a horizontal drag naturally produces. Reading the two levels back out of it:
+ *
+ *   - if every group's columns are still consecutive and no column changed group, the drag either
+ *     moved a whole group past another one, or moved a column inside its own group;
+ *   - if the dragged column has landed among another group's columns, it is a move between
+ *     groups, and the caller will have to say so explicitly.
+ */
+export function planColumnDrag(args: {
+  orderedColumnIds: readonly number[];
+  groupIdByColumnId: ReadonlyMap<number, number>;
+  currentGroupOrder: readonly number[];
+  draggedColumnId: number;
+}): ColumnDragPlan {
+  const { orderedColumnIds, groupIdByColumnId, currentGroupOrder, draggedColumnId } = args;
+
+  const groupSequence = orderedColumnIds
+    .map((id) => groupIdByColumnId.get(id))
+    .filter((g): g is number => g !== undefined);
+
+  // First appearance of each group, which is the group order the drag implies.
+  const impliedGroupOrder: number[] = [];
+  for (const g of groupSequence) {
+    if (!impliedGroupOrder.includes(g)) impliedGroupOrder.push(g);
+  }
+
+  // A group is "broken" when its columns are not consecutive, which only happens when something
+  // from another group has landed in the middle of it.
+  const broken = impliedGroupOrder.filter((g) => {
+    const first = groupSequence.indexOf(g);
+    const last = groupSequence.lastIndexOf(g);
+    for (let i = first; i <= last; i++) {
+      if (groupSequence[i] !== g) return true;
+    }
+    return false;
+  });
+
+  if (broken.length > 0) {
+    // The dragged column is the one that moved, so the group it has landed inside is whichever
+    // group surrounds its new index.
+    const index = orderedColumnIds.indexOf(draggedColumnId);
+    const neighbour = groupSequence[index - 1] ?? groupSequence[index + 1] ?? groupIdByColumnId.get(draggedColumnId);
+    if (neighbour === undefined) return { kind: "noop" };
+    const position = orderedColumnIds.slice(0, index).filter((id) => groupIdByColumnId.get(id) === neighbour).length;
+    return { kind: "move-column", columnId: draggedColumnId, groupId: neighbour, position };
+  }
+
+  const groupOrderChanged =
+    impliedGroupOrder.length !== currentGroupOrder.length ||
+    impliedGroupOrder.some((g, i) => g !== currentGroupOrder[i]);
+  if (groupOrderChanged) {
+    return { kind: "reorder-groups", orderedGroupIds: impliedGroupOrder };
+  }
+
+  const groupId = groupIdByColumnId.get(draggedColumnId);
+  if (groupId === undefined) return { kind: "noop" };
+  return {
+    kind: "reorder-in-group",
+    groupId,
+    orderedColumnIds: orderedColumnIds.filter((id) => groupIdByColumnId.get(id) === groupId)
+  };
+}
