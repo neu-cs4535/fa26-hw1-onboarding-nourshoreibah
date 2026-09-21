@@ -877,6 +877,12 @@ test.describe("Gradebook Page - Comprehensive", () => {
     await expect(page.getByRole("button", { name: "Import Columns" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Add Column" })).toBeVisible();
 
+    // Expand first. Assignment columns are grouped by what kind of assignment they are now, so
+    // several columns these assertions read sit inside a group, and groups start collapsed.
+    const gradebookRegion = page.getByRole("region", { name: "Instructor Gradebook Table" });
+    await gradebookRegion.getByRole("button", { name: "Expand all groups" }).click();
+    await waitForVirtualizerIdle(page);
+
     // Check that Student 1's assignments are showing grades, final grade is calculated
     await expect(async () => {
       const after = await readCellNumber(page, students[0].private_profile_name, "Test Assignment 1 (Group)");
@@ -896,9 +902,8 @@ test.describe("Gradebook Page - Comprehensive", () => {
       expect(after).toBe(30);
     }).toPass({ timeout: 60_000 });
 
-    // Expand assignment groups and scroll right to reveal virtualized columns
-    const tableRegion = page.getByRole("region", { name: "Instructor Gradebook Table" });
-    await tableRegion.getByRole("button", { name: "Expand all groups" }).click();
+    // Scroll right to reveal virtualized columns. Already expanded above.
+    const tableRegion = gradebookRegion;
     await waitForVirtualizerIdle(page);
     await tableRegion.evaluate((el) => {
       el.scrollLeft = el.scrollWidth;
@@ -1696,6 +1701,11 @@ test.describe("Gradebook column reorder (issue #531)", () => {
     // virtualizer and its previous DOM node may be unmounted. Re-query the
     // headerCell from the live thead, then scroll it into view (webkit and
     // chromium both occasionally render the column off-screen).
+    // Re-expand: the move refetches, which re-runs the collapse-by-default effect, and a column
+    // inside a collapsed group is not in the DOM to be scrolled to.
+    await region.getByRole("button", { name: "Expand all groups" }).click();
+    await waitForVirtualizerIdle(page);
+
     const headerCellAfterMove = region
       .locator("thead tr")
       .filter({ has: page.locator("th").filter({ hasText: "Student Name" }) })
