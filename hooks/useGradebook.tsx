@@ -1,6 +1,7 @@
 "use client";
 import { ClassRealTimeController } from "@/lib/ClassRealTimeController";
 import { sortColumnsForDisplay, type GradebookColumnGroup } from "@/lib/gradebookColumnGroups";
+import { buildWeightedTotalSpecs } from "@/supabase/functions/gradebook-column-recalculate/expression/weightedTotal";
 import TableController, {
   fetchPostgrestAllPages,
   type BroadcastMessage,
@@ -1865,6 +1866,25 @@ export class GradebookController {
     exprNode.traverse((node: MathNode) => {
       if (node.type === "FunctionNode") {
         const functionName = (node as FunctionNode).fn.name;
+        if (functionName === "weighted_total") {
+          // weighted_total() names no slugs, so the slug-matching branch below sees nothing and
+          // the column would be recorded as depending on nothing at all. That is not harmless:
+          // the recalculator decides both what to rerun and in what order from this list, so the
+          // total would go stale the moment a grade changed and could be computed before the
+          // columns it weighs. Record every column the call actually reads, which is exactly the
+          // set the calculation itself uses, minus this column so it does not look like a cycle.
+          for (const spec of buildWeightedTotalSpecs({
+            columns: this.gradebook_columns.rows,
+            groups: this.gradebook_column_groups.rows ?? [],
+            excludeColumnId: column_id
+          })) {
+            if (!("gradebook_columns" in dependencies)) {
+              dependencies["gradebook_columns"] = new Set();
+            }
+            dependencies["gradebook_columns"].add(spec.column_id);
+          }
+          return;
+        }
         if (functionName in availableDependencies) {
           const args = (node as FunctionNode).args;
           const argType = args[0].type;

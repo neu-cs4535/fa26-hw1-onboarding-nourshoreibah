@@ -22,6 +22,11 @@ import {
   pushMissingDependenciesToContext,
   type IncompleteValuesAdvice
 } from "@/supabase/functions/gradebook-column-recalculate/expression/shared";
+import {
+  buildWeightedTotalSpecs,
+  makeWeightedTotalSource,
+  type WeightedTotalSource
+} from "@/supabase/functions/gradebook-column-recalculate/expression/weightedTotal";
 import type { AssignmentNode, FunctionNode, MathNode } from "mathjs";
 import { minimatch } from "minimatch";
 import type { GradebookController } from "@/hooks/useGradebook";
@@ -630,7 +635,7 @@ export function evaluateForStudent(params: {
   // Build a fresh math instance to avoid polluting the shared one used by
   // render expressions.
   const localMath: MathJSInstance = math.create(math.all, {});
-  buildImports(localMath, gradebookController, studentId);
+  const imports = buildImports(localMath, gradebookController, studentId);
 
   const parsed = localMath.parse(trimmed);
   // For every context-aware function call, prepend the `context` symbol to
@@ -670,8 +675,20 @@ export function evaluateForStudent(params: {
     scope: {
       setTag: () => {},
       addBreadcrumb: () => {}
-    }
+    },
+    weighted_total_source: undefined as WeightedTotalSource | undefined
   };
+  // The column being previewed is excluded, so a draft expression cannot weigh the value the
+  // column already holds. Values come from the same gradebook_columns import the rest of the
+  // preview uses, which keeps the builder's number equal to the recalculator's.
+  context.weighted_total_source = makeWeightedTotalSource(
+    buildWeightedTotalSpecs({
+      columns: gradebookController.columns as ColumnWithEntries[],
+      groups: gradebookController.gradebook_column_groups.rows ?? [],
+      excludeColumnId: editingColumnId
+    }),
+    (slug) => (imports["gradebook_columns"] as unknown as (ctx: unknown, slug: string) => unknown)(context, slug)
+  );
 
   /** mathjs `ResultSet` shape is `{ entries: unknown[] }`, but plain Arrays
    * also own an `entries()` method via `Array.prototype`, so we must guard

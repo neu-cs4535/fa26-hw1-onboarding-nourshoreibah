@@ -8,9 +8,15 @@ import {
   ContextFunctions,
   ExprDependencyInstance,
   ExpressionContext,
+  getGradebookColumnsDependencySource,
   setRowOverrideValues,
   clearRowOverrideValues
 } from "./expression/DependencySource.ts";
+import {
+  buildWeightedTotalSpecs,
+  makeWeightedTotalSource,
+  type WeightedTotalSpec
+} from "./expression/weightedTotal.ts";
 import * as Sentry from "npm:@sentry/deno@10.10.0";
 
 const DEBUG_LOG = Boolean(Deno.env.get("DEBUG_GRADEBOOK_CALCULATION")) || false;
@@ -362,6 +368,65 @@ function topoSortColumns(columns: ColumnWithPrefix[]): number[] {
   return order;
 }
 
+/**
+ * Load the column-group weights that `weighted_total()` weighs, for a whole gradebook.
+ *
+ * Groups live in their own table, so the columns query alone cannot say what a group is worth.
+ * Callers drop the column they are evaluating from the returned list; see
+ * `buildWeightedTotalSpecs`.
+ */
+async function loadWeightedTotalSpecs(
+  adminSupabase: SupabaseClient<Database>,
+  scope: Sentry.Scope,
+  gradebook_id: number,
+  columns: readonly { id: number; slug: string; gradebook_column_group_id: number; weight: number | null }[]
+): Promise<WeightedTotalSpec[]> {
+  const { data: groups, error } = await adminSupabase
+    .from("gradebook_column_groups")
+    .select("id, weight")
+    .eq("gradebook_id", gradebook_id);
+  if (error || !groups) {
+    Sentry.captureException(error ?? new Error("Missing gradebook column groups"), scope);
+    return [];
+  }
+  return buildWeightedTotalSpecs({ columns, groups });
+}
+
+/**
+ * Point `weighted_total()` at the same value lookup the rest of the expression uses, minus the
+ * column doing the asking.
+ *
+ * Returns an attacher rather than doing the work inline because a batch calls it once per student
+ * per column, and the per-column spec list depends only on the column. Reading values through the
+ * dependency source is what keeps `weighted_total()` in step with `gradebook_columns(...)` in the
+ * same row: score overrides, values computed earlier in the row, and the private and
+ * instructor-only rules all resolve in one place.
+ */
+function createWeightedTotalAttacher({
+  math,
+  class_id,
+  specs
+}: {
+  math: ReturnType<typeof create>;
+  class_id: number;
+  specs: readonly WeightedTotalSpec[];
+}): (context: ExpressionContext, columnId: number) => void {
+  const source = getGradebookColumnsDependencySource(math);
+  const specsByColumnId = new Map<number, WeightedTotalSpec[]>();
+
+  return (context, columnId) => {
+    if (!source) return;
+    let specsForColumn = specsByColumnId.get(columnId);
+    if (!specsForColumn) {
+      specsForColumn = specs.filter((spec) => spec.column_id !== columnId);
+      specsByColumnId.set(columnId, specsForColumn);
+    }
+    context.weighted_total_source = makeWeightedTotalSource(specsForColumn, (slug) =>
+      source.execute({ function_name: "gradebook_columns", context, key: slug, class_id })
+    );
+  };
+}
+
 export async function processGradebookRowCalculation(
   adminSupabase: SupabaseClient<Database>,
   scope: Sentry.Scope,
@@ -396,7 +461,10 @@ export async function processGradebookRowCalculation(
     .from("gradebook_columns")
     .select("*, gradebooks!gradebook_columns_gradebook_id_fkey(expression_prefix)")
     .eq("gradebook_id", gradebook_id)
-    .order("sort_order", { ascending: true });
+    // gradebook_columns.sort_order was replaced by per-group ordering. Ordering on the dropped
+    // column made PostgREST reject the request, which failed every recalculation for the gradebook.
+    .order("gradebook_column_group_id", { ascending: true })
+    .order("position_in_group", { ascending: true });
   if (colsError || !columns) {
     Sentry.captureException(colsError || new Error("Missing columns"), scope);
     return [];
@@ -408,6 +476,7 @@ export async function processGradebookRowCalculation(
     columnById.set(c.id, c);
     columnBySlug.set(c.slug, c);
   }
+  const weightedTotalSpecs = await loadWeightedTotalSpecs(adminSupabase, scope, gradebook_id, columns);
 
   // Prepare math and dependency sources
   const math = create(all, {});
@@ -429,6 +498,7 @@ export async function processGradebookRowCalculation(
   }
 
   await addDependencySourceFunctions({ math, keys, supabase: adminSupabase });
+  const attachWeightedTotalSource = createWeightedTotalAttacher({ math, class_id, specs: weightedTotalSpecs });
 
   // Compile expressions
   const compiledById = new Map<number, EvalFunction>();
@@ -527,6 +597,7 @@ export async function processGradebookRowCalculation(
       scope,
       class_id
     };
+    attachWeightedTotalSource(context, columnId);
 
     let nextScore: number | null = null;
     let isMissing = false;
@@ -716,11 +787,16 @@ export async function processGradebookRowsCalculation(
     .from("gradebook_columns")
     .select("*, gradebooks!gradebook_columns_gradebook_id_fkey(expression_prefix)")
     .eq("gradebook_id", gradebook_id)
-    .order("sort_order", { ascending: true });
+    // gradebook_columns.sort_order was replaced by per-group ordering. Ordering on the dropped
+    // column made PostgREST reject the request, which failed every recalculation for the gradebook.
+    .order("gradebook_column_group_id", { ascending: true })
+    .order("position_in_group", { ascending: true });
   if (colsError || !columns) {
     Sentry.captureException(colsError || new Error("Missing columns"), scope);
     return new Map();
   }
+
+  const weightedTotalSpecs = await loadWeightedTotalSpecs(adminSupabase, scope, gradebook_id, columns);
 
   const math = create(all, {});
   // Build keys for all students in this batch
@@ -741,6 +817,7 @@ export async function processGradebookRowsCalculation(
     console.log(`Working on ${keys.length} keys for gradebook ${gradebook_id}`);
   }
   await addDependencySourceFunctions({ math, keys, supabase: adminSupabase });
+  const attachWeightedTotalSource = createWeightedTotalAttacher({ math, class_id, specs: weightedTotalSpecs });
 
   const compiledById = new Map<number, EvalFunction>();
   for (const c of columns as unknown as ColumnWithPrefix[]) {
@@ -843,6 +920,7 @@ export async function processGradebookRowsCalculation(
         scope,
         class_id
       };
+      attachWeightedTotalSource(context, columnId);
 
       let nextScore: number | null = null;
       let isMissing = false;

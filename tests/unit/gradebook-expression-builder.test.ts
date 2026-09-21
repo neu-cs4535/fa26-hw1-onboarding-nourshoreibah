@@ -30,6 +30,15 @@ type ColumnSpec = {
   max_score: number;
   score_expression?: string | null;
   dependencies?: { gradebook_columns?: number[]; assignments?: number[] } | null;
+  /** Only the weighted_total() fixtures set these; everything else sits in one unweighted group. */
+  gradebook_column_group_id?: number;
+  weight?: number | null;
+};
+
+type GroupSpec = {
+  id: number;
+  /** Share of the course, so 0.4 is 40%. Omit for an unweighted group. */
+  weight?: number | null;
 };
 
 type StudentEntry = {
@@ -58,10 +67,11 @@ function createFakeController(params: {
   class_id?: number;
   columns: ColumnSpec[];
   assignments?: AssignmentSpec[];
+  groups?: GroupSpec[];
   /** Per-student, per-slug entries. Missing entries are treated as missing. */
   entries: Record<string, Record<string, StudentEntry>>;
 }) {
-  const { class_id = 1, columns, assignments = [], entries } = params;
+  const { class_id = 1, columns, assignments = [], groups = [], entries } = params;
   const columnById = new Map(columns.map((c) => [c.id, c]));
   const columnBySlug = new Map(columns.map((c) => [c.slug, c]));
 
@@ -72,6 +82,12 @@ function createFakeController(params: {
     },
     get assignments() {
       return assignments;
+    },
+    /** Stands in for the TableController the real controller exposes. */
+    gradebook_column_groups: {
+      get rows() {
+        return groups.map((g) => ({ id: g.id, weight: g.weight ?? null }));
+      }
     },
     /** Mirrors GradebookController.getGradebookColumnStudent's `GradebookColumnStudent | undefined` return. */
     getGradebookColumnStudent(column_id: number, student_id: string): GradebookColumnStudent | undefined {

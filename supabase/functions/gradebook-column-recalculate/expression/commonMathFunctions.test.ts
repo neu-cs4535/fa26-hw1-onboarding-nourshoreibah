@@ -1,6 +1,7 @@
 import { assertEquals, assertThrows } from "jsr:@std/assert@^1";
 import { addCommonExpressionFunctions } from "./commonMathFunctions.ts";
 import { pickPreferredGradebookValue } from "./shared.ts";
+import { buildWeightedTotalSpecs, makeWeightedTotalSource } from "./weightedTotal.ts";
 
 // These tests exercise the real gradebook expression math (the functions the recalc edge
 // function imports into mathjs) directly, with synthetic gradebook values — no database and
@@ -172,4 +173,56 @@ Deno.test("pickPreferred: with no base override, the override-row value is used"
 Deno.test("pickPreferred: falls back to base when no override row exists", () => {
   const r = pickPreferredGradebookValue(undefined, dep(80, null));
   assertEquals(r?.score, 80);
+});
+
+// weighted_total() runs the same `weightedTotal.ts` module the browser evaluators import. These
+// cases exist so the Deno runtime is exercised too: the Jest suite in
+// tests/unit/gradebook-weighted-total.test.ts asserts the same numbers from the Next.js side, and
+// a divergence between the two runtimes would show up as one suite failing and the other passing.
+const weightedFixture = {
+  columns: [
+    { id: 1, slug: "hw-1", gradebook_column_group_id: 10, weight: null },
+    { id: 2, slug: "hw-2", gradebook_column_group_id: 10, weight: null },
+    { id: 3, slug: "exam-1", gradebook_column_group_id: 20, weight: null },
+    { id: 4, slug: "course-total", gradebook_column_group_id: 30, weight: null }
+  ],
+  groups: [
+    { id: 10, weight: 0.4 },
+    { id: 20, weight: 0.6 },
+    { id: 30, weight: null }
+  ]
+};
+
+const weightedValues: Record<string, { score: number | null; max_score: number; is_excused?: boolean }> = {
+  "hw-1": { score: 80, max_score: 100 },
+  "hw-2": { score: 25, max_score: 50 },
+  "exam-1": { score: 90, max_score: 100 },
+  "course-total": { score: 99, max_score: 100 }
+};
+
+function weightedContext(excludeColumnId: number | null) {
+  const specs = buildWeightedTotalSpecs({ ...weightedFixture, excludeColumnId });
+  return {
+    ...ctx,
+    weighted_total_source: makeWeightedTotalSource(specs, (slug: string) => weightedValues[slug])
+  };
+}
+
+Deno.test("weighted_total: 40% homework at 0.7 plus 60% exams at 0.9 is 82", () => {
+  // (80 + 25) / (100 + 50) = 0.7 and 90 / 100 = 0.9.
+  assertEquals(fns()["weighted_total"](weightedContext(4)), 82);
+});
+
+Deno.test("weighted_total: an excused column leaves its group instead of scoring zero", () => {
+  weightedValues["hw-2"] = { score: null, max_score: 50, is_excused: true };
+  try {
+    const r = fns()["weighted_total"](weightedContext(4)) as number;
+    assertEquals(Math.round(r * 1e9) / 1e9, 86);
+  } finally {
+    weightedValues["hw-2"] = { score: 25, max_score: 50 };
+  }
+});
+
+Deno.test("weighted_total: refuses when the evaluator supplied no group weights", () => {
+  assertThrows(() => fns()["weighted_total"](ctx), Error, "weighted_total() is not available");
 });
