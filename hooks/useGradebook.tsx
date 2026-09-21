@@ -141,12 +141,6 @@ function sortGroups(rows: readonly GradebookColumnGroup[]): GradebookColumnGroup
   return [...rows].sort((a, b) => a.sort_order - b.sort_order || a.id - b.id);
 }
 
-/**
- * The gradebook's column groups, in display order.
- *
- * Unlike columns, groups are not filtered for students: a group carries no scores, and a group
- * whose every column is hidden simply renders no header because nothing is left to put under it.
- */
 export function useGradebookColumnGroups() {
   const gradebookController = useGradebookController();
   const [groups, setGroups] = useState<GradebookColumnGroup[]>(() =>
@@ -154,10 +148,6 @@ export function useGradebookColumnGroups() {
   );
 
   useEffect(() => {
-    // list() hands back the rows it already has and calls the listener only on later changes, so
-    // seed from the return value as well as subscribing. Reading rows at useState time is not
-    // enough: that snapshot is taken when the component first renders, which can be before the
-    // controller's initial fetch has landed.
     const { data, unsubscribe } = gradebookController.gradebook_column_groups.list((rows) => {
       setGroups(sortGroups(rows));
     });
@@ -1510,9 +1500,6 @@ export class GradebookController {
     this.readyPromise = Promise.all([
       this.gradebook_row.readyPromise,
       this.gradebook_columns.readyPromise,
-      // Groups have to be loaded before anything renders. Columns without their groups sort as
-      // though every group started at position zero, which interleaves them, and the grouped
-      // view comes out empty rather than merely unsorted.
       this.gradebook_column_groups.readyPromise,
       this.table.readyPromise,
       this.assignments_table.readyPromise
@@ -1867,12 +1854,6 @@ export class GradebookController {
       if (node.type === "FunctionNode") {
         const functionName = (node as FunctionNode).fn.name;
         if (functionName === "weighted_total") {
-          // weighted_total() names no slugs, so the slug-matching branch below sees nothing and
-          // the column would be recorded as depending on nothing at all. That is not harmless:
-          // the recalculator decides both what to rerun and in what order from this list, so the
-          // total would go stale the moment a grade changed and could be computed before the
-          // columns it weighs. Record every column the call actually reads, which is exactly the
-          // set the calculation itself uses, minus this column so it does not look like a cycle.
           for (const spec of buildWeightedTotalSpecs({
             columns: this.gradebook_columns.rows,
             groups: this.gradebook_column_groups.rows ?? [],
@@ -2041,8 +2022,6 @@ export class GradebookController {
   exportGradebook(courseController: CourseController, options?: { useRenderExpressions?: boolean }) {
     const useRenderExpressions = options?.useRenderExpressions ?? false;
     const roster = courseController.getRosterWithUserInfo().data;
-    // Export follows the on-screen order, which is now two levels: the group's position in the
-    // gradebook, then the column's position inside it.
     const columns = sortColumnsForDisplay(this.gradebook_columns.rows, this.gradebook_column_groups.rows ?? []);
 
     // Get class sections and lab sections for lookups

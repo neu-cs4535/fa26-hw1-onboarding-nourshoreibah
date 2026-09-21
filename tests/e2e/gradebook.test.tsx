@@ -877,8 +877,6 @@ test.describe("Gradebook Page - Comprehensive", () => {
     await expect(page.getByRole("button", { name: "Import Columns" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Add Column" })).toBeVisible();
 
-    // Expand first. Assignment columns are grouped by what kind of assignment they are now, so
-    // several columns these assertions read sit inside a group, and groups start collapsed.
     const gradebookRegion = page.getByRole("region", { name: "Instructor Gradebook Table" });
     await gradebookRegion.getByRole("button", { name: "Expand all groups" }).click();
     await waitForVirtualizerIdle(page);
@@ -902,7 +900,6 @@ test.describe("Gradebook Page - Comprehensive", () => {
       expect(after).toBe(30);
     }).toPass({ timeout: 60_000 });
 
-    // Scroll right to reveal virtualized columns. Already expanded above.
     const tableRegion = gradebookRegion;
     await waitForVirtualizerIdle(page);
     await tableRegion.evaluate((el) => {
@@ -1480,7 +1477,6 @@ test.describe("Gradebook Page - CSV Render Export", () => {
         score_expression: "gradebook_columns('final-grade')",
         render_expression: "letter(score)",
         dependencies: { gradebook_columns: [finalGradebookColumn.id] },
-        // Immediately to the right of the column it renders, inside that column's group.
         gradebook_column_group_id: finalGradebookColumn.gradebook_column_group_id,
         position_in_group: finalGradebookColumn.position_in_group + 1
       })
@@ -1648,10 +1644,6 @@ test.describe("Gradebook column reorder (issue #531)", () => {
     await region.getByRole("button", { name: "Expand all groups" }).click();
     await waitForVirtualizerIdle(page);
 
-    // Move Left swaps a column with its neighbour *inside its group*; at the edge of a group it
-    // moves the whole group instead. So the target has to be a column with a left neighbour in
-    // the same group, and picking one by name would depend on how the fixture happened to lay
-    // out. Derive it: take a group with at least two columns and use its second one.
     const { data: allCols } = await supabase
       .from("gradebook_columns")
       .select("id, name, position_in_group, gradebook_column_group_id")
@@ -1683,8 +1675,6 @@ test.describe("Gradebook column reorder (issue #531)", () => {
     await page.getByRole("menuitem", { name: "Move Left", exact: true }).click();
     await expect(page.getByText("Column moved left").first()).toBeAttached();
 
-    // Position decreased by one, and — the part that matters — the column is still in the group
-    // it started in. A reorder that moved a column between groups would be a bug, not a reorder.
     await expect(async () => {
       const { data: colAfterLeft } = await supabase
         .from("gradebook_columns")
@@ -1701,8 +1691,6 @@ test.describe("Gradebook column reorder (issue #531)", () => {
     // virtualizer and its previous DOM node may be unmounted. Re-query the
     // headerCell from the live thead, then scroll it into view (webkit and
     // chromium both occasionally render the column off-screen).
-    // Re-expand: the move refetches, which re-runs the collapse-by-default effect, and a column
-    // inside a collapsed group is not in the DOM to be scrolled to.
     await region.getByRole("button", { name: "Expand all groups" }).click();
     await waitForVirtualizerIdle(page);
 
@@ -1762,7 +1750,6 @@ test.describe("Gradebook column reorder (issue #531)", () => {
       }).toPass({ timeout: 5_000, intervals: [250, 500] });
     }).toPass({ timeout: 30_000, intervals: [250, 500, 1000] });
 
-    // Back where it started, still in the same group.
     await expect(async () => {
       const { data: colRestored } = await supabase
         .from("gradebook_columns")

@@ -108,8 +108,6 @@ export default function ImportGradebookColumns() {
           description: null,
           dependencies: null,
           slug,
-          // Imported columns are routed by their slug like any other, so a CSV of `quiz-*`
-          // columns lands in the quiz group rather than in a block of its own.
           gradebook_column_group_id: await resolveGroupForSlug(
             supabase,
             gradebookController.gradebook_id,

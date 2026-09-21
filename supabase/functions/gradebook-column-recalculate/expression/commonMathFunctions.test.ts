@@ -175,10 +175,6 @@ Deno.test("pickPreferred: falls back to base when no override row exists", () =>
   assertEquals(r?.score, 80);
 });
 
-// weighted_total() runs the same `weightedTotal.ts` module the browser evaluators import. These
-// cases exist so the Deno runtime is exercised too: the Jest suite in
-// tests/unit/gradebook-weighted-total.test.ts asserts the same numbers from the Next.js side, and
-// a divergence between the two runtimes would show up as one suite failing and the other passing.
 const weightedFixture = {
   columns: [
     { id: 1, slug: "hw-1", gradebook_column_group_id: 10, weight: null },
@@ -209,7 +205,6 @@ function weightedContext(excludeColumnId: number | null) {
 }
 
 Deno.test("weighted_total: 40% homework at 0.7 plus 60% exams at 0.9 is 82", () => {
-  // (80 + 25) / (100 + 50) = 0.7 and 90 / 100 = 0.9.
   assertEquals(fns()["weighted_total"](weightedContext(4)), 82);
 });
 

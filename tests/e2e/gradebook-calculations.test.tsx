@@ -48,8 +48,6 @@ async function createColumn(opts: {
   dependencies?: { gradebook_columns?: number[]; assignments?: number[] } | null;
 }): Promise<number> {
   const gbId = await getGradebookId(opts.class_id);
-  // The database routes the column to a group by its slug, the same way it routes an
-  // assignment-backed one.
   const { data: groupId, error: groupError } = await supabase.rpc("gradebook_column_group_for_slug", {
     p_gradebook_id: gbId,
     p_class_id: opts.class_id,

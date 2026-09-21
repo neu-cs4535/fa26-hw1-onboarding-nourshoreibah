@@ -368,13 +368,6 @@ function topoSortColumns(columns: ColumnWithPrefix[]): number[] {
   return order;
 }
 
-/**
- * Load the column-group weights that `weighted_total()` weighs, for a whole gradebook.
- *
- * Groups live in their own table, so the columns query alone cannot say what a group is worth.
- * Callers drop the column they are evaluating from the returned list; see
- * `buildWeightedTotalSpecs`.
- */
 async function loadWeightedTotalSpecs(
   adminSupabase: SupabaseClient<Database>,
   scope: Sentry.Scope,
@@ -392,16 +385,6 @@ async function loadWeightedTotalSpecs(
   return buildWeightedTotalSpecs({ columns, groups });
 }
 
-/**
- * Point `weighted_total()` at the same value lookup the rest of the expression uses, minus the
- * column doing the asking.
- *
- * Returns an attacher rather than doing the work inline because a batch calls it once per student
- * per column, and the per-column spec list depends only on the column. Reading values through the
- * dependency source is what keeps `weighted_total()` in step with `gradebook_columns(...)` in the
- * same row: score overrides, values computed earlier in the row, and the private and
- * instructor-only rules all resolve in one place.
- */
 function createWeightedTotalAttacher({
   math,
   class_id,
@@ -461,8 +444,6 @@ export async function processGradebookRowCalculation(
     .from("gradebook_columns")
     .select("*, gradebooks!gradebook_columns_gradebook_id_fkey(expression_prefix)")
     .eq("gradebook_id", gradebook_id)
-    // gradebook_columns.sort_order was replaced by per-group ordering. Ordering on the dropped
-    // column made PostgREST reject the request, which failed every recalculation for the gradebook.
     .order("gradebook_column_group_id", { ascending: true })
     .order("position_in_group", { ascending: true });
   if (colsError || !columns) {
@@ -787,8 +768,6 @@ export async function processGradebookRowsCalculation(
     .from("gradebook_columns")
     .select("*, gradebooks!gradebook_columns_gradebook_id_fkey(expression_prefix)")
     .eq("gradebook_id", gradebook_id)
-    // gradebook_columns.sort_order was replaced by per-group ordering. Ordering on the dropped
-    // column made PostgREST reject the request, which failed every recalculation for the gradebook.
     .order("gradebook_column_group_id", { ascending: true })
     .order("position_in_group", { ascending: true });
   if (colsError || !columns) {

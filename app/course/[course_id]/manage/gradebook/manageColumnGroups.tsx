@@ -1,17 +1,5 @@
 "use client";
 
-/**
- * Managing gradebook column groups.
- *
- * Groups used to be a side effect of how columns were named, so there was nothing to manage: an
- * instructor changed a grouping by renaming columns until the prefixes lined up, and could not
- * change one at all without renaming something. A group is a row now, so it can be created,
- * renamed, weighted, reordered and deleted.
- *
- * Every write goes through an RPC rather than a table write. Reordering in particular has to,
- * because the database is where the rule lives that a reorder may not change what a column
- * belongs to.
- */
 import { toaster } from "@/components/ui/toaster";
 import { useGradebookColumnGroups, useGradebookColumns, useGradebookController } from "@/hooks/useGradebook";
 import { formatGroupWeight } from "@/lib/gradebookColumnGroups";
@@ -75,8 +63,6 @@ export default function ManageColumnGroupsDialog() {
     const name = newGroupName.trim();
     if (!name) return;
     await run("Group created", async () => {
-      // A hand-made group takes no auto_assign_slug_base, so it never silently acquires columns
-      // an instructor did not put there.
       const { error } = await supabase.from("gradebook_column_groups").insert({
         class_id: gradebookController.class_id,
         gradebook_id: gradebookController.gradebook_id,
@@ -103,8 +89,6 @@ export default function ManageColumnGroupsDialog() {
   const setWeight = useCallback(
     async (id: number, raw: string) => {
       const trimmed = raw.trim();
-      // Entered as a percentage because that is how instructors talk about it; stored as a share
-      // of the course so the arithmetic never has to divide by a hundred.
       const weight = trimmed === "" ? null : Number(trimmed) / 100;
       if (weight !== null && (Number.isNaN(weight) || weight < 0)) {
         toaster.error({ title: "Weight must be a number of percent, or blank" });

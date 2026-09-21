@@ -1127,7 +1127,6 @@ export class CourseController {
     return this._gradebookColumns;
   }
 
-  /** Column groups for this class, for pages outside the gradebook that need display order. */
   get gradebookColumnGroups(): TableController<"gradebook_column_groups"> {
     if (!this._gradebookColumnGroups) {
       this._gradebookColumnGroups = new TableController({

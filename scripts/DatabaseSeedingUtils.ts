@@ -5212,8 +5212,6 @@ final;`,
       });
     }
 
-    // Printed as the groups now read, left to right, so a run's output can be compared against a
-    // screenshot of the gradebook without having to decode a list of integers.
     const { data: layout } = await supabase
       .from("gradebook_column_groups")
       .select("name, sort_order, gradebook_columns(slug, position_in_group)")
@@ -5232,18 +5230,7 @@ final;`,
     }
   }
 
-  /**
-   * Put the column groups in the order an instructor would read them.
-   *
-   * This used to renumber every column in the gradebook, because grouping was inferred from a
-   * slug prefix plus a contiguity check, so the only way to make a family look like a family was
-   * to pack its members into consecutive global positions. Columns belong to a group by foreign
-   * key now, so nothing has to be packed: the families list below says which groups exist and in
-   * what order they should read, which is one integer per group.
-   *
-   * Anything unmatched, a code-walk column for instance, sorts after the named families and keeps
-   * its existing relative order.
-   */
+  /** Put the column groups in the order an instructor would read them. */
   private async orderColumnGroupsForReading(class_id: number) {
     const { data: groups, error } = await supabase
       .from("gradebook_column_groups")
@@ -5253,8 +5240,6 @@ final;`,
       throw new Error(`Failed to read gradebook column groups for class ${class_id}: ${error?.message}`);
     }
 
-    // Matched against the group's auto-assign base, which is the slug family it accepts, falling
-    // back to the group's own slug for groups that do not auto-receive anything.
     const families: Array<(base: string) => boolean> = [
       (base) => base === "assignment-lab",
       (base) => base === "assignment-group",
@@ -5282,8 +5267,7 @@ final;`,
         return familyRank(baseA) - familyRank(baseB) || (a.sort_order ?? 0) - (b.sort_order ?? 0) || a.id - b.id;
       });
 
-    // Two passes, offset well past the end, because (gradebook_id, sort_order) is unique and a
-    // straight renumber would collide with a group that has not moved yet.
+    // Two passes: (gradebook_id, sort_order) is unique, so a straight renumber collides.
     const offset = groups.length + 1000;
     for (const [position, group] of ordered.entries()) {
       const { error: parkError } = await supabase
@@ -5304,7 +5288,6 @@ final;`,
       }
     }
 
-    // The default group sits to the right of everything else.
     const defaultGroup = groups.find((g) => g.is_default);
     if (defaultGroup) {
       await supabase.from("gradebook_column_groups").update({ sort_order: ordered.length }).eq("id", defaultGroup.id);
@@ -5473,8 +5456,6 @@ final;`,
     dependencies?: { assignments?: number[]; gradebook_columns?: number[] };
     released?: boolean;
     instructor_only?: boolean;
-    /** Omit to let the database route the column by its slug, which is what it does for
-     *  assignment-backed columns too. */
     gradebook_column_group_id?: number;
   }): Promise<{
     id: number;
@@ -5494,8 +5475,6 @@ final;`,
       throw new Error(`Failed to find gradebook for class ${class_id}: ${gradebookError?.message}`);
     }
 
-    // Where the column goes is the database's decision, taken by the same routing function the
-    // assignment trigger uses. The seed does not get its own copy of the rule.
     let groupId = gradebook_column_group_id;
     if (groupId === undefined) {
       const { data: resolved, error: resolveError } = await supabase.rpc("gradebook_column_group_for_slug", {

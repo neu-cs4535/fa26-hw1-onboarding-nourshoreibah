@@ -543,14 +543,8 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
 
   const columnGroups = useGradebookColumnGroups();
 
-  // Display order is the group's position in the gradebook, then the column's position inside it.
   const sortedColumns = useMemo(() => sortColumnsForDisplay(columns, columnGroups), [columns, columnGroups]);
 
-  // Groups come from the gradebook_column_groups table. This file used to carry a character-for-
-  // character copy of the instructor table's grouping memo, including the sort_order contiguity
-  // test. That test was worse here than there: useGradebookColumns filters out columns a student
-  // is not allowed to see, which removed positions from the middle of the sequence and split the
-  // surrounding group in two, so students saw groups that no instructor ever saw.
   const groupedColumns = useMemo(() => buildGroupedColumns(sortedColumns, columnGroups), [sortedColumns, columnGroups]);
 
   const groupById = useMemo(() => new Map(columnGroups.map((g) => [g.id, g])), [columnGroups]);
@@ -571,8 +565,6 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
     });
   }, [groupedColumns]);
 
-  // Keyed on the group's id, not its header text, so two groups that read the same do not toggle
-  // together.
   const toggleGroup = useCallback((key: string) => {
     setCollapsedGroups((prev) => {
       const newSet = new Set(prev);

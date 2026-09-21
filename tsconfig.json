@@ -7,9 +7,7 @@
     "strict": true,
     "forceConsistentCasingInFileNames": true,
     "noEmit": true,
-    // Expression evaluation is shared with the Deno edge function, and Deno relative imports must
-    // carry the .ts extension. Allowing it here lets both runtimes read the same source file
-    // instead of keeping a copy in sync.
+    // Deno relative imports must carry the .ts extension; this file's expression code is shared with it.
     "allowImportingTsExtensions": true,
     "esModuleInterop": true,
     "module": "esnext",

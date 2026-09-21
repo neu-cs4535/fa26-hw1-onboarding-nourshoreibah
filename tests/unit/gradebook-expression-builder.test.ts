@@ -30,14 +30,12 @@ type ColumnSpec = {
   max_score: number;
   score_expression?: string | null;
   dependencies?: { gradebook_columns?: number[]; assignments?: number[] } | null;
-  /** Only the weighted_total() fixtures set these; everything else sits in one unweighted group. */
   gradebook_column_group_id?: number;
   weight?: number | null;
 };
 
 type GroupSpec = {
   id: number;
-  /** Share of the course, so 0.4 is 40%. Omit for an unweighted group. */
   weight?: number | null;
 };
 
@@ -83,7 +81,6 @@ function createFakeController(params: {
     get assignments() {
       return assignments;
     },
-    /** Stands in for the TableController the real controller exposes. */
     gradebook_column_groups: {
       get rows() {
         return groups.map((g) => ({ id: g.id, weight: g.weight ?? null }));

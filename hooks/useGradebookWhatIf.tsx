@@ -33,7 +33,6 @@ export type ExpressionContext = {
   incomplete_values_policy: "assume_max" | "assume_zero" | "report_only";
   scope: Sentry.Scope;
   class_id: number;
-  /** Set per column so `weighted_total()` can weigh every other column without weighing itself. */
   weighted_total_source?: WeightedTotalSource;
 };
 //These functions should be called with a context object as the first argument
@@ -528,7 +527,6 @@ class GradebookWhatIfController {
           assume_zero: undefined,
           gradebook_score: this._grades[columnId]?.gradebook_score
         };
-        // Built once per column: which other columns weighted_total() weighs, and how heavily.
         const weightedTotalSpecs = buildWeightedTotalSpecs({
           columns: allColumns,
           groups: this.gradebookController.gradebook_column_groups.rows ?? [],
@@ -543,8 +541,6 @@ class GradebookWhatIfController {
             scope: new Sentry.Scope(),
             class_id: this.gradebookController.class_id
           };
-          // Read through the same gradebook_columns import the expression itself uses, so
-          // weighted_total() honours what-if values and the incomplete-values policy.
           context.weighted_total_source = makeWeightedTotalSource(weightedTotalSpecs, (slug) =>
             (imports["gradebook_columns"] as unknown as (ctx: ExpressionContext, slug: string) => unknown)(
               context,

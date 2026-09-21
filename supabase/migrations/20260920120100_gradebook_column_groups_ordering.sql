@@ -1,22 +1,3 @@
--- Two-level column ordering: the routines.
---
--- 20260920120000 created gradebook_column_groups, backfilled it, and dropped
--- gradebook_columns.sort_order in favour of position_in_group. Everything that used to read or
--- write a single global sequence per gradebook has to be rewritten against the two levels. This
--- migration does that, and adds the routing that puts a newly created column into a group without
--- any caller having to know groups exist.
---
--- Where the old code was careful about something, the new code stays careful about it in the same
--- way: the per-gradebook advisory lock, the bypass GUC around bulk writes, and the
--- pg_trigger_depth() guard are all still here. One thing is deliberately tidied: auto-layout used
--- to take pg_advisory_xact_lock(17031, gradebook_id) while every other path took
--- pg_advisory_xact_lock(gradebook_id), so the two did not actually exclude each other. They all
--- use the one-argument form now.
-
--- ---------------------------------------------------------------------------------------------
--- 1. Routing a new column to a group
--- ---------------------------------------------------------------------------------------------
-
 CREATE OR REPLACE FUNCTION public.gradebook_column_group_for_slug(
   p_gradebook_id bigint, p_class_id bigint, p_slug text)
 RETURNS bigint
@@ -30,9 +11,6 @@ DECLARE
 BEGIN
   v_base := public.gradebook_column_base_group_name(p_slug);
 
-  -- Rightmost group that accepts this base. Rightmost rather than leftmost because a new column
-  -- in a family belongs at the end of it, and because the backfill can legitimately leave more
-  -- than one group carrying the same base when an instructor has since split one by hand.
   SELECT g.id INTO v_id
     FROM public.gradebook_column_groups g
    WHERE g.gradebook_id = p_gradebook_id
@@ -44,7 +22,6 @@ BEGIN
     RETURN v_id;
   END IF;
 
-  -- Nothing claims this base yet, so start a group for it, immediately left of the default group.
   INSERT INTO public.gradebook_column_groups
          (class_id, gradebook_id, name, slug, sort_order, auto_assign_slug_base)
   VALUES (p_class_id, p_gradebook_id,
@@ -63,8 +40,6 @@ END $$;
 COMMENT ON FUNCTION public.gradebook_column_group_for_slug(bigint, bigint, text) IS
   'Picks the group a newly created column belongs to, by the slug base the group advertises in auto_assign_slug_base.';
 
--- Callable from the app so that code creating a column can ask where it should go, rather than
--- reimplementing the routing rule in TypeScript. The rule lives in one place.
 REVOKE ALL ON FUNCTION public.gradebook_column_group_for_slug(bigint, bigint, text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.gradebook_column_group_for_slug(bigint, bigint, text)
   TO authenticated, service_role;
@@ -83,26 +58,11 @@ BEGIN
   RETURN NEW;
 END $$;
 
--- Deliberately has no pg_trigger_depth() guard. Columns inserted from inside another trigger,
--- which is how every assignment-backed column arrives, still need a group.
---
--- The name matters. Postgres fires BEFORE ROW triggers in name order, and this one has to run
--- before gradebook_columns_enforce_sort_order_tr, which reads the group to work out what the
--- next free position in it is. 'gradebook_columns_assign...' sorts before
--- 'gradebook_columns_enforce...' on the 'a' < 'e'. Renaming either one breaks the other.
+-- Must sort before gradebook_columns_enforce_sort_order_tr: Postgres fires BEFORE ROW triggers in name order.
 DROP TRIGGER IF EXISTS gradebook_columns_assign_default_group_tr ON public.gradebook_columns;
 CREATE TRIGGER gradebook_columns_assign_default_group_tr
   BEFORE INSERT ON public.gradebook_columns
   FOR EACH ROW EXECUTE FUNCTION public.gradebook_columns_assign_default_group();
-
--- ---------------------------------------------------------------------------------------------
--- 2. Position enforcement, scoped to the group
--- ---------------------------------------------------------------------------------------------
---
--- Same shape as the old gradebook_columns_enforce_sort_order, with every WHERE narrowed from
--- "this gradebook" to "this group". Appending to a group is now O(1) and disturbs nothing, which
--- is the main practical win of the two-level model: inserting a column in the middle of a
--- gradebook used to renumber every column to its right.
 
 CREATE OR REPLACE FUNCTION public.gradebook_columns_enforce_sort_order()
 RETURNS trigger
@@ -122,8 +82,6 @@ BEGIN
 
   PERFORM pg_advisory_xact_lock(NEW.gradebook_id);
 
-  -- Negative means "wherever, put it at the end", which is what the column's DEFAULT of -1
-  -- produces when a caller omits the field. An explicit caller never passes a negative.
   IF NEW.position_in_group IS NULL OR NEW.position_in_group < 0 THEN
     SELECT COALESCE(MAX(position_in_group), -1) + 1
       INTO NEW.position_in_group
@@ -141,14 +99,12 @@ BEGIN
 
   ELSIF TG_OP = 'UPDATE' THEN
     IF NEW.gradebook_column_group_id IS DISTINCT FROM OLD.gradebook_column_group_id THEN
-      -- Close the gap in the group it left.
       UPDATE public.gradebook_columns
          SET position_in_group = position_in_group - 1
        WHERE gradebook_column_group_id = OLD.gradebook_column_group_id
          AND position_in_group > OLD.position_in_group
          AND id <> NEW.id;
 
-      -- Make room in the group it joined.
       UPDATE public.gradebook_columns
          SET position_in_group = position_in_group + 1
        WHERE gradebook_column_group_id = NEW.gradebook_column_group_id
@@ -180,14 +136,6 @@ ON public.gradebook_columns
 FOR EACH ROW
 EXECUTE FUNCTION public.gradebook_columns_enforce_sort_order();
 
--- ---------------------------------------------------------------------------------------------
--- 3. Every gradebook gets a default group
--- ---------------------------------------------------------------------------------------------
---
--- A trigger on gradebooks rather than an edit to classes_populate_default_structures, so a
--- gradebook created by any other path gets one too. The FK on gradebook_columns is NOT NULL, so
--- a gradebook without this row is a gradebook you cannot add a column to.
-
 CREATE OR REPLACE FUNCTION public.gradebooks_create_default_column_group()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -195,9 +143,6 @@ SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
 BEGIN
-  -- Parked at the far right. Real groups are numbered from 0 upwards as they are created, so a
-  -- default group sitting at 0 would collide with the first of them on the
-  -- (gradebook_id, sort_order) unique. Reorder and delete both renumber it back into range.
   INSERT INTO public.gradebook_column_groups
          (class_id, gradebook_id, name, slug, sort_order, is_default)
   VALUES (NEW.class_id, NEW.id, 'Ungrouped', 'ungrouped', 2147483647, true)
@@ -209,19 +154,6 @@ DROP TRIGGER IF EXISTS gradebooks_create_default_column_group_tr ON public.grade
 CREATE TRIGGER gradebooks_create_default_column_group_tr
   AFTER INSERT ON public.gradebooks
   FOR EACH ROW EXECUTE FUNCTION public.gradebooks_create_default_column_group();
-
--- ---------------------------------------------------------------------------------------------
--- 4. Assignment-backed columns
--- ---------------------------------------------------------------------------------------------
---
--- The old version computed MAX(sort_order) + 1 across the whole class and wrote it, because the
--- pg_trigger_depth() > 1 guard means the enforce trigger declines to do anything for a column
--- inserted from inside this trigger. Under two levels there is nothing to compute: appending to
--- a group needs no position arithmetic and disturbs no other row, so this just names the group
--- and lets the column land at the end of it.
---
--- create_gradebook_column_for_code_walk_rubric needs no change for the same reason: it never set
--- sort_order, and the routing trigger now gives it a group.
 
 CREATE OR REPLACE FUNCTION public.create_gradebook_column_for_assignment()
 RETURNS trigger
@@ -245,11 +177,8 @@ BEGIN
         RETURN NEW;
     END IF;
 
-    -- Same lock namespace as every other ordering path, which the old class_id lock was not.
     PERFORM pg_advisory_xact_lock(v_gradebook_id);
 
-    -- Resolve the group here rather than leaning on the BEFORE INSERT trigger, so that the
-    -- position below is computed against the group the row will actually land in.
     v_group_id := public.gradebook_column_group_for_slug(
                     v_gradebook_id, NEW.class_id, 'assignment-' || NEW.slug);
 
@@ -282,23 +211,9 @@ BEGIN
 END;
 $function$;
 
--- ---------------------------------------------------------------------------------------------
--- 5. Optimistic concurrency for layout changes
--- ---------------------------------------------------------------------------------------------
---
--- Two people reordering at once used to serialize on the advisory lock and then silently
--- last-writer-wins: the loser's permutation was computed against a snapshot taken before the
--- winner's write, and every check it passed was a check against stale data. With groups in the
--- picture that is worse than a lost drag, because a stale permutation can be internally valid and
--- still split a group the winner just created.
---
--- Statement-level so a 200-row reorder bumps the version once rather than 200 times.
-
 ALTER TABLE public.gradebooks
   ADD COLUMN IF NOT EXISTS column_layout_version bigint NOT NULL DEFAULT 0;
 
--- Two functions rather than one, because a statement trigger can only reference the transition
--- tables its own definition declares: an INSERT trigger has no old_table to read.
 CREATE OR REPLACE FUNCTION public.gradebooks_bump_layout_version_new()
 RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 BEGIN
@@ -315,9 +230,6 @@ BEGIN
   RETURN NULL;
 END $$;
 
--- Postgres refuses a column list on a trigger that declares transition tables, so this one fires
--- on any UPDATE and decides for itself whether the layout actually moved. Bumping on every column
--- edit would make an unrelated rename invalidate someone else's in-flight drag.
 CREATE OR REPLACE FUNCTION public.gradebooks_bump_layout_version_if_moved()
 RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 BEGIN
@@ -368,14 +280,6 @@ CREATE TRIGGER gradebook_column_groups_bump_layout_delete
   REFERENCING OLD TABLE AS old_table
   FOR EACH STATEMENT EXECUTE FUNCTION public.gradebooks_bump_layout_version_old();
 
-
--- ---------------------------------------------------------------------------------------------
--- 6. One place that writes an order
--- ---------------------------------------------------------------------------------------------
---
--- The lock-and-bypass dance was copy-pasted into four functions, each with its own EXCEPTION
--- block to reset the GUC. It lives here once now.
-
 CREATE OR REPLACE FUNCTION public._gradebook_columns_apply_positions(
   p_gradebook_id bigint, p_group_id bigint, p_ordered_column_ids bigint[])
 RETURNS void
@@ -401,19 +305,6 @@ BEGIN
 END $$;
 
 REVOKE ALL ON FUNCTION public._gradebook_columns_apply_positions(bigint, bigint, bigint[]) FROM PUBLIC;
-
--- ---------------------------------------------------------------------------------------------
--- 7. Move left / move right
--- ---------------------------------------------------------------------------------------------
---
--- The old version swapped with whatever column was visually adjacent, which is exactly the
--- operation that breaks groups: the leftmost column of one group moving left lands in the middle
--- of the group before it. Now a move inside a group swaps two positions, and a move off the edge
--- of a group moves the whole group past its neighbour. Neither ever writes
--- gradebook_column_group_id, so neither can change what a column belongs to.
---
--- Still SECURITY INVOKER, and still relying on the existing "instructors and graders edit"
--- UPDATE policy on gradebook_columns, so graders keep the nudge rights they have today.
 
 CREATE OR REPLACE FUNCTION public.gradebook_column_move_left(p_column_id bigint)
 RETURNS public.gradebook_columns
@@ -456,7 +347,6 @@ BEGIN
     END;
     PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_col.gradebook_id::text, 'false', true);
   ELSE
-    -- Already first in its group: move the group itself past the one before it.
     SELECT sort_order INTO v_group_order
       FROM public.gradebook_column_groups WHERE id = v_col.gradebook_column_group_id;
 
@@ -544,15 +434,6 @@ BEGIN
 END;
 $$;
 
--- ---------------------------------------------------------------------------------------------
--- 8. Reorder
--- ---------------------------------------------------------------------------------------------
---
--- The old gradebook_columns_reorder took one flat array of every column in the gradebook, which
--- under two levels cannot say anything about where the group boundaries fall. Rather than leave a
--- function that would accept such an array and quietly do something arbitrary with it, it now
--- raises and names its replacements.
-
 CREATE OR REPLACE FUNCTION public.gradebook_columns_reorder(p_ordered_column_ids bigint[])
 RETURNS void
 LANGUAGE plpgsql
@@ -563,8 +444,6 @@ BEGIN
           ERRCODE = 'feature_not_supported';
 END $$;
 
--- Order the columns inside one group. This cannot change what any column belongs to: it writes
--- position_in_group and nothing else, and it refuses an array that reaches outside the group.
 CREATE OR REPLACE FUNCTION public.gradebook_columns_reorder_in_group(
   p_group_id bigint, p_ordered_column_ids bigint[], p_expected_version bigint)
 RETURNS bigint
@@ -626,7 +505,6 @@ BEGIN
   RETURN v_version;
 END $$;
 
--- Order the groups. One integer per group, rather than renumbering every column in the gradebook.
 CREATE OR REPLACE FUNCTION public.gradebook_column_groups_reorder(
   p_gradebook_id bigint, p_ordered_group_ids bigint[], p_expected_version bigint)
 RETURNS bigint
@@ -684,7 +562,6 @@ BEGIN
     FROM unnest(p_ordered_group_ids) WITH ORDINALITY AS t(id, ordinality)
    WHERE g.id = t.id;
 
-  -- The default group keeps to the right-hand end.
   UPDATE public.gradebook_column_groups
      SET sort_order = COALESCE(array_length(p_ordered_group_ids, 1), 0)
    WHERE gradebook_id = p_gradebook_id AND is_default;
@@ -693,12 +570,6 @@ BEGIN
   RETURN v_version;
 END $$;
 
--- ---------------------------------------------------------------------------------------------
--- 9. Group CRUD that the UI needs
--- ---------------------------------------------------------------------------------------------
-
--- Moving a column between groups is a different operation from reordering, on purpose. A drag
--- that reorders cannot reach this; something has to say explicitly that membership changes.
 CREATE OR REPLACE FUNCTION public.gradebook_column_assign_group(
   p_column_id bigint, p_group_id bigint, p_position integer DEFAULT NULL)
 RETURNS public.gradebook_columns
@@ -724,7 +595,6 @@ BEGIN
     RAISE EXCEPTION 'insufficient permissions: instructor access required for class %', v_col.class_id;
   END IF;
 
-  -- The composite foreign key would catch this too; catching it here gives a better message.
   IF v_group.gradebook_id <> v_col.gradebook_id THEN
     RAISE EXCEPTION 'group % belongs to a different gradebook than column %', p_group_id, p_column_id;
   END IF;
@@ -744,8 +614,6 @@ BEGIN
   RETURN v_col;
 END $$;
 
--- The FK is ON DELETE RESTRICT, so a group with columns in it cannot simply be deleted. This
--- moves the members into the default group, keeping their relative order, and then deletes.
 CREATE OR REPLACE FUNCTION public.gradebook_column_group_delete(p_group_id bigint)
 RETURNS void
 LANGUAGE plpgsql
@@ -799,7 +667,6 @@ BEGIN
 
   DELETE FROM public.gradebook_column_groups WHERE id = p_group_id;
 
-  -- Close the gap the deleted group left.
   UPDATE public.gradebook_column_groups g
      SET sort_order = sub.pos
     FROM (
@@ -819,19 +686,6 @@ GRANT EXECUTE ON FUNCTION public.gradebook_columns_reorder_in_group(bigint, bigi
 GRANT EXECUTE ON FUNCTION public.gradebook_column_groups_reorder(bigint, bigint[], bigint) TO authenticated, service_role;
 GRANT EXECUTE ON FUNCTION public.gradebook_column_assign_group(bigint, bigint, integer) TO authenticated, service_role;
 GRANT EXECUTE ON FUNCTION public.gradebook_column_group_delete(bigint) TO authenticated, service_role;
-
--- ---------------------------------------------------------------------------------------------
--- 10. The bulk fetch RPCs
--- ---------------------------------------------------------------------------------------------
---
--- These two are why the old column was dropped rather than reinterpreted. Both order a payload by
--- gradebook_columns.sort_order, and get_gradebook_records_for_all_students_array returns a bare
--- array per student whose element order IS the column order. A client that zipped that array
--- against a separately fetched column list would have misaligned every score by some number of
--- places, silently, with no error anywhere. Reinterpreting sort_order in place would have done
--- exactly that; dropping it turned both into a hard failure until they were fixed here.
---
--- Everything except the join and the ORDER BY is unchanged from the previous definitions.
 
 CREATE OR REPLACE FUNCTION public.get_gradebook_records_for_all_students(p_class_id bigint)
  RETURNS jsonb
@@ -928,27 +782,6 @@ BEGIN
 END;
 $function$;
 
--- ---------------------------------------------------------------------------------------------
--- 11. Auto-layout
--- ---------------------------------------------------------------------------------------------
---
--- The old version walked every column in one global sequence and, for each, looked up the
--- sort_order of its already-placed dependencies so it could sit one to their right. That only
--- works while "to the right of" is a single comparable integer across the whole gradebook, and
--- it is not any more. Dependencies also routinely cross families: a `total-labs` column depends
--- on every lab column.
---
--- So auto-layout now orders both levels. Within a group it does what it always did: natural sort
--- by slug, so lab-2 comes before lab-10. Across groups it lifts each column dependency to an edge
--- between the groups those columns belong to, drops the self-edges that produces, and topologically
--- sorts the resulting graph, so a group of summary columns lands to the right of the group it
--- summarises.
---
--- A cycle between groups is more likely than a cycle between columns, because lifting merges
--- edges: two groups that each contain a column depending on the other are a cycle even when no
--- column depends on itself. That is not a broken gradebook, so it warns and keeps the order it
--- already had rather than failing, which is what the old code did for column cycles.
-
 CREATE OR REPLACE FUNCTION public.gradebook_auto_layout(p_gradebook_id bigint)
 RETURNS void
 LANGUAGE plpgsql
@@ -971,14 +804,10 @@ BEGIN
     RAISE EXCEPTION 'insufficient permissions: instructor access required for class %', v_class_id;
   END IF;
 
-  -- One lock namespace for every ordering path. The old two-argument form here did not exclude
-  -- the one-argument form every other function took, so auto-layout could interleave with a
-  -- reorder.
   PERFORM pg_advisory_xact_lock(p_gradebook_id);
   PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || p_gradebook_id::text, 'true', true);
 
   BEGIN
-    -- Phase A: natural sort within each group.
     WITH ordered_cols AS (
       SELECT id,
              ROW_NUMBER() OVER (
@@ -996,10 +825,6 @@ BEGIN
      WHERE gc.id = oc.id
        AND gc.position_in_group IS DISTINCT FROM oc.pos;
 
-    -- Phase B: the group graph. Edge g1 -> g2 means "a column in g2 reads a column in g1", so g1
-    -- has to come first.
-    -- Dropped explicitly as well as ON COMMIT, so calling auto-layout twice in one transaction
-    -- does not trip over the previous call's scratch tables.
     DROP TABLE IF EXISTS _al_edges;
     DROP TABLE IF EXISTS _al_rank;
 
@@ -1017,8 +842,6 @@ BEGIN
     CREATE TEMP TABLE _al_rank (group_id bigint PRIMARY KEY, rank integer NOT NULL) ON COMMIT DROP;
 
     LOOP
-      -- Every group whose prerequisites are all placed, taking the ones that were already
-      -- leftmost first so a gradebook with no dependencies keeps the order it had.
       SELECT array_agg(g.id ORDER BY g.is_default, g.sort_order, g.id) INTO v_next
         FROM public.gradebook_column_groups g
        WHERE g.gradebook_id = p_gradebook_id
@@ -1052,7 +875,6 @@ BEGIN
        WHERE g.gradebook_id = p_gradebook_id AND NOT (g.id = ANY (v_placed));
     END IF;
 
-    -- Phase C: dense group positions, default group last.
     UPDATE public.gradebook_column_groups g
        SET sort_order = sub.pos
       FROM (

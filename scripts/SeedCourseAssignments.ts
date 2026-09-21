@@ -406,8 +406,6 @@ async function createGradebookColumn(
   gradebookId: number,
   column: PlannedGradebookColumn
 ): Promise<void> {
-  // The database decides which group this belongs to, by the same rule the assignment trigger
-  // uses, rather than this script carrying its own copy of it.
   const { data: groupId, error: groupError } = await supabase.rpc("gradebook_column_group_for_slug", {
     p_gradebook_id: gradebookId,
     p_class_id: classId,

@@ -1,13 +1,3 @@
-/**
- * Tests for `weighted_total()`, the score-expression function that turns column-group weights
- * into a course percentage.
- *
- * The point of these tests is not only that the arithmetic is right. It is that there is one
- * copy of it. The last block runs the same fixture through the server-side wiring (mathjs plus
- * `addCommonExpressionFunctions`, the way the Deno recalculator sets it up) and through
- * `evaluateForStudent` (the Expression Builder preview) and asserts both land on the same
- * number, which is only possible while both keep calling `computeWeightedTotal`.
- */
 import * as mathjs from "mathjs";
 import { minimatch } from "minimatch";
 
@@ -37,11 +27,6 @@ type Fixture = {
   values: Record<string, Partial<WeightedTotalValue>>;
 };
 
-/**
- * Homework is 40% of the course, exams 60%, and a third group carries no weight at all.
- * Group scores: homework (80 + 25) / (100 + 50) = 0.7, exams 90 / 100 = 0.9.
- * Course total: 100 * (0.4 * 0.7 + 0.6 * 0.9) = 82.
- */
 function baseFixture(): Fixture {
   return {
     columns: [
@@ -66,7 +51,6 @@ function baseFixture(): Fixture {
   };
 }
 
-/** Resolve a fixture the way an evaluator would: specs for one column, values by slug. */
 function totalFor(fixture: Fixture, evaluatingColumnId: number | null): number | undefined {
   const specs = buildWeightedTotalSpecs({
     columns: fixture.columns,
@@ -99,37 +83,31 @@ describe("computeWeightedTotal", () => {
   test("a within-group weight of 2 makes a column count double", () => {
     const fixture = baseFixture();
     fixture.columns[1].weight = 2;
-    // Homework becomes (80 + 2*25) / (100 + 2*50) = 0.65, so 100 * (0.4*0.65 + 0.6*0.9) = 80.
     expect(totalFor(fixture, 5)).toBeCloseTo(80, 10);
   });
 
   test("an excused column leaves its group entirely rather than scoring zero", () => {
     const fixture = baseFixture();
     fixture.values["hw-2"] = { score: null, is_excused: true, is_missing: true };
-    // Homework is now 80 / 100 = 0.8, so 100 * (0.4*0.8 + 0.6*0.9) = 86.
     expect(totalFor(fixture, 5)).toBeCloseTo(86, 10);
   });
 
   test("a missing column that is not excused counts as zero against its full max_score", () => {
     const fixture = baseFixture();
     fixture.values["hw-2"] = { score: null, is_missing: true };
-    // Homework is now 80 / 150, so 100 * (0.4*(80/150) + 0.6*0.9) = 75.333…
     expect(totalFor(fixture, 5)).toBeCloseTo(100 * (0.4 * (80 / 150) + 0.54), 10);
   });
 
   test("a column nobody has graded yet is skipped, not read as a zero", () => {
     const fixture = baseFixture();
     fixture.values["hw-2"] = { score: null };
-    // Homework collapses to hw-1 alone: 100 * (0.4*0.8 + 0.6*0.9) = 86.
     expect(totalFor(fixture, 5)).toBeCloseTo(86, 10);
   });
 
   test("the column being evaluated never counts itself", () => {
     const fixture = baseFixture();
-    // Move the total into the homework group, where leaving it in would corrupt the result.
     fixture.columns[4].gradebook_column_group_id = HOMEWORK_GROUP;
     expect(totalFor(fixture, 5)).toBeCloseTo(82, 10);
-    // Without the exclusion the stale 99/100 it already holds drags the homework group up.
     expect(totalFor(fixture, null)).not.toBeCloseTo(82, 5);
   });
 
@@ -142,7 +120,6 @@ describe("computeWeightedTotal", () => {
   test("a weighted group with nothing graded drops out and the rest renormalise", () => {
     const fixture = baseFixture();
     delete fixture.values["exam-1"];
-    // Only homework contributed, so the student sees their homework percentage, not 0.4 * it.
     expect(totalFor(fixture, 5)).toBeCloseTo(70, 10);
   });
 
@@ -153,7 +130,6 @@ describe("computeWeightedTotal", () => {
       { id: EXAM_GROUP, weight: 0.3 },
       { id: UNWEIGHTED_GROUP, weight: null }
     ];
-    // (0.2*0.7 + 0.3*0.9) / 0.5 = 0.82, the same ratio as 0.4/0.6.
     expect(totalFor(fixture, 5)).toBeCloseTo(82, 10);
   });
 
@@ -184,11 +160,6 @@ describe("buildWeightedTotalSpecs", () => {
   });
 });
 
-/**
- * Evaluate an expression the way the Deno recalculator does: import the shared functions into a
- * fresh mathjs instance and rewrite every context-aware call to take `context` as its first
- * argument. This is a copy of the recalculator's AST transform, not of its arithmetic.
- */
 function evaluateServerSide(expression: string, fixture: Fixture, evaluatingColumnId: number): unknown {
   const math = mathjs.create(mathjs.all, {});
   const imports: Record<string, (...args: never[]) => unknown> = {};
@@ -219,7 +190,6 @@ function evaluateServerSide(expression: string, fixture: Fixture, evaluatingColu
   return instrumented.compile().evaluate({ context });
 }
 
-/** The slice of `GradebookController` that `evaluateForStudent` reaches for. */
 function createFakeController(fixture: Fixture) {
   const columns = fixture.columns.map((c) => ({ ...c, name: c.slug, score_expression: null, dependencies: null }));
   return {

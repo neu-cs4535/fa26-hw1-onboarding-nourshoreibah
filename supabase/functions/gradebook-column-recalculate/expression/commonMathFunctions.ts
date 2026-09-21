@@ -22,12 +22,6 @@ export type ExpressionContextForCommonFunctions = {
     setTag?: (key: string, value: unknown) => void;
     addBreadcrumb?: (payload: { message: string; level: string }) => void;
   };
-  /**
-   * Pairs the gradebook's column-group weights with this student's values, so `weighted_total()`
-   * can do arithmetic without knowing how the surrounding evaluator reads a score. Evaluators
-   * build it with `makeWeightedTotalSource`; one that cannot (because it never loaded the whole
-   * gradebook) leaves it unset and `weighted_total()` refuses rather than inventing a total.
-   */
   weighted_total_source?: WeightedTotalSource;
 };
 

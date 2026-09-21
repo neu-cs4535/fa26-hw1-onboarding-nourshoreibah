@@ -678,9 +678,6 @@ export function evaluateForStudent(params: {
     },
     weighted_total_source: undefined as WeightedTotalSource | undefined
   };
-  // The column being previewed is excluded, so a draft expression cannot weigh the value the
-  // column already holds. Values come from the same gradebook_columns import the rest of the
-  // preview uses, which keeps the builder's number equal to the recalculator's.
   context.weighted_total_source = makeWeightedTotalSource(
     buildWeightedTotalSpecs({
       columns: gradebookController.columns as ColumnWithEntries[],

@@ -2849,9 +2849,7 @@ export async function createAssignmentsAndGradebookColumns({
     dependencies?: { assignments?: number[]; gradebook_columns?: number[] };
     released?: boolean;
     instructor_only?: boolean;
-    /** Position inside the column's group. Omit to append. */
     position_in_group?: number;
-    /** Omit to let the database route the column by its slug. */
     gradebook_column_group_id?: number;
     rateLimitManager?: RateLimitManager;
   }): Promise<{
@@ -2903,8 +2901,6 @@ export async function createAssignmentsAndGradebookColumns({
       }
     }
 
-    // Which group the column belongs to is the database's call, using the same routing function
-    // the assignment trigger uses.
     let resolvedGroupId = gradebook_column_group_id;
     if (resolvedGroupId === undefined) {
       const { data: routed, error: routeError } = await supabase.rpc("gradebook_column_group_for_slug", {

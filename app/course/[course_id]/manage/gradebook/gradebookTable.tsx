@@ -238,14 +238,6 @@ type GradebookGroupedColumnRef = {
   position_in_group: GradebookColumn["position_in_group"];
 };
 
-/**
- * Build left-to-right "units": each is a block of DB column ids. Collapsed groups = one unit
- * (whole group).
- *
- * Exported so it can be unit tested. It used to be module-private and re-derived a column's group
- * from its slug, which meant the drag-and-drop path had its own opinion about grouping,
- * independent of the memo that drew the headers.
- */
 export function buildVisibleReorderUnits(args: {
   scrollableLeafColumns: TanStackColumn<UserProfile, unknown>[];
   groupedColumns: Record<string, { groupName: string; columns: GradebookGroupedColumnRef[] }>;
@@ -267,7 +259,6 @@ export function buildVisibleReorderUnits(args: {
     if (collapsedGroups.has(key!)) {
       const best = findBestColumnToShow(group.columns);
       if (colId !== best.id) continue;
-      // group.columns is already in display order.
       units.push(group.columns.map((c) => c.id));
     } else {
       units.push([colId]);
@@ -405,7 +396,6 @@ function AddColumnDialog() {
     scoreExpression?: string;
     renderExpression?: string;
     instructorOnly: boolean;
-    /** Empty string means "let the slug decide", which is what the routing rule is for. */
     gradebookColumnGroupId: string;
   };
 
@@ -465,9 +455,6 @@ function AddColumnDialog() {
         dependencies,
         class_id: gradebookController.class_id,
         gradebook_id: gradebookController.gradebook_id,
-        // Either the group the instructor picked, or whichever one the slug routes to. Asking the
-        // database rather than deciding here keeps one rule in one place. No position: the
-        // enforce trigger appends the column to the end of the group it lands in.
         gradebook_column_group_id: data.gradebookColumnGroupId
           ? Number(data.gradebookColumnGroupId)
           : await resolveGroupForSlug(
@@ -2592,16 +2579,11 @@ export default function GradebookTable() {
     columnGroups
   );
   const cachedColumnsKey = JSON.stringify(columnsForGrouping);
-  // Groups come from the gradebook_column_groups table. This shapes rows; it does not decide
-  // anything. The slug-splitting that used to live here, along with the sort_order contiguity
-  // test that split a family whenever a column had been deleted out of the middle of it, is gone.
   const groupedColumns = useMemo(
     () => buildGroupedColumns(JSON.parse(cachedColumnsKey) as typeof columnsForGrouping, columnGroups),
     [cachedColumnsKey, columnGroups]
   );
 
-  // Which group each column renders under, by id. Replaces three separate re-derivations of the
-  // slug prefix followed by a prefix-match scan over the grouped record.
   const columnGroupKeyById = useMemo(
     () => buildColumnGroupKeyMap(JSON.parse(cachedColumnsKey) as typeof columnsForGrouping, columnGroups),
     [cachedColumnsKey, columnGroups]
@@ -2610,10 +2592,6 @@ export default function GradebookTable() {
   const columnGroupById = useMemo(() => new Map(columnGroups.map((g) => [g.id, g])), [columnGroups]);
 
   // Initialize all groups as collapsed by default, but preserve existing collapsed state
-  // Collapse state is keyed on the group's id, not on the text of its header. Keying on the text
-  // meant two groups that happened to render the same header collapsed and expanded as a single
-  // unit from opposite ends of the gradebook, which is what a family split by a deleted column,
-  // or a column whose slug merely looked assignment-backed, used to produce.
   useEffect(() => {
     const collapsibleKeys = Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1);
     setCollapsedGroups((prev) => {
@@ -3078,8 +3056,6 @@ export default function GradebookTable() {
 
       setIsReorderingColumns(true);
       try {
-        // One retry on a version conflict. Losing a drag because someone else was also editing
-        // the layout is worth one silent retry; losing it twice is worth telling the user about.
         const apply = async (): Promise<void> => {
           const version = gradebookController.gradebook_row.rows[0]?.column_layout_version ?? 0;
           if (plan.kind === "reorder-groups") {

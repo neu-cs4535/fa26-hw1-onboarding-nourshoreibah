@@ -26,7 +26,6 @@ export type ExpressionContext = {
   incomplete_values_policy: "assume_max" | "assume_zero" | "report_only";
   scope: Sentry.Scope;
   class_id: number;
-  /** Set per column so `weighted_total()` can weigh every other column without weighing itself. */
   weighted_total_source?: WeightedTotalSource;
 };
 export type ResolvedExprDependencyInstance = ExprDependencyInstance & {
@@ -626,13 +625,6 @@ export async function addDependencySourceFunctions({
   math.import(imports, { override: true });
 }
 
-/**
- * Hand back the gradebook-column source that `addDependencySourceFunctions` attached to this math
- * instance. `weighted_total()` needs to read column values, and reading them through this source
- * rather than through the raw rows is what keeps it agreeing with `gradebook_columns(...)` in the
- * same expression: score overrides, values computed earlier in the same row, and the private and
- * instructor-only rules are all applied here and nowhere else.
- */
 export function getGradebookColumnsDependencySource(math: MathJsInstance): DependencySource | undefined {
   const batchDependencySourceMap = (math as unknown as Record<string, unknown>)._batchDependencySourceMap as
     | Record<string, DependencySource>

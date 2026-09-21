@@ -1,10 +1,3 @@
-/**
- * Grouping had no unit coverage at all. It was a memo inside a 4,000-line component, duplicated
- * into a second component, with three more partial copies alongside it, and the only thing any
- * test said about it was that a "Expand All" button existed.
- *
- * These cover the shaping and the drag planning now that both are ordinary functions.
- */
 import {
   buildColumnGroupKeyMap,
   buildGroupedColumns,
@@ -50,8 +43,6 @@ describe("display order", () => {
   });
 
   it("does not interleave groups, which sorting on position alone would", () => {
-    // Every group starts again at zero, so position on its own puts one column of each group
-    // first, then the next of each, which is a plausible order and the wrong one.
     const columns = [col(1, 10, 0), col(2, 20, 0), col(3, 10, 1), col(4, 20, 1)];
     const ids = sortColumnsForDisplay(columns, groups).map((c) => c.id);
     expect(ids).toEqual([2, 4, 1, 3]);
@@ -65,9 +56,6 @@ describe("display order", () => {
 
 describe("grouping", () => {
   it("keys on the group id, so two groups sharing a header stay distinct", () => {
-    // This is the case the old heuristic could not represent. A family split by a deleted column
-    // produced two groups both rendering "Quiz", and collapse state was keyed on that text, so
-    // collapsing one collapsed both.
     const groups = [group(1, "Quiz", 0), group(2, "Quiz", 1)];
     const columns = [col(11, 1, 0), col(12, 1, 1), col(13, 2, 0)];
 
@@ -80,7 +68,6 @@ describe("grouping", () => {
   });
 
   it("omits a group whose columns are all hidden instead of leaving an empty header", () => {
-    // A student's column list has instructor-only and unreleased columns filtered out of it.
     const groups = [group(1, "Labs", 0), group(2, "Hidden", 1)];
     const visibleToStudent = [col(11, 1, 0)];
 
@@ -91,9 +78,6 @@ describe("grouping", () => {
   });
 
   it("does not split a group when a column is filtered out of the middle of it", () => {
-    // The old grouping started a new group whenever sort_order skipped a number, so filtering a
-    // column out of a student's list split the group around the hole and showed them groups no
-    // instructor ever saw. Membership is a foreign key now, so a gap is just a gap.
     const groups = [group(1, "Skills", 0)];
     const afterFiltering = [col(11, 1, 0), col(13, 1, 2)];
 
@@ -143,8 +127,6 @@ describe("what a drag turned out to mean", () => {
   });
 
   it("reads a column landing among another group's columns as a move, never a reorder", () => {
-    // The distinction is the whole point. A reorder writes positions and cannot change
-    // membership, so a drag that changes membership has to come out as a different operation.
     const plan = planColumnDrag({
       orderedColumnIds: [11, 21, 12, 22],
       groupIdByColumnId,

@@ -250,9 +250,6 @@ export default function StudentPage() {
   const sortedPrivateGrades = useMemo(() => {
     if (!studentSummary) return [] as PrivateGrade[];
     const list = [...studentSummary.grades_private];
-    // Two columns here can sit in different groups, so both levels matter and both need a
-    // sentinel: a column whose group has not loaded sorts to the end rather than to position
-    // zero of an imaginary first group.
     const rank = (columnId: number): [number, number] => {
       const col = columnsById.get(columnId);
       if (!col) return [Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER];
