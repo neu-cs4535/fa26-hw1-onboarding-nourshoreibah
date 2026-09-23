@@ -14,6 +14,7 @@
  *   Fixture 3 — Countif for lab participation and skill tracking
  *   Fixture 4 — Instructor-only columns with frozen snapshot on release
  *   Fixture 5 — Score override precedence on manual and calculated columns
+ *   Fixture 6 — A total over a column group follows columns added to the group
  */
 
 import { Course } from "@/utils/supabase/DatabaseTypes";
@@ -45,14 +46,18 @@ async function createColumn(opts: {
   score_expression?: string | null;
   instructor_only?: boolean;
   position_in_group?: number;
-  dependencies?: { gradebook_columns?: number[]; assignments?: number[] } | null;
+  gradebook_column_group_id?: number;
+  dependencies?: { gradebook_columns?: number[]; assignments?: number[]; gradebook_column_groups?: number[] } | null;
 }): Promise<number> {
   const gbId = await getGradebookId(opts.class_id);
-  const { data: groupId, error: groupError } = await supabase.rpc("gradebook_column_group_for_slug", {
-    p_gradebook_id: gbId,
-    p_class_id: opts.class_id,
-    p_slug: opts.slug
-  });
+  const { data: groupId, error: groupError } =
+    opts.gradebook_column_group_id !== undefined
+      ? { data: opts.gradebook_column_group_id, error: null }
+      : await supabase.rpc("gradebook_column_group_for_slug", {
+          p_gradebook_id: gbId,
+          p_class_id: opts.class_id,
+          p_slug: opts.slug
+        });
   if (groupError || typeof groupId !== "number") {
     throw new Error(`Failed to resolve a column group for ${opts.slug}: ${groupError?.message}`);
   }
@@ -187,8 +192,12 @@ async function unreleaseColumn(class_id: number, column_slug: string) {
   if (error) throw new Error(`Unrelease failed for ${column_slug}: ${error.message}`);
 }
 
-/** Clear stuck recalculation states, enqueue all calculated rows, and kick the worker. */
-async function kickRecalculation(class_id: number) {
+/**
+ * Clear stuck recalculation states, enqueue all calculated rows, and kick the worker.
+ * With `enqueue: false` it only kicks the worker, so a test can prove that something else
+ * (a trigger) put the rows on the queue.
+ */
+async function kickRecalculation(class_id: number, { enqueue = true }: { enqueue?: boolean } = {}) {
   // Clear any stuck recalculating states
   await supabase
     .from("gradebook_row_recalc_state")
@@ -199,11 +208,13 @@ async function kickRecalculation(class_id: number) {
   // Enqueue recalculation for all calculated column rows in the class.
   // Score changes on manual columns don't auto-enqueue dependent calculated rows,
   // so we need to push them into the PGMQ queue ourselves.
-  const { data: calcRows } = await supabase
-    .from("gradebook_column_students")
-    .select("class_id, gradebook_id, student_id, is_private, gradebook_columns!inner(score_expression)")
-    .eq("class_id", class_id)
-    .not("gradebook_columns.score_expression", "is", null);
+  const { data: calcRows } = enqueue
+    ? await supabase
+        .from("gradebook_column_students")
+        .select("class_id, gradebook_id, student_id, is_private, gradebook_columns!inner(score_expression)")
+        .eq("class_id", class_id)
+        .not("gradebook_columns.score_expression", "is", null)
+    : { data: null };
 
   if (calcRows && calcRows.length > 0) {
     const batch = calcRows.map((r) => ({
@@ -252,6 +263,8 @@ async function waitForScore(opts: {
   /** Number of decimal places for toBeCloseTo (default 2 → ±0.005) */
   precision?: number;
   timeout?: number;
+  /** false: never enqueue rows ourselves, only kick the worker. */
+  enqueue?: boolean;
 }) {
   const precision = opts.precision ?? 2;
   const timeout = opts.timeout ?? 90_000;
@@ -260,7 +273,7 @@ async function waitForScore(opts: {
   await expect(async () => {
     if (kickCount < 8) {
       kickCount++;
-      await kickRecalculation(opts.class_id);
+      await kickRecalculation(opts.class_id, { enqueue: opts.enqueue ?? true });
     }
     const { data: col } = await supabase
       .from("gradebook_columns")
@@ -2031,5 +2044,162 @@ test.describe("Fixture 5: Score Override Precedence", () => {
     await expect(bonusCard).toBeVisible({ timeout: 30_000 });
     await expect(bonusCard).toContainText(/82(\.0+)?/);
     await assertStudentPageAccessible(page, "gradebook calculations student overrides UI");
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
+// FIXTURE 6: A total over a column group
+//
+// Columns, all in the "homework" group except extra:
+//   grp-hw-a (manual, max=100)
+//   grp-hw-b (manual, max=100)
+//   grp-hw-total = mean(gradebook_column_group("homework"))   [sits inside its own group]
+//   grp-hw-c (manual, max=100)   created after the total
+//   grp-extra (manual, max=100)  created in Ungrouped, then moved into homework
+//
+// Alice: a=80, b=60, c=100, extra=40
+//   before c:           100*(80+60)/200         = 70
+//   after c is scored:  100*(80+60+100)/300     = 80
+//   after extra moves:  100*(80+60+100+40)/400  = 70
+//
+// The last two steps poll with enqueue: false, so only the membership trigger and the
+// existing score-change trigger can put the total's rows on the queue.
+// ────────────────────────────────────────────────────────────────────
+
+test.describe("Fixture 6: Column group total", () => {
+  test.describe.configure({ mode: "serial" });
+  test.setTimeout(300_000);
+
+  let course: Course;
+  let alice: TestingUser;
+  let groupId: number;
+
+  async function columnDependencies(slug: string) {
+    const { data, error } = await supabase
+      .from("gradebook_columns")
+      .select("id, dependencies")
+      .eq("class_id", course.id)
+      .eq("slug", slug)
+      .single();
+    if (error || !data) throw new Error(`Column ${slug} not found: ${error?.message}`);
+    return { id: data.id, dependencies: data.dependencies as { gradebook_columns?: number[] } | null };
+  }
+
+  test.beforeAll(async () => {
+    course = await createClass({ name: "Calc Test — Column Group Total" });
+    const suffix = Math.random().toString(36).slice(2, 6);
+    [alice] = await createUsersInClass([
+      {
+        name: "Alice Group",
+        email: `alice-group-${suffix}@pawtograder.net`,
+        role: "student",
+        class_id: course.id,
+        useMagicLink: true
+      }
+    ]);
+
+    const gradebookId = await getGradebookId(course.id);
+    const { data: group, error: groupError } = await supabase
+      .from("gradebook_column_groups")
+      .insert({ class_id: course.id, gradebook_id: gradebookId, name: "Homework", slug: "homework", sort_order: 0 })
+      .select("id")
+      .single();
+    if (groupError || !group) throw new Error(`Failed to create group: ${groupError?.message}`);
+    groupId = group.id;
+
+    const a = await createColumn({
+      class_id: course.id,
+      name: "HW A",
+      slug: "grp-hw-a",
+      max_score: 100,
+      gradebook_column_group_id: groupId,
+      position_in_group: 0
+    });
+    const b = await createColumn({
+      class_id: course.id,
+      name: "HW B",
+      slug: "grp-hw-b",
+      max_score: 100,
+      gradebook_column_group_id: groupId,
+      position_in_group: 1
+    });
+    await createColumn({
+      class_id: course.id,
+      name: "Homework total",
+      slug: "grp-hw-total",
+      max_score: 100,
+      score_expression: 'mean(gradebook_column_group("homework"))',
+      dependencies: { gradebook_column_groups: [groupId], gradebook_columns: [a, b] },
+      gradebook_column_group_id: groupId,
+      position_in_group: 2
+    });
+
+    for (const slug of ["grp-hw-a", "grp-hw-b", "grp-hw-total"]) {
+      await waitForRow(course.id, slug, alice.private_profile_id, true);
+    }
+    await setScore(course.id, "grp-hw-a", alice.private_profile_id, 80);
+    await setScore(course.id, "grp-hw-b", alice.private_profile_id, 60);
+  });
+
+  test("the total averages the group's columns, not itself", async () => {
+    await waitForScore({
+      class_id: course.id,
+      student_id: alice.private_profile_id,
+      column_slug: "grp-hw-total",
+      is_private: true,
+      expected: 70
+    });
+  });
+
+  test("a column added to the group later is picked up without re-saving the total", async () => {
+    const c = await createColumn({
+      class_id: course.id,
+      name: "HW C",
+      slug: "grp-hw-c",
+      max_score: 100,
+      gradebook_column_group_id: groupId,
+      position_in_group: 3
+    });
+    const total = await columnDependencies("grp-hw-total");
+    expect(total.dependencies?.gradebook_columns).toContain(c);
+    expect(total.dependencies?.gradebook_columns).not.toContain(total.id);
+
+    await waitForRow(course.id, "grp-hw-c", alice.private_profile_id, true);
+    await setScore(course.id, "grp-hw-c", alice.private_profile_id, 100);
+    await waitForScore({
+      class_id: course.id,
+      student_id: alice.private_profile_id,
+      column_slug: "grp-hw-total",
+      is_private: true,
+      expected: 80,
+      enqueue: false
+    });
+  });
+
+  test("moving a scored column into the group recalculates the total", async () => {
+    const extra = await createColumn({ class_id: course.id, name: "Extra", slug: "grp-extra", max_score: 100 });
+    await waitForRow(course.id, "grp-extra", alice.private_profile_id, true);
+    await setScore(course.id, "grp-extra", alice.private_profile_id, 40);
+
+    const { error } = await supabase
+      .from("gradebook_columns")
+      .update({ gradebook_column_group_id: groupId, position_in_group: 4 })
+      .eq("id", extra);
+    if (error) throw new Error(`Failed to move grp-extra into homework: ${error.message}`);
+
+    expect((await columnDependencies("grp-hw-total")).dependencies?.gradebook_columns).toContain(extra);
+    await waitForScore({
+      class_id: course.id,
+      student_id: alice.private_profile_id,
+      column_slug: "grp-hw-total",
+      is_private: true,
+      expected: 70,
+      enqueue: false
+    });
+  });
+
+  test("a slug the total names cannot be changed", async () => {
+    const { error } = await supabase.from("gradebook_column_groups").update({ slug: "hw" }).eq("id", groupId);
+    expect(error?.message).toContain("Homework total (grp-hw-total)");
   });
 });
