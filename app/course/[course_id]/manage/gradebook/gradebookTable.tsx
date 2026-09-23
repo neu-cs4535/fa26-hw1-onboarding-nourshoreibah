@@ -149,6 +149,8 @@ const COLLAPSED_GROUP_COL_WIDTH = 48;
 const EMPTY_GROUP_COL_WIDTH = 200;
 /** Leaf ids of the placeholder column an empty group renders, alongside `grade_<id>`. */
 const EMPTY_GROUP_PREFIX = "emptygroup_";
+/** Droppable id of the zone after the last column that sends a dropped column to Ungrouped. */
+const UNGROUP_DROP_ID = "ungroup_drop";
 /** Droppable ids of those placeholders, so a column can be dropped straight into an empty group. */
 const EMPTY_GROUP_DROP_PREFIX = "emptygroupdrop_";
 
@@ -361,6 +363,106 @@ function effectiveInstructorOnlyForSubmit(scoreExpression: string | undefined, i
   return Boolean(normalizeScoreExpression(scoreExpression)) && Boolean(instructorOnly);
 }
 
+/**
+ * The group a column goes in: a dropdown, or "choose automatically from the slug" with a live
+ * preview of where that lands. The preview reads only; nothing is created until the dialog saves.
+ */
+function ColumnGroupField({
+  id,
+  groups,
+  autoGroup,
+  onAutoGroupChange,
+  slug,
+  active,
+  selectProps,
+  error,
+  emptySlugHint,
+  manualHint
+}: {
+  id: string;
+  groups: GradebookColumnGroup[];
+  autoGroup: boolean;
+  onAutoGroupChange: (checked: boolean) => void;
+  slug: string;
+  /** Whether the dialog is open; the preview only runs then. */
+  active: boolean;
+  selectProps: React.SelectHTMLAttributes<HTMLSelectElement> & { ref?: React.Ref<HTMLSelectElement> };
+  error?: string;
+  emptySlugHint?: string;
+  manualHint?: string;
+}) {
+  const gradebookController = useGradebookController();
+  const [slugRoute, setSlugRoute] = useState<{ name: string; isNew: boolean } | null>(null);
+  useEffect(() => {
+    const trimmed = slug.trim();
+    if (!active || !autoGroup || !trimmed) {
+      setSlugRoute(null);
+      return;
+    }
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      const { data, error: previewError } = await createClient().rpc("gradebook_column_group_preview_for_slug", {
+        p_gradebook_id: gradebookController.gradebook_id,
+        p_class_id: gradebookController.class_id,
+        p_slug: trimmed
+      });
+      if (cancelled) return;
+      const row = previewError ? undefined : data?.[0];
+      setSlugRoute(row ? { name: row.group_name, isNew: row.is_new } : null);
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [active, autoGroup, slug, gradebookController]);
+
+  return (
+    <Box>
+      <Label htmlFor={id}>Group</Label>
+      <NativeSelect.Root size="sm" disabled={autoGroup}>
+        <NativeSelect.Field id={id} {...selectProps}>
+          <option value="" disabled>
+            Choose a group
+          </option>
+          {groups.map((g) => (
+            <option key={g.id} value={String(g.id)}>
+              {g.name}
+            </option>
+          ))}
+        </NativeSelect.Field>
+        <NativeSelect.Indicator />
+      </NativeSelect.Root>
+      {error && !autoGroup && (
+        <Text color="red.500" fontSize="sm" mt={1}>
+          {error}
+        </Text>
+      )}
+      <Box mt={2}>
+        <Checkbox checked={autoGroup} onCheckedChange={(details) => onAutoGroupChange(details.checked === true)}>
+          Choose automatically from the slug
+        </Checkbox>
+      </Box>
+      {autoGroup ? (
+        <Text fontSize="xs" color="fg.muted" mt={1}>
+          {!slug.trim()
+            ? (emptySlugHint ?? "")
+            : slugRoute === null
+              ? "Checking…"
+              : slugRoute.isNew
+                ? `Starts a new group, ${slugRoute.name}.`
+                : `Joins ${slugRoute.name}.`}
+        </Text>
+      ) : (
+        manualHint && (
+          <Text fontSize="xs" color="fg.muted" mt={1}>
+            {manualHint}
+          </Text>
+        )
+      )}
+    </Box>
+  );
+}
+
 function AddColumnDialog({
   isOpen,
   onClose,
@@ -418,30 +520,6 @@ function AddColumnDialog({
   const autoGroup = watch("autoGroup");
   const slugValue = watch("slug") ?? "";
 
-  // Where "automatically from the slug" would put the column, read without creating anything.
-  const [slugRoute, setSlugRoute] = useState<{ name: string; isNew: boolean } | null>(null);
-  useEffect(() => {
-    const slug = slugValue.trim();
-    if (!isOpen || !autoGroup || !slug) {
-      setSlugRoute(null);
-      return;
-    }
-    let cancelled = false;
-    const timer = setTimeout(async () => {
-      const { data, error } = await createClient().rpc("gradebook_column_group_preview_for_slug", {
-        p_gradebook_id: gradebookController.gradebook_id,
-        p_class_id: gradebookController.class_id,
-        p_slug: slug
-      });
-      if (cancelled) return;
-      const row = error ? undefined : data?.[0];
-      setSlugRoute(row ? { name: row.group_name, isNew: row.is_new } : null);
-    }, 250);
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-    };
-  }, [isOpen, autoGroup, slugValue, gradebookController]);
   const renderExpressionValue = watch("renderExpression") ?? "";
   const maxScoreValue = watch("maxScore");
   const [isExpressionBuilderExpanded, setIsExpressionBuilderExpanded] = useState(false);
@@ -567,51 +645,19 @@ function AddColumnDialog({
                     </Text>
                   )}
                 </Box>
-                <Box>
-                  <Label htmlFor="gradebookColumnGroupId">Group</Label>
-                  <NativeSelect.Root size="sm" disabled={autoGroup}>
-                    <NativeSelect.Field
-                      id="gradebookColumnGroupId"
-                      {...register("gradebookColumnGroupId", {
-                        validate: (value, values) => values.autoGroup || value !== "" || "Choose a group"
-                      })}
-                    >
-                      <option value="" disabled>
-                        Choose a group
-                      </option>
-                      {addDialogGroups.map((g) => (
-                        <option key={g.id} value={String(g.id)}>
-                          {g.name}
-                        </option>
-                      ))}
-                    </NativeSelect.Field>
-                    <NativeSelect.Indicator />
-                  </NativeSelect.Root>
-                  {errors.gradebookColumnGroupId && !autoGroup && (
-                    <Text color="red.500" fontSize="sm" mt={1}>
-                      {errors.gradebookColumnGroupId.message as string}
-                    </Text>
-                  )}
-                  <Box mt={2}>
-                    <Checkbox
-                      checked={autoGroup}
-                      onCheckedChange={(details) => setValue("autoGroup", details.checked === true)}
-                    >
-                      Choose automatically from the slug
-                    </Checkbox>
-                  </Box>
-                  {autoGroup && (
-                    <Text fontSize="xs" color="fg.muted" mt={1}>
-                      {!slugValue.trim()
-                        ? "Type a slug to see which group the column joins."
-                        : slugRoute === null
-                          ? "Checking…"
-                          : slugRoute.isNew
-                            ? `Starts a new group, ${slugRoute.name}.`
-                            : `Joins ${slugRoute.name}.`}
-                    </Text>
-                  )}
-                </Box>
+                <ColumnGroupField
+                  id="gradebookColumnGroupId"
+                  groups={addDialogGroups}
+                  autoGroup={autoGroup}
+                  onAutoGroupChange={(checked) => setValue("autoGroup", checked)}
+                  slug={slugValue}
+                  active={isOpen}
+                  selectProps={register("gradebookColumnGroupId", {
+                    validate: (value, values) => values.autoGroup || value !== "" || "Choose a group"
+                  })}
+                  error={errors.gradebookColumnGroupId?.message as string | undefined}
+                  emptySlugHint="Type a slug to see which group the column joins."
+                />
                 <Box>
                   <Label htmlFor="maxScore">
                     Max Score
@@ -726,6 +772,7 @@ function EditColumnDialog({ columnId, onClose }: { columnId: number; onClose: ()
     renderExpression?: string;
     showCalculatedRanges?: boolean;
     instructorOnly: boolean;
+    autoGroup: boolean;
     gradebookColumnGroupId: string;
   };
 
@@ -747,6 +794,7 @@ function EditColumnDialog({ columnId, onClose }: { columnId: number; onClose: ()
       renderExpression: column?.render_expression ?? "",
       showCalculatedRanges: column?.show_calculated_ranges ?? false,
       instructorOnly: column?.instructor_only ?? false,
+      autoGroup: false,
       gradebookColumnGroupId: column ? String(column.gradebook_column_group_id) : ""
     }
   });
@@ -754,6 +802,7 @@ function EditColumnDialog({ columnId, onClose }: { columnId: number; onClose: ()
   const scoreExpression = watch("scoreExpression") ?? "";
   const renderExpressionValue = watch("renderExpression") ?? "";
   const maxScoreValue = watch("maxScore");
+  const editAutoGroup = watch("autoGroup");
   const [isExpressionBuilderExpanded, setIsExpressionBuilderExpanded] = useState(false);
   const [validation, setValidation] = useState<ValidationResult | null>(null);
 
@@ -769,6 +818,7 @@ function EditColumnDialog({ columnId, onClose }: { columnId: number; onClose: ()
         renderExpression: column.render_expression ?? "",
         showCalculatedRanges: column.show_calculated_ranges ?? false,
         instructorOnly: column.instructor_only ?? false,
+        autoGroup: false,
         gradebookColumnGroupId: String(column.gradebook_column_group_id)
       });
       // Clear any ValidationResult cached from a previously-edited column so
@@ -828,7 +878,14 @@ function EditColumnDialog({ columnId, onClose }: { columnId: number; onClose: ()
 
       // Moving goes through the RPC, which keeps positions in both groups dense. It runs first so a
       // move the database refuses (a cycle through a group total) leaves the rest unsaved too.
-      const targetGroupId = Number(data.gradebookColumnGroupId);
+      const targetGroupId = data.autoGroup
+        ? await resolveGroupForSlug(
+            createClient(),
+            gradebookController.gradebook_id,
+            gradebookController.class_id,
+            column.slug
+          )
+        : Number(data.gradebookColumnGroupId);
       if (Number.isFinite(targetGroupId) && targetGroupId > 0 && targetGroupId !== column.gradebook_column_group_id) {
         const { error: moveError } = await createClient().rpc("gradebook_column_assign_group", {
           p_column_id: columnId,
@@ -970,22 +1027,16 @@ function EditColumnDialog({ columnId, onClose }: { columnId: number; onClose: ()
                     </Text>
                   )}
                 </Box>
-                <Box>
-                  <Label htmlFor="editGradebookColumnGroupId">Group</Label>
-                  <NativeSelect.Root size="sm">
-                    <NativeSelect.Field id="editGradebookColumnGroupId" {...register("gradebookColumnGroupId")}>
-                      {editDialogGroups.map((g) => (
-                        <option key={g.id} value={String(g.id)}>
-                          {g.name}
-                        </option>
-                      ))}
-                    </NativeSelect.Field>
-                    <NativeSelect.Indicator />
-                  </NativeSelect.Root>
-                  <Text fontSize="xs" color="fg.muted" mt={1}>
-                    Moving a column puts it at the end of the new group. Totals that name the group pick it up.
-                  </Text>
-                </Box>
+                <ColumnGroupField
+                  id="editGradebookColumnGroupId"
+                  groups={editDialogGroups}
+                  autoGroup={editAutoGroup}
+                  onAutoGroupChange={(checked) => setValue("autoGroup", checked)}
+                  slug={column.slug ?? ""}
+                  active
+                  selectProps={register("gradebookColumnGroupId")}
+                  manualHint="Moving a column puts it at the end of the new group. Totals that name the group pick it up."
+                />
                 <Box>
                   {canEditScoreExpression ? (
                     <ExpressionBuilder
@@ -2477,6 +2528,34 @@ function EmptyGroupPlaceholderHeader({
   );
 }
 
+/** Appears after the last column while a column is dragged; dropping there takes it out of its group. */
+function UngroupDropZone({ left, height }: { left: number; height: number }) {
+  const { setNodeRef, isOver } = useDroppable({ id: UNGROUP_DROP_ID });
+  return (
+    <Box
+      ref={setNodeRef}
+      position="absolute"
+      left={`${left + 8}px`}
+      top="6px"
+      w="140px"
+      h={`${Math.max(height - 12, 24)}px`}
+      display="flex"
+      alignItems="center"
+      justifyContent="center"
+      borderWidth="1px"
+      borderStyle="dashed"
+      borderColor={isOver ? "border.info" : "border.emphasized"}
+      bg={isOver ? "bg.info" : "bg.subtle"}
+      borderRadius="md"
+      zIndex={45}
+    >
+      <Text fontSize="xs" color="fg.muted">
+        Ungrouped
+      </Text>
+    </Box>
+  );
+}
+
 function DraggableGradebookHeaderBox({
   header,
   vc,
@@ -3435,6 +3514,13 @@ export default function GradebookTable() {
         });
       };
 
+      if (overId === UNGROUP_DROP_ID) {
+        const defaultGroupId = columnGroups.find((g) => g.is_default)?.id;
+        if (!activeIdStr.startsWith("grade_") || defaultGroupId === undefined) return;
+        await dropColumn(Number(activeIdStr.slice(6)), { groupId: defaultGroupId, beforeColumnId: null });
+        return;
+      }
+
       // A column dropped on an empty group's placeholder moves into that group.
       if (overId.startsWith(EMPTY_GROUP_DROP_PREFIX)) {
         if (!activeIdStr.startsWith("grade_")) return;
@@ -3486,7 +3572,8 @@ export default function GradebookTable() {
       movableGroupOrder,
       leafGroupIds,
       runOptimisticLayoutChange,
-      reorderGroups
+      reorderGroups,
+      columnGroups
     ]
   );
 
@@ -4212,6 +4299,9 @@ export default function GradebookTable() {
                                 />
                               );
                             })}
+                            {activeDragColumnId?.startsWith("grade_") && (
+                              <UngroupDropZone left={scrollableWidth} height={leafHeaderHeight} />
+                            )}
                             {columnVirtualizer.getVirtualItems().map((vc) => {
                               const header = h2Scroll[vc.index];
                               if (!header) return null;
