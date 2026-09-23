@@ -861,13 +861,13 @@ test.describe("Gradebook Page - Comprehensive", () => {
 
     // Verify calculated/summary columns are present (some headers may be grouped/virtualized)
     // Check for at least one Average column and the Final Grade column
-    await expect(page.getByText("Average Assignments")).toBeVisible();
+    await expect(page.getByText("Average Assignments").first()).toBeVisible();
 
     // Verify manual grading columns
-    await expect(page.getByText("Participation")).toBeVisible();
+    await expect(page.getByText("Participation").first()).toBeVisible();
 
     // Check calculated columns (avoid relying on hidden/virtualized headers)
-    await expect(page.getByText("Final Grade")).toBeVisible();
+    await expect(page.getByText("Final Grade").first()).toBeVisible();
 
     // Verify student count
     await expect(page.getByText(`Showing ${students.length} students`)).toBeVisible();
@@ -1788,6 +1788,9 @@ test.describe("Gradebook column reorder (issue #531)", () => {
       await page.getByRole("option", { name: c.name, exact: true }).click();
       await expect(createDialog.getByRole("button", { name: `Remove ${c.name}` })).toBeVisible();
     }
+    // The picker stays open between picks and its menu covers the footer, so close it first.
+    await createDialog.getByLabel("Name", { exact: true }).click();
+    await expect(page.getByRole("option")).toHaveCount(0);
     await createDialog.getByRole("button", { name: "Create group" }).click();
     await expect(createDialog).toBeHidden({ timeout: 15_000 });
 
