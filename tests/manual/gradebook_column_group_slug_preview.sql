@@ -1,4 +1,4 @@
--- Proof harness for 20260920120400_gradebook_column_group_slug_preview.sql.
+-- Proof harness for 20260920120000_gradebook_column_groups.sql (the gradebook_column_group_slug_preview section).
 --
 -- Run from the repo root against a seeded local Supabase; everything happens in one transaction that
 -- ends in ROLLBACK, so it leaves no fixtures behind:

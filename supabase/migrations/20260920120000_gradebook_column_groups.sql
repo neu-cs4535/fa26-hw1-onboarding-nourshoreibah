@@ -1,3 +1,7 @@
+-- ============================================================================
+-- gradebook_column_groups
+-- ============================================================================
+
 DO $$
 DECLARE
   v_nulls integer;
@@ -55,6 +59,9 @@ COMMENT ON COLUMN public.gradebook_column_groups.auto_assign_slug_base IS
 
 CREATE UNIQUE INDEX IF NOT EXISTS gradebook_column_groups_one_default
   ON public.gradebook_column_groups (gradebook_id) WHERE is_default;
+-- Not unique: a family the instructor split around another one (hw-1, hw-2 | midterm | hw-3)
+-- keeps one group per run, all advertising the same base. Routing sends a new column to the
+-- last of them in display order (sort_order DESC, id DESC).
 CREATE INDEX IF NOT EXISTS gradebook_column_groups_auto_assign_idx
   ON public.gradebook_column_groups (gradebook_id, auto_assign_slug_base)
   WHERE auto_assign_slug_base IS NOT NULL;
@@ -77,6 +84,65 @@ DROP TRIGGER IF EXISTS set_updated_at_on_gradebook_column_groups ON public.grade
 CREATE TRIGGER set_updated_at_on_gradebook_column_groups
   BEFORE UPDATE ON public.gradebook_column_groups
   FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+-- The instructor policy above admits any column in a PATCH, so the invariants the ordering
+-- RPCs rely on are held here, as help_requests and api_tokens do for theirs.
+-- Attached to UPDATE OF those columns, which fires on the statement's column list rather than
+-- on a changed value, so the comparisons let a no-op write of the same value through.
+CREATE OR REPLACE FUNCTION public.gradebook_column_groups_forbid_rehome()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  IF NEW.id IS DISTINCT FROM OLD.id THEN
+    RAISE EXCEPTION 'gradebook column group % cannot change its id', OLD.id
+      USING ERRCODE = '42501';
+  END IF;
+  -- Moving a group to another class or gradebook would carry its members' layout with it
+  -- and let RLS be checked against a class the caller picked.
+  IF NEW.class_id IS DISTINCT FROM OLD.class_id OR NEW.gradebook_id IS DISTINCT FROM OLD.gradebook_id THEN
+    RAISE EXCEPTION 'gradebook column group % cannot be moved to another class or gradebook', OLD.id
+      USING ERRCODE = '42501';
+  END IF;
+  -- Every gradebook has exactly one default group, created with the gradebook.
+  IF NEW.is_default IS DISTINCT FROM OLD.is_default THEN
+    RAISE EXCEPTION 'is_default is fixed when a group is created (group %)', OLD.id
+      USING ERRCODE = '42501';
+  END IF;
+  RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS gradebook_column_groups_forbid_rehome_tr ON public.gradebook_column_groups;
+CREATE TRIGGER gradebook_column_groups_forbid_rehome_tr
+  BEFORE UPDATE OF id, class_id, gradebook_id, is_default ON public.gradebook_column_groups
+  FOR EACH ROW EXECUTE FUNCTION public.gradebook_column_groups_forbid_rehome();
+
+-- The default group goes only with its gradebook or class. ON DELETE CASCADE deletes it from
+-- the foreign key's trigger after the parent row is gone, and the lookups below run in a later
+-- command than that delete, so they no longer see the parent. A direct DELETE still does.
+CREATE OR REPLACE FUNCTION public.gradebook_column_groups_protect_default()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  IF OLD.is_default
+     AND EXISTS (SELECT 1 FROM public.gradebooks WHERE id = OLD.gradebook_id)
+     AND EXISTS (SELECT 1 FROM public.classes WHERE id = OLD.class_id) THEN
+    RAISE EXCEPTION 'the default group cannot be deleted; it is where columns go when nothing else claims them'
+      USING ERRCODE = '42501';
+  END IF;
+  RETURN OLD;
+END $$;
+
+REVOKE ALL ON FUNCTION public.gradebook_column_groups_protect_default() FROM PUBLIC, anon, authenticated;
+
+DROP TRIGGER IF EXISTS gradebook_column_groups_protect_default_tr ON public.gradebook_column_groups;
+CREATE TRIGGER gradebook_column_groups_protect_default_tr
+  BEFORE DELETE ON public.gradebook_column_groups
+  FOR EACH ROW EXECUTE FUNCTION public.gradebook_column_groups_protect_default();
 
 -- Statement-level: a renumber touches every group in a gradebook, and a row-level trigger
 -- would repeat the per-student loop once per group.
@@ -428,15 +494,37 @@ CREATE TABLE public._cg_correction_ledger (
   correction text NOT NULL
 );
 
+-- C1: the heuristic started a new header at every hole in sort_order, so deleting a column
+-- split its family in two. Each phase-one group is one legacy run, so two neighbouring groups
+-- (in display order) with the same base can only have been split by such a hole, and those
+-- are rejoined. Runs of one base with another family between them (hw-1, hw-2 | midterm |
+-- hw-3) were put in that order by the instructor and stay separate groups.
 CREATE TEMP TABLE _cg_merge_map AS
-WITH fams AS (
+WITH seq AS (
+  SELECT g.id,
+         g.gradebook_id,
+         g.sort_order,
+         g.auto_assign_slug_base AS base,
+         LAG(g.auto_assign_slug_base) OVER (PARTITION BY g.gradebook_id
+                                            ORDER BY g.sort_order, g.id) AS prev_base
+    FROM public.gradebook_column_groups g
+   WHERE NOT g.is_default
+),
+islands AS (
+  SELECT s.*,
+         SUM(CASE WHEN s.base IS NOT NULL AND s.base = s.prev_base THEN 0 ELSE 1 END)
+           OVER (PARTITION BY s.gradebook_id
+                 ORDER BY s.sort_order, s.id
+                 ROWS UNBOUNDED PRECEDING) AS island
+    FROM seq s
+),
+fams AS (
   SELECT gradebook_id,
-         auto_assign_slug_base,
+         island,
          (array_agg(id ORDER BY sort_order, id))[1] AS keep_id,
          array_agg(id) AS member_group_ids
-    FROM public.gradebook_column_groups
-   WHERE auto_assign_slug_base IS NOT NULL AND NOT is_default
-   GROUP BY gradebook_id, auto_assign_slug_base
+    FROM islands
+   GROUP BY gradebook_id, island
   HAVING count(*) > 1
 )
 SELECT gc.id AS column_id,
@@ -450,7 +538,7 @@ SELECT gc.id AS column_id,
     ON gc.gradebook_column_group_id = g.id;
 
 INSERT INTO public._cg_correction_ledger (column_id, correction)
-SELECT column_id, 'C1 merged a family that a deleted column had split in two'
+SELECT column_id, 'C1 rejoined neighbouring runs of one family that only a gap in sort_order (usually a deleted column) had split'
   FROM _cg_merge_map
 ON CONFLICT (column_id) DO NOTHING;
 
@@ -465,23 +553,34 @@ DELETE FROM public.gradebook_column_groups g
    AND NOT EXISTS (SELECT 1 FROM public.gradebook_columns c
                     WHERE c.gradebook_column_group_id = g.id);
 
-CREATE TEMP TABLE _cg_assignment_kind AS
+-- C2 covers only columns whose legacy base is the bare 'assignment' (two-token slugs such as
+-- assignment-final), which the heuristic pooled under one header whatever they were. Slugs
+-- with a subtype (assignment-lab-3, assignment-hw1-code-walk) already have a family base
+-- (assignment-lab, assignment-hw1) and keep the phase-one grouping. New-column routing
+-- (_gradebook_column_group_slug_route) applies the same rule.
+-- kind is the routing key for a column linked through assignments.gradebook_column_id, and
+-- NULL for one that no assignment points at.
+CREATE TEMP TABLE _cg_bare_assignment AS
 SELECT gc.id AS column_id,
        gc.gradebook_id,
        gc.class_id,
+       gc.name,
+       gc.slug,
        CASE
-         WHEN a.minutes_due_after_lab IS NOT NULL      THEN 'assignment-lab'
-         WHEN a.group_config <> 'individual'           THEN 'assignment-group'
-         ELSE                                               'assignment-individual'
+         WHEN a.id IS NULL                        THEN NULL
+         WHEN a.minutes_due_after_lab IS NOT NULL THEN 'assignment-lab'
+         WHEN a.group_config <> 'individual'      THEN 'assignment-group'
+         ELSE                                          'assignment-individual'
        END AS kind
   FROM public.gradebook_columns gc
-  JOIN public.assignments a ON a.gradebook_column_id = gc.id;
-
-CREATE TEMP TABLE _cg_slug_pretenders AS
-SELECT gc.id AS column_id, gc.gradebook_id, gc.class_id, gc.name
-  FROM public.gradebook_columns gc
- WHERE gc.slug LIKE 'assignment-%'
-   AND NOT EXISTS (SELECT 1 FROM public.assignments a WHERE a.gradebook_column_id = gc.id);
+  LEFT JOIN LATERAL (
+    SELECT a.id, a.minutes_due_after_lab, a.group_config
+      FROM public.assignments a
+     WHERE a.gradebook_column_id = gc.id
+     ORDER BY a.id
+     LIMIT 1
+  ) a ON true
+ WHERE public.gradebook_column_base_group_name(gc.slug) = 'assignment';
 
 CREATE OR REPLACE FUNCTION public._cg_ensure_group(
   p_gradebook_id bigint, p_class_id bigint, p_slug text, p_name text, p_auto_base text)
@@ -509,20 +608,74 @@ BEGIN
   RETURN v_id;
 END $$;
 
+-- Always inserts, suffixing the slug (-2, -3, ...) past any group already using it, the way
+-- _gradebook_column_group_for_slug does.
+CREATE OR REPLACE FUNCTION public._cg_create_group(
+  p_gradebook_id bigint, p_class_id bigint, p_slug text, p_name text, p_auto_base text)
+RETURNS bigint
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_id bigint;
+  v_slug text := p_slug;
+  v_suffix integer := 1;
+BEGIN
+  WHILE EXISTS (SELECT 1 FROM public.gradebook_column_groups
+                 WHERE gradebook_id = p_gradebook_id AND slug = v_slug) LOOP
+    v_suffix := v_suffix + 1;
+    v_slug := p_slug || '-' || v_suffix;
+  END LOOP;
+
+  INSERT INTO public.gradebook_column_groups
+         (class_id, gradebook_id, name, slug, sort_order, auto_assign_slug_base)
+  SELECT p_class_id, p_gradebook_id, p_name, v_slug,
+         COALESCE((SELECT MAX(sort_order) + 1
+                     FROM public.gradebook_column_groups
+                    WHERE gradebook_id = p_gradebook_id AND NOT is_default), 0),
+         p_auto_base
+  RETURNING id INTO v_id;
+  RETURN v_id;
+END $$;
+
+-- The group new-column routing would pick for p_key: the last group advertising it in display
+-- order, else a new one advertising it.
+CREATE OR REPLACE FUNCTION public._cg_route_group(
+  p_gradebook_id bigint, p_class_id bigint, p_key text, p_name text)
+RETURNS bigint
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_id bigint;
+BEGIN
+  SELECT id INTO v_id
+    FROM public.gradebook_column_groups
+   WHERE gradebook_id = p_gradebook_id
+     AND auto_assign_slug_base = p_key
+     AND NOT is_default
+   ORDER BY sort_order DESC, id DESC
+   LIMIT 1;
+  IF v_id IS NOT NULL THEN
+    RETURN v_id;
+  END IF;
+  RETURN public._cg_create_group(p_gradebook_id, p_class_id, p_key, p_name, p_key);
+END $$;
+
+-- C2a: a bare assignment-<slug> column linked to an assignment joins the lab, group or
+-- individual assignment group.
 CREATE TEMP TABLE _cg_c2a_targets AS
-SELECT k.column_id,
-       public._cg_ensure_group(
-         k.gradebook_id, k.class_id, k.kind,
-         CASE k.kind
+SELECT b.column_id,
+       public._cg_route_group(
+         b.gradebook_id, b.class_id, b.kind,
+         CASE b.kind
            WHEN 'assignment-lab'   THEN 'Labs'
            WHEN 'assignment-group' THEN 'Group Assignments'
            ELSE                         'Assignments'
-         END,
-         k.kind) AS new_group_id
-  FROM _cg_assignment_kind k;
+         END) AS new_group_id
+  FROM _cg_bare_assignment b
+ WHERE b.kind IS NOT NULL;
 
 INSERT INTO public._cg_correction_ledger (column_id, correction)
-SELECT t.column_id, 'C2 classified from the assignments row instead of the slug'
+SELECT t.column_id, 'C2 bare assignment-<slug> column grouped by its assignments row (lab, group or individual)'
   FROM _cg_c2a_targets t
   JOIN public.gradebook_columns gc ON gc.id = t.column_id
  WHERE gc.gradebook_column_group_id IS DISTINCT FROM t.new_group_id
@@ -533,15 +686,20 @@ UPDATE public.gradebook_columns gc
   FROM _cg_c2a_targets t
  WHERE gc.id = t.column_id;
 
+-- C2b: a bare assignment-<slug> column no assignment points at gets a group of its own, keyed
+-- by its full slug, once it shares its header with anything else.
 CREATE TEMP TABLE _cg_c2b_targets AS
-SELECT p.column_id,
-       public._cg_ensure_group(
-         p.gradebook_id, p.class_id,
-         'column-' || p.column_id::text, p.name, NULL) AS new_group_id
-  FROM _cg_slug_pretenders p;
+SELECT b.column_id,
+       public._cg_create_group(b.gradebook_id, b.class_id, b.slug, b.name, b.slug) AS new_group_id
+  FROM _cg_bare_assignment b
+  JOIN public.gradebook_columns gc ON gc.id = b.column_id
+ WHERE b.kind IS NULL
+   AND EXISTS (SELECT 1 FROM public.gradebook_columns o
+                WHERE o.gradebook_column_group_id = gc.gradebook_column_group_id
+                  AND o.id <> gc.id);
 
 INSERT INTO public._cg_correction_ledger (column_id, correction)
-SELECT t.column_id, 'C2 slug claimed an assignment that does not exist; moved out of the assignment group'
+SELECT t.column_id, 'C2 bare assignment-<slug> column with no assignments row; given its own group instead of sharing the assignment header'
   FROM _cg_c2b_targets t
 ON CONFLICT (column_id) DO NOTHING;
 
@@ -550,22 +708,40 @@ UPDATE public.gradebook_columns gc
   FROM _cg_c2b_targets t
  WHERE gc.id = t.column_id;
 
+-- A bare-'assignment' group left holding only its one unlinked column advertises that
+-- column's slug, as C2b's groups do. Nothing routes to the bare base any more.
+UPDATE public.gradebook_column_groups g
+   SET auto_assign_slug_base = only_col.slug
+  FROM (
+    SELECT c.gradebook_column_group_id AS group_id, min(c.slug) AS slug
+      FROM public.gradebook_columns c
+     GROUP BY c.gradebook_column_group_id
+    HAVING count(*) = 1
+  ) only_col
+ WHERE g.id = only_col.group_id
+   AND NOT g.is_default
+   AND g.auto_assign_slug_base = 'assignment';
+
+-- Only well-formed column ids count: a malformed dependencies row must not abort the deploy.
 CREATE TEMP TABLE _cg_dep_cohorts AS
 WITH deps AS (
   SELECT gc.id AS column_id,
          gc.gradebook_id,
          gc.class_id,
-         (SELECT array_agg(x ORDER BY x)
-            FROM jsonb_array_elements_text(gc.dependencies -> 'gradebook_columns') AS t(x)
+         (SELECT array_agg(DISTINCT t.x ORDER BY t.x)
+            FROM jsonb_array_elements_text(
+                   CASE WHEN jsonb_typeof(gc.dependencies -> 'gradebook_columns') = 'array'
+                        THEN gc.dependencies -> 'gradebook_columns'
+                        ELSE '[]'::jsonb END) AS t(x)
+           WHERE t.x ~ '^\d{1,18}$'
          ) AS dep_set
     FROM public.gradebook_columns gc
-   WHERE gc.dependencies ? 'gradebook_columns'
-     AND jsonb_array_length(gc.dependencies -> 'gradebook_columns') >= 2
+   WHERE jsonb_typeof(gc.dependencies -> 'gradebook_columns') = 'array'
 )
 SELECT gradebook_id, class_id, dep_set,
        array_agg(column_id ORDER BY column_id) AS column_ids
   FROM deps
- WHERE dep_set IS NOT NULL
+ WHERE cardinality(dep_set) >= 2
  GROUP BY gradebook_id, class_id, dep_set
 HAVING count(*) > 1;
 
@@ -791,9 +967,47 @@ DROP TRIGGER IF EXISTS gradebook_columns_enforce_sort_order_tr ON public.gradebo
 
 ALTER TABLE public.gradebook_columns DROP COLUMN sort_order;
 
+DROP FUNCTION IF EXISTS public._cg_route_group(bigint, bigint, text, text);
+DROP FUNCTION IF EXISTS public._cg_create_group(bigint, bigint, text, text, text);
 DROP FUNCTION IF EXISTS public._cg_ensure_group(bigint, bigint, text, text, text);
 DROP FUNCTION IF EXISTS public._cg_common_name_prefix(text[]);
 DROP TABLE IF EXISTS public._cg_correction_ledger;
+
+-- A new group is always appended, whatever sort_order the caller sent: the browser's
+-- max + 1 would otherwise race _gradebook_column_group_for_slug, which appends under the same
+-- per-gradebook advisory lock. Created after the backfill, which places phase-one groups at
+-- explicit positions. A group must also belong to its gradebook's class, which the
+-- instructor policy (checked on class_id alone) cannot see.
+CREATE OR REPLACE FUNCTION public.gradebook_column_groups_before_insert()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM public.gradebooks
+                  WHERE id = NEW.gradebook_id AND class_id = NEW.class_id) THEN
+    RAISE EXCEPTION 'gradebook % does not belong to class %', NEW.gradebook_id, NEW.class_id
+      USING ERRCODE = '42501';
+  END IF;
+
+  IF NEW.is_default THEN
+    NEW.sort_order := 2147483647;
+  ELSE
+    PERFORM pg_advisory_xact_lock(NEW.gradebook_id);
+    SELECT COALESCE(MAX(sort_order) + 1, 0) INTO NEW.sort_order
+      FROM public.gradebook_column_groups
+     WHERE gradebook_id = NEW.gradebook_id AND NOT is_default;
+  END IF;
+  RETURN NEW;
+END $$;
+
+REVOKE ALL ON FUNCTION public.gradebook_column_groups_before_insert() FROM PUBLIC, anon, authenticated;
+
+DROP TRIGGER IF EXISTS gradebook_column_groups_before_insert_tr ON public.gradebook_column_groups;
+CREATE TRIGGER gradebook_column_groups_before_insert_tr
+  BEFORE INSERT ON public.gradebook_column_groups
+  FOR EACH ROW EXECUTE FUNCTION public.gradebook_column_groups_before_insert();
 
 DROP INDEX IF EXISTS public.idx_gradebook_columns_id_covering;
 CREATE INDEX IF NOT EXISTS idx_gradebook_columns_group_position
@@ -846,3 +1060,2055 @@ CREATE TRIGGER gradebook_columns_broadcast_group_visibility_update
   AFTER UPDATE ON public.gradebook_columns
   REFERENCING OLD TABLE AS old_table NEW TABLE AS new_table
   FOR EACH STATEMENT EXECUTE FUNCTION public.broadcast_gradebook_column_groups_on_column_visibility();
+
+
+-- ============================================================================
+-- gradebook_column_groups_ordering
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public._gradebook_column_group_for_slug(
+  p_gradebook_id bigint, p_class_id bigint, p_slug text)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_base text;
+  v_slug text;
+  v_suffix integer := 1;
+  v_id   bigint;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM public.gradebooks WHERE id = p_gradebook_id AND class_id = p_class_id) THEN
+    RAISE EXCEPTION 'gradebook % does not belong to class %', p_gradebook_id, p_class_id;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(p_gradebook_id);
+
+  v_base := public.gradebook_column_base_group_name(p_slug);
+
+  SELECT g.id INTO v_id
+    FROM public.gradebook_column_groups g
+   WHERE g.gradebook_id = p_gradebook_id
+     AND g.auto_assign_slug_base = v_base
+   ORDER BY g.sort_order DESC, g.id DESC
+   LIMIT 1;
+
+  IF v_id IS NOT NULL THEN
+    RETURN v_id;
+  END IF;
+
+  -- A group already holding this slug has opted out of auto-routing, so make a new one beside it.
+  v_slug := v_base;
+  WHILE EXISTS (SELECT 1 FROM public.gradebook_column_groups
+                 WHERE gradebook_id = p_gradebook_id AND slug = v_slug) LOOP
+    v_suffix := v_suffix + 1;
+    v_slug := v_base || '-' || v_suffix;
+  END LOOP;
+
+  INSERT INTO public.gradebook_column_groups
+         (class_id, gradebook_id, name, slug, sort_order, auto_assign_slug_base)
+  VALUES (p_class_id, p_gradebook_id,
+          public.gradebook_column_group_display_name(v_base),
+          v_slug,
+          COALESCE((SELECT MAX(sort_order) + 1
+                      FROM public.gradebook_column_groups
+                     WHERE gradebook_id = p_gradebook_id AND NOT is_default), 0),
+          v_base)
+  RETURNING id INTO v_id;
+
+  RETURN v_id;
+END $$;
+
+REVOKE ALL ON FUNCTION public._gradebook_column_group_for_slug(bigint, bigint, text) FROM PUBLIC, anon, authenticated;
+
+CREATE OR REPLACE FUNCTION public.gradebook_column_group_for_slug(
+  p_gradebook_id bigint, p_class_id bigint, p_slug text)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  -- This can create a group, and only instructors create columns (and groups). Graders who
+  -- only want to know where a slug would land use gradebook_column_group_preview_for_slug.
+  IF COALESCE(auth.role(), '') <> 'service_role' AND NOT public.authorizeforclassinstructor(p_class_id) THEN
+    RAISE EXCEPTION 'insufficient permissions: instructor access required for class %', p_class_id;
+  END IF;
+  RETURN public._gradebook_column_group_for_slug(p_gradebook_id, p_class_id, p_slug);
+END $$;
+
+COMMENT ON FUNCTION public.gradebook_column_group_for_slug(bigint, bigint, text) IS
+  'Picks the group a newly created column belongs to, by the slug base the group advertises in auto_assign_slug_base.';
+
+REVOKE ALL ON FUNCTION public.gradebook_column_group_for_slug(bigint, bigint, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.gradebook_column_group_for_slug(bigint, bigint, text)
+  TO authenticated, service_role;
+
+CREATE OR REPLACE FUNCTION public.gradebook_columns_assign_default_group()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  IF NEW.gradebook_column_group_id IS NULL THEN
+    NEW.gradebook_column_group_id :=
+      public._gradebook_column_group_for_slug(NEW.gradebook_id, NEW.class_id, NEW.slug);
+  END IF;
+  RETURN NEW;
+END $$;
+
+-- Must sort before gradebook_columns_enforce_sort_order_tr: Postgres fires BEFORE ROW triggers in name order.
+DROP TRIGGER IF EXISTS gradebook_columns_assign_default_group_tr ON public.gradebook_columns;
+CREATE TRIGGER gradebook_columns_assign_default_group_tr
+  BEFORE INSERT ON public.gradebook_columns
+  FOR EACH ROW EXECUTE FUNCTION public.gradebook_columns_assign_default_group();
+
+CREATE OR REPLACE FUNCTION public.gradebook_columns_enforce_sort_order()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_max_other integer;
+  v_same_group boolean;
+BEGIN
+  -- Nested calls skip the shifting, which would re-enter this trigger through our own UPDATEs.
+  -- An INSERT from inside another trigger (code-walk rubric columns) still needs to be appended.
+  IF pg_trigger_depth() > 1 THEN
+    IF TG_OP = 'INSERT' AND (NEW.position_in_group IS NULL OR NEW.position_in_group < 0) THEN
+      PERFORM pg_advisory_xact_lock(NEW.gradebook_id);
+      SELECT COALESCE(MAX(position_in_group), -1) + 1
+        INTO NEW.position_in_group
+        FROM public.gradebook_columns
+       WHERE gradebook_column_group_id = NEW.gradebook_column_group_id;
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF current_setting('pawtograder.bypass_sort_order_trigger_' || NEW.gradebook_id::text, true) = 'true' THEN
+    RETURN NEW;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(NEW.gradebook_id);
+
+  -- The last position among the other members of the target group (-1 when there are none).
+  SELECT COALESCE(MAX(position_in_group), -1)
+    INTO v_max_other
+    FROM public.gradebook_columns
+   WHERE gradebook_column_group_id = NEW.gradebook_column_group_id
+     AND id <> NEW.id;
+
+  v_same_group := TG_OP = 'UPDATE'
+                  AND NEW.gradebook_column_group_id IS NOT DISTINCT FROM OLD.gradebook_column_group_id;
+
+  IF v_same_group THEN
+    -- Within a group the end is the last occupied slot, not one past it: a NULL or negative
+    -- position means "move to the end", and nothing may land beyond it and leave a gap.
+    IF NEW.position_in_group IS NULL OR NEW.position_in_group < 0
+       OR NEW.position_in_group > v_max_other THEN
+      NEW.position_in_group := GREATEST(v_max_other, OLD.position_in_group);
+    END IF;
+  ELSIF NEW.position_in_group IS NULL OR NEW.position_in_group < 0
+        OR NEW.position_in_group > v_max_other + 1 THEN
+    -- Joining a group (insert or move): append, and never past the end.
+    NEW.position_in_group := v_max_other + 1;
+  END IF;
+
+  IF TG_OP = 'INSERT' THEN
+    UPDATE public.gradebook_columns
+       SET position_in_group = position_in_group + 1
+     WHERE gradebook_column_group_id = NEW.gradebook_column_group_id
+       AND position_in_group >= NEW.position_in_group
+       AND id <> NEW.id;
+
+  ELSIF TG_OP = 'UPDATE' THEN
+    IF NOT v_same_group THEN
+      -- Close the hole in the group it left, then open one in the group it joined.
+      UPDATE public.gradebook_columns
+         SET position_in_group = position_in_group - 1
+       WHERE gradebook_column_group_id = OLD.gradebook_column_group_id
+         AND position_in_group > OLD.position_in_group
+         AND id <> NEW.id;
+
+      UPDATE public.gradebook_columns
+         SET position_in_group = position_in_group + 1
+       WHERE gradebook_column_group_id = NEW.gradebook_column_group_id
+         AND position_in_group >= NEW.position_in_group
+         AND id <> NEW.id;
+
+    ELSIF NEW.position_in_group > OLD.position_in_group THEN
+      -- Moving right: the columns it passes each step left one.
+      UPDATE public.gradebook_columns
+         SET position_in_group = position_in_group - 1
+       WHERE gradebook_column_group_id = NEW.gradebook_column_group_id
+         AND position_in_group >  OLD.position_in_group
+         AND position_in_group <= NEW.position_in_group
+         AND id <> NEW.id;
+
+    ELSIF NEW.position_in_group < OLD.position_in_group THEN
+      -- Moving left: the columns it passes each step right one.
+      UPDATE public.gradebook_columns
+         SET position_in_group = position_in_group + 1
+       WHERE gradebook_column_group_id = NEW.gradebook_column_group_id
+         AND position_in_group >= NEW.position_in_group
+         AND position_in_group <  OLD.position_in_group
+         AND id <> NEW.id;
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS gradebook_columns_enforce_sort_order_tr ON public.gradebook_columns;
+CREATE TRIGGER gradebook_columns_enforce_sort_order_tr
+BEFORE INSERT OR UPDATE OF position_in_group, gradebook_id, gradebook_column_group_id
+ON public.gradebook_columns
+FOR EACH ROW
+EXECUTE FUNCTION public.gradebook_columns_enforce_sort_order();
+
+CREATE OR REPLACE FUNCTION public.gradebooks_create_default_column_group()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  INSERT INTO public.gradebook_column_groups
+         (class_id, gradebook_id, name, slug, sort_order, is_default)
+  VALUES (NEW.class_id, NEW.id, 'Ungrouped', 'ungrouped', 2147483647, true)
+  ON CONFLICT (gradebook_id, slug) DO NOTHING;
+  RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS gradebooks_create_default_column_group_tr ON public.gradebooks;
+CREATE TRIGGER gradebooks_create_default_column_group_tr
+  AFTER INSERT ON public.gradebooks
+  FOR EACH ROW EXECUTE FUNCTION public.gradebooks_create_default_column_group();
+
+CREATE OR REPLACE FUNCTION public.create_gradebook_column_for_assignment()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public'
+AS $function$
+DECLARE
+    v_gradebook_id bigint;
+    v_group_id bigint;
+    v_position integer;
+    new_col_id bigint;
+BEGIN
+    SELECT g.id INTO v_gradebook_id
+    FROM public.gradebooks g
+    WHERE g.class_id = NEW.class_id
+    ORDER BY g.id
+    LIMIT 1;
+
+    IF v_gradebook_id IS NULL THEN
+        RETURN NEW;
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(v_gradebook_id);
+
+    v_group_id := public._gradebook_column_group_for_slug(
+                    v_gradebook_id, NEW.class_id, 'assignment-' || NEW.slug);
+
+    SELECT COALESCE(MAX(position_in_group), -1) + 1 INTO v_position
+      FROM public.gradebook_columns
+     WHERE gradebook_column_group_id = v_group_id;
+
+    INSERT INTO public.gradebook_columns (
+        name, max_score, slug, class_id, gradebook_id,
+        score_expression, released, dependencies,
+        gradebook_column_group_id, position_in_group
+    ) VALUES (
+        NEW.title,
+        NEW.total_points,
+        'assignment-' || NEW.slug,
+        NEW.class_id,
+        v_gradebook_id,
+        'assignments("' || NEW.slug || '")',
+        false,
+        jsonb_build_object('assignments', jsonb_build_array(NEW.id)),
+        v_group_id,
+        v_position
+    ) RETURNING id INTO new_col_id;
+
+    UPDATE public.assignments
+    SET gradebook_column_id = new_col_id
+    WHERE id = NEW.id;
+
+    RETURN NEW;
+END;
+$function$;
+
+ALTER TABLE public.gradebooks
+  ADD COLUMN IF NOT EXISTS column_layout_version bigint NOT NULL DEFAULT 0;
+
+CREATE OR REPLACE FUNCTION public.gradebooks_bump_layout_version_new()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+BEGIN
+  UPDATE public.gradebooks g SET column_layout_version = g.column_layout_version + 1
+   WHERE g.id IN (SELECT gradebook_id FROM new_table);
+  RETURN NULL;
+END $$;
+
+CREATE OR REPLACE FUNCTION public.gradebooks_bump_layout_version_old()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+BEGIN
+  UPDATE public.gradebooks g SET column_layout_version = g.column_layout_version + 1
+   WHERE g.id IN (SELECT gradebook_id FROM old_table);
+  RETURN NULL;
+END $$;
+
+CREATE OR REPLACE FUNCTION public.gradebooks_bump_layout_version_if_moved()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+BEGIN
+  UPDATE public.gradebooks g SET column_layout_version = g.column_layout_version + 1
+   WHERE g.id IN (
+     SELECT n.gradebook_id
+       FROM new_table n
+       JOIN old_table o ON o.id = n.id
+      WHERE n.position_in_group IS DISTINCT FROM o.position_in_group
+         OR n.gradebook_column_group_id IS DISTINCT FROM o.gradebook_column_group_id
+   );
+  RETURN NULL;
+END $$;
+
+DROP TRIGGER IF EXISTS gradebook_columns_bump_layout_insert ON public.gradebook_columns;
+CREATE TRIGGER gradebook_columns_bump_layout_insert
+  AFTER INSERT ON public.gradebook_columns
+  REFERENCING NEW TABLE AS new_table
+  FOR EACH STATEMENT EXECUTE FUNCTION public.gradebooks_bump_layout_version_new();
+
+DROP TRIGGER IF EXISTS gradebook_columns_bump_layout_update ON public.gradebook_columns;
+CREATE TRIGGER gradebook_columns_bump_layout_update
+  AFTER UPDATE ON public.gradebook_columns
+  REFERENCING OLD TABLE AS old_table NEW TABLE AS new_table
+  FOR EACH STATEMENT EXECUTE FUNCTION public.gradebooks_bump_layout_version_if_moved();
+
+DROP TRIGGER IF EXISTS gradebook_columns_bump_layout_delete ON public.gradebook_columns;
+CREATE TRIGGER gradebook_columns_bump_layout_delete
+  AFTER DELETE ON public.gradebook_columns
+  REFERENCING OLD TABLE AS old_table
+  FOR EACH STATEMENT EXECUTE FUNCTION public.gradebooks_bump_layout_version_old();
+
+DROP TRIGGER IF EXISTS gradebook_column_groups_bump_layout_insert ON public.gradebook_column_groups;
+CREATE TRIGGER gradebook_column_groups_bump_layout_insert
+  AFTER INSERT ON public.gradebook_column_groups
+  REFERENCING NEW TABLE AS new_table
+  FOR EACH STATEMENT EXECUTE FUNCTION public.gradebooks_bump_layout_version_new();
+
+CREATE OR REPLACE FUNCTION public.gradebooks_bump_layout_version_if_groups_moved()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+BEGIN
+  UPDATE public.gradebooks g SET column_layout_version = g.column_layout_version + 1
+   WHERE g.id IN (
+     SELECT n.gradebook_id
+       FROM new_table n
+       JOIN old_table o ON o.id = n.id
+      WHERE n.sort_order IS DISTINCT FROM o.sort_order
+   );
+  RETURN NULL;
+END $$;
+
+DROP TRIGGER IF EXISTS gradebook_column_groups_bump_layout_update ON public.gradebook_column_groups;
+CREATE TRIGGER gradebook_column_groups_bump_layout_update
+  AFTER UPDATE ON public.gradebook_column_groups
+  REFERENCING OLD TABLE AS old_table NEW TABLE AS new_table
+  FOR EACH STATEMENT EXECUTE FUNCTION public.gradebooks_bump_layout_version_if_groups_moved();
+
+DROP TRIGGER IF EXISTS gradebook_column_groups_bump_layout_delete ON public.gradebook_column_groups;
+CREATE TRIGGER gradebook_column_groups_bump_layout_delete
+  AFTER DELETE ON public.gradebook_column_groups
+  REFERENCING OLD TABLE AS old_table
+  FOR EACH STATEMENT EXECUTE FUNCTION public.gradebooks_bump_layout_version_old();
+
+CREATE OR REPLACE FUNCTION public._gradebook_columns_apply_positions(
+  p_gradebook_id bigint, p_group_id bigint, p_ordered_column_ids bigint[])
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || p_gradebook_id::text, 'true', true);
+  BEGIN
+    UPDATE public.gradebook_columns gc
+       SET position_in_group = t.ordinality - 1
+      FROM unnest(p_ordered_column_ids) WITH ORDINALITY AS t(id, ordinality)
+     WHERE gc.id = t.id
+       AND gc.gradebook_column_group_id = p_group_id
+       AND gc.position_in_group IS DISTINCT FROM t.ordinality - 1;
+  EXCEPTION
+    WHEN OTHERS THEN
+      PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || p_gradebook_id::text, 'false', true);
+      RAISE;
+  END;
+  PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || p_gradebook_id::text, 'false', true);
+END $$;
+
+REVOKE ALL ON FUNCTION public._gradebook_columns_apply_positions(bigint, bigint, bigint[]) FROM PUBLIC, anon, authenticated;
+
+CREATE OR REPLACE FUNCTION public.gradebook_column_move_left(p_column_id bigint)
+RETURNS public.gradebook_columns
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_col public.gradebook_columns;
+  v_neighbor_id bigint;
+  v_neighbor_pos integer;
+  v_group_order integer;
+  v_prev_group_id bigint;
+  v_prev_group_order integer;
+BEGIN
+  -- Same lock order as every other layout writer: the gradebook's advisory lock, then rows.
+  SELECT * INTO v_col FROM public.gradebook_columns WHERE id = p_column_id;
+  IF v_col.id IS NULL THEN
+    RAISE EXCEPTION 'gradebook column % not found', p_column_id;
+  END IF;
+
+  -- Checked here rather than left to RLS, which would silently update nothing.
+  IF NOT public.authorizeforclassinstructor(v_col.class_id) THEN
+    RAISE EXCEPTION 'insufficient permissions: instructor access required for class %', v_col.class_id;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(v_col.gradebook_id);
+
+  -- Re-read under the lock: the column may have moved or gone while we waited.
+  SELECT * INTO v_col FROM public.gradebook_columns WHERE id = p_column_id FOR UPDATE;
+  IF v_col.id IS NULL THEN
+    RAISE EXCEPTION 'gradebook column % not found', p_column_id;
+  END IF;
+
+  SELECT id, position_in_group INTO v_neighbor_id, v_neighbor_pos
+    FROM public.gradebook_columns
+   WHERE gradebook_column_group_id = v_col.gradebook_column_group_id
+     AND position_in_group < v_col.position_in_group
+   ORDER BY position_in_group DESC
+   LIMIT 1;
+
+  IF v_neighbor_id IS NOT NULL THEN
+    PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_col.gradebook_id::text, 'true', true);
+    BEGIN
+      UPDATE public.gradebook_columns SET position_in_group = v_col.position_in_group
+       WHERE id = v_neighbor_id;
+      UPDATE public.gradebook_columns SET position_in_group = v_neighbor_pos
+       WHERE id = p_column_id;
+    EXCEPTION
+      WHEN OTHERS THEN
+        PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_col.gradebook_id::text, 'false', true);
+        RAISE;
+    END;
+    PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_col.gradebook_id::text, 'false', true);
+  ELSE
+    SELECT sort_order INTO v_group_order
+      FROM public.gradebook_column_groups
+     WHERE id = v_col.gradebook_column_group_id AND NOT is_default;
+
+    SELECT id, sort_order INTO v_prev_group_id, v_prev_group_order
+      FROM public.gradebook_column_groups
+     WHERE gradebook_id = v_col.gradebook_id
+       AND NOT is_default
+       AND sort_order < v_group_order
+     ORDER BY sort_order DESC
+     LIMIT 1;
+
+    -- The default group is pinned last, so it neither moves nor is swapped with.
+    IF v_group_order IS NOT NULL AND v_prev_group_id IS NOT NULL THEN
+      UPDATE public.gradebook_column_groups SET sort_order = v_group_order WHERE id = v_prev_group_id;
+      UPDATE public.gradebook_column_groups SET sort_order = v_prev_group_order
+       WHERE id = v_col.gradebook_column_group_id;
+    END IF;
+  END IF;
+
+  SELECT * INTO v_col FROM public.gradebook_columns WHERE id = p_column_id;
+  RETURN v_col;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.gradebook_column_move_right(p_column_id bigint)
+RETURNS public.gradebook_columns
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_col public.gradebook_columns;
+  v_neighbor_id bigint;
+  v_neighbor_pos integer;
+  v_group_order integer;
+  v_next_group_id bigint;
+  v_next_group_order integer;
+BEGIN
+  -- Same lock order as every other layout writer: the gradebook's advisory lock, then rows.
+  SELECT * INTO v_col FROM public.gradebook_columns WHERE id = p_column_id;
+  IF v_col.id IS NULL THEN
+    RAISE EXCEPTION 'gradebook column % not found', p_column_id;
+  END IF;
+
+  -- Checked here rather than left to RLS, which would silently update nothing.
+  IF NOT public.authorizeforclassinstructor(v_col.class_id) THEN
+    RAISE EXCEPTION 'insufficient permissions: instructor access required for class %', v_col.class_id;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(v_col.gradebook_id);
+
+  -- Re-read under the lock: the column may have moved or gone while we waited.
+  SELECT * INTO v_col FROM public.gradebook_columns WHERE id = p_column_id FOR UPDATE;
+  IF v_col.id IS NULL THEN
+    RAISE EXCEPTION 'gradebook column % not found', p_column_id;
+  END IF;
+
+  SELECT id, position_in_group INTO v_neighbor_id, v_neighbor_pos
+    FROM public.gradebook_columns
+   WHERE gradebook_column_group_id = v_col.gradebook_column_group_id
+     AND position_in_group > v_col.position_in_group
+   ORDER BY position_in_group ASC
+   LIMIT 1;
+
+  IF v_neighbor_id IS NOT NULL THEN
+    PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_col.gradebook_id::text, 'true', true);
+    BEGIN
+      UPDATE public.gradebook_columns SET position_in_group = v_col.position_in_group
+       WHERE id = v_neighbor_id;
+      UPDATE public.gradebook_columns SET position_in_group = v_neighbor_pos
+       WHERE id = p_column_id;
+    EXCEPTION
+      WHEN OTHERS THEN
+        PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_col.gradebook_id::text, 'false', true);
+        RAISE;
+    END;
+    PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_col.gradebook_id::text, 'false', true);
+  ELSE
+    SELECT sort_order INTO v_group_order
+      FROM public.gradebook_column_groups
+     WHERE id = v_col.gradebook_column_group_id AND NOT is_default;
+
+    SELECT id, sort_order INTO v_next_group_id, v_next_group_order
+      FROM public.gradebook_column_groups
+     WHERE gradebook_id = v_col.gradebook_id
+       AND NOT is_default
+       AND sort_order > v_group_order
+     ORDER BY sort_order ASC
+     LIMIT 1;
+
+    IF v_group_order IS NOT NULL AND v_next_group_id IS NOT NULL THEN
+      UPDATE public.gradebook_column_groups SET sort_order = v_group_order WHERE id = v_next_group_id;
+      UPDATE public.gradebook_column_groups SET sort_order = v_next_group_order
+       WHERE id = v_col.gradebook_column_group_id;
+    END IF;
+  END IF;
+
+  SELECT * INTO v_col FROM public.gradebook_columns WHERE id = p_column_id;
+  RETURN v_col;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.gradebook_columns_reorder(p_ordered_column_ids bigint[])
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RAISE EXCEPTION 'gradebook_columns_reorder no longer describes a gradebook layout'
+    USING HINT = 'Column order is now two levels. Use gradebook_columns_reorder_in_group(group_id, ordered_ids, expected_version) to order columns inside a group, and gradebook_column_groups_reorder(gradebook_id, ordered_group_ids, expected_version) to order the groups.',
+          ERRCODE = 'feature_not_supported';
+END $$;
+
+CREATE OR REPLACE FUNCTION public.gradebook_columns_reorder_in_group(
+  p_group_id bigint, p_ordered_column_ids bigint[], p_expected_version bigint)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_gradebook_id bigint;
+  v_class_id bigint;
+  v_version bigint;
+  v_member_count integer;
+  v_given_count integer;
+BEGIN
+  SELECT gradebook_id, class_id INTO v_gradebook_id, v_class_id
+    FROM public.gradebook_column_groups WHERE id = p_group_id;
+  IF v_gradebook_id IS NULL THEN
+    RAISE EXCEPTION 'gradebook column group % not found', p_group_id;
+  END IF;
+
+  IF NOT public.authorizeforclassinstructor(v_class_id) THEN
+    RAISE EXCEPTION 'insufficient permissions: instructor access required for class %', v_class_id;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(v_gradebook_id);
+
+  SELECT column_layout_version INTO v_version
+    FROM public.gradebooks WHERE id = v_gradebook_id FOR UPDATE;
+  -- NULL is not a "skip the check" value; every caller sends the version it rendered.
+  IF v_version IS DISTINCT FROM p_expected_version THEN
+    RAISE EXCEPTION 'gradebook layout changed underneath this reorder (expected %, found %)',
+      p_expected_version, v_version
+      USING ERRCODE = '40001';
+  END IF;
+
+  SELECT count(*) INTO v_member_count
+    FROM public.gradebook_columns WHERE gradebook_column_group_id = p_group_id;
+
+  SELECT count(*) INTO v_given_count
+    FROM (SELECT DISTINCT unnest(p_ordered_column_ids)) t;
+
+  IF v_given_count <> array_length(p_ordered_column_ids, 1) THEN
+    RAISE EXCEPTION 'reorder list contains duplicate column ids';
+  END IF;
+  IF v_given_count <> v_member_count THEN
+    RAISE EXCEPTION 'reorder list has % columns but group % has %',
+      v_given_count, p_group_id, v_member_count;
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM unnest(p_ordered_column_ids) AS t(id)
+     WHERE NOT EXISTS (SELECT 1 FROM public.gradebook_columns gc
+                        WHERE gc.id = t.id AND gc.gradebook_column_group_id = p_group_id)
+  ) THEN
+    RAISE EXCEPTION 'reorder list names a column that is not in group %', p_group_id;
+  END IF;
+
+  PERFORM public._gradebook_columns_apply_positions(v_gradebook_id, p_group_id, p_ordered_column_ids);
+
+  SELECT column_layout_version INTO v_version FROM public.gradebooks WHERE id = v_gradebook_id;
+  RETURN v_version;
+END $$;
+
+CREATE OR REPLACE FUNCTION public.gradebook_column_groups_reorder(
+  p_gradebook_id bigint, p_ordered_group_ids bigint[], p_expected_version bigint)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_class_id bigint;
+  v_version bigint;
+  v_group_count integer;
+  v_given_count integer;
+BEGIN
+  SELECT class_id INTO v_class_id FROM public.gradebooks WHERE id = p_gradebook_id;
+  IF v_class_id IS NULL THEN
+    RAISE EXCEPTION 'gradebook % not found', p_gradebook_id;
+  END IF;
+
+  IF NOT public.authorizeforclassinstructor(v_class_id) THEN
+    RAISE EXCEPTION 'insufficient permissions: instructor access required for class %', v_class_id;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(p_gradebook_id);
+
+  SELECT column_layout_version INTO v_version
+    FROM public.gradebooks WHERE id = p_gradebook_id FOR UPDATE;
+  -- NULL is not a "skip the check" value; every caller sends the version it rendered.
+  IF v_version IS DISTINCT FROM p_expected_version THEN
+    RAISE EXCEPTION 'gradebook layout changed underneath this reorder (expected %, found %)',
+      p_expected_version, v_version
+      USING ERRCODE = '40001';
+  END IF;
+
+  SELECT count(*) INTO v_group_count
+    FROM public.gradebook_column_groups WHERE gradebook_id = p_gradebook_id AND NOT is_default;
+  SELECT count(*) INTO v_given_count
+    FROM (SELECT DISTINCT unnest(p_ordered_group_ids)) t;
+
+  IF v_given_count <> COALESCE(array_length(p_ordered_group_ids, 1), 0) THEN
+    RAISE EXCEPTION 'reorder list contains duplicate group ids';
+  END IF;
+  IF v_given_count <> v_group_count THEN
+    RAISE EXCEPTION 'reorder list has % groups but gradebook % has %',
+      v_given_count, p_gradebook_id, v_group_count;
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM unnest(p_ordered_group_ids) AS t(id)
+     WHERE NOT EXISTS (SELECT 1 FROM public.gradebook_column_groups g
+                        WHERE g.id = t.id AND g.gradebook_id = p_gradebook_id AND NOT g.is_default)
+  ) THEN
+    RAISE EXCEPTION 'reorder list names a group that is not in gradebook %', p_gradebook_id;
+  END IF;
+
+  UPDATE public.gradebook_column_groups g
+     SET sort_order = t.ordinality - 1
+    FROM unnest(p_ordered_group_ids) WITH ORDINALITY AS t(id, ordinality)
+   WHERE g.id = t.id;
+
+  SELECT column_layout_version INTO v_version FROM public.gradebooks WHERE id = p_gradebook_id;
+  RETURN v_version;
+END $$;
+
+CREATE OR REPLACE FUNCTION public.gradebook_column_assign_group(
+  p_column_id bigint, p_group_id bigint, p_position integer DEFAULT NULL)
+RETURNS public.gradebook_columns
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_col public.gradebook_columns;
+  v_group public.gradebook_column_groups;
+BEGIN
+  -- Same lock order as every other layout writer: the gradebook's advisory lock, then rows.
+  SELECT * INTO v_col FROM public.gradebook_columns WHERE id = p_column_id;
+  IF v_col.id IS NULL THEN
+    RAISE EXCEPTION 'gradebook column % not found', p_column_id;
+  END IF;
+
+  IF NOT public.authorizeforclassinstructor(v_col.class_id) THEN
+    RAISE EXCEPTION 'insufficient permissions: instructor access required for class %', v_col.class_id;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(v_col.gradebook_id);
+
+  SELECT * INTO v_col FROM public.gradebook_columns WHERE id = p_column_id FOR UPDATE;
+  IF v_col.id IS NULL THEN
+    RAISE EXCEPTION 'gradebook column % not found', p_column_id;
+  END IF;
+
+  SELECT * INTO v_group FROM public.gradebook_column_groups WHERE id = p_group_id;
+  IF v_group.id IS NULL THEN
+    RAISE EXCEPTION 'gradebook column group % not found', p_group_id;
+  END IF;
+
+  IF v_group.gradebook_id <> v_col.gradebook_id THEN
+    RAISE EXCEPTION 'group % belongs to a different gradebook than column %', p_group_id, p_column_id;
+  END IF;
+
+  UPDATE public.gradebook_columns
+     SET gradebook_column_group_id = p_group_id,
+         position_in_group = COALESCE(
+           p_position,
+           (SELECT COALESCE(MAX(position_in_group), -1) + 1
+              FROM public.gradebook_columns
+             WHERE gradebook_column_group_id = p_group_id AND id <> p_column_id))
+   WHERE id = p_column_id;
+
+  SELECT * INTO v_col FROM public.gradebook_columns WHERE id = p_column_id;
+  RETURN v_col;
+END $$;
+
+CREATE OR REPLACE FUNCTION public.gradebook_column_group_delete(p_group_id bigint)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_group public.gradebook_column_groups;
+  v_default_id bigint;
+  v_base integer;
+BEGIN
+  SELECT * INTO v_group FROM public.gradebook_column_groups WHERE id = p_group_id;
+  IF v_group.id IS NULL THEN
+    RAISE EXCEPTION 'gradebook column group % not found', p_group_id;
+  END IF;
+
+  IF NOT public.authorizeforclassinstructor(v_group.class_id) THEN
+    RAISE EXCEPTION 'insufficient permissions: instructor access required for class %', v_group.class_id;
+  END IF;
+
+  IF v_group.is_default THEN
+    RAISE EXCEPTION 'the default group cannot be deleted; it is where columns go when nothing else claims them';
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(v_group.gradebook_id);
+
+  SELECT id INTO v_default_id
+    FROM public.gradebook_column_groups
+   WHERE gradebook_id = v_group.gradebook_id AND is_default;
+
+  SELECT COALESCE(MAX(position_in_group), -1) + 1 INTO v_base
+    FROM public.gradebook_columns WHERE gradebook_column_group_id = v_default_id;
+
+  PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_group.gradebook_id::text, 'true', true);
+  BEGIN
+    UPDATE public.gradebook_columns gc
+       SET gradebook_column_group_id = v_default_id,
+           position_in_group = v_base + sub.rn
+      FROM (
+        SELECT id, ROW_NUMBER() OVER (ORDER BY position_in_group, id) - 1 AS rn
+          FROM public.gradebook_columns
+         WHERE gradebook_column_group_id = p_group_id
+      ) sub
+     WHERE gc.id = sub.id;
+  EXCEPTION
+    WHEN OTHERS THEN
+      PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_group.gradebook_id::text, 'false', true);
+      RAISE;
+  END;
+  PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_group.gradebook_id::text, 'false', true);
+
+  DELETE FROM public.gradebook_column_groups WHERE id = p_group_id;
+
+  UPDATE public.gradebook_column_groups g
+     SET sort_order = sub.pos
+    FROM (
+      SELECT id, ROW_NUMBER() OVER (ORDER BY sort_order, id) - 1 AS pos
+        FROM public.gradebook_column_groups
+       WHERE gradebook_id = v_group.gradebook_id AND NOT is_default
+    ) sub
+   WHERE g.id = sub.id AND g.sort_order IS DISTINCT FROM sub.pos;
+END $$;
+
+REVOKE ALL ON FUNCTION public.gradebook_columns_reorder_in_group(bigint, bigint[], bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.gradebook_column_groups_reorder(bigint, bigint[], bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.gradebook_column_assign_group(bigint, bigint, integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.gradebook_column_group_delete(bigint) FROM PUBLIC;
+
+GRANT EXECUTE ON FUNCTION public.gradebook_columns_reorder_in_group(bigint, bigint[], bigint) TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.gradebook_column_groups_reorder(bigint, bigint[], bigint) TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.gradebook_column_assign_group(bigint, bigint, integer) TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.gradebook_column_group_delete(bigint) TO authenticated, service_role;
+
+CREATE OR REPLACE FUNCTION public.get_gradebook_records_for_all_students(p_class_id bigint)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ STABLE PARALLEL SAFE SECURITY DEFINER
+ SET search_path TO 'pg_catalog', 'public'
+AS $function$
+BEGIN
+    IF NOT public.authorizeforclassgrader(p_class_id) THEN
+        RETURN '[]'::jsonb;
+    END IF;
+
+    RETURN (
+        SELECT COALESCE(jsonb_agg(student_data ORDER BY student_id), '[]'::jsonb)
+        FROM (
+            SELECT 
+                gcs.student_id,
+                jsonb_build_object(
+                    'private_profile_id', gcs.student_id::text,
+                    'entries', jsonb_agg(
+                        jsonb_build_object(
+                            'gcs_id', gcs.id,
+                            'gc_id', gcs.gradebook_column_id,
+                            'is_private', gcs.is_private,
+                            'score', gcs.score,
+                            'score_override', gcs.score_override,
+                            'is_missing', gcs.is_missing,
+                            'is_excused', gcs.is_excused,
+                            'is_droppable', gcs.is_droppable,
+                            'released', gcs.released,
+                            'score_override_note', gcs.score_override_note,
+                            'is_recalculating', gcs.is_recalculating,
+                            'incomplete_values', gcs.incomplete_values,
+                            'updated_at', to_jsonb(gcs.updated_at)
+                        ) ORDER BY gcg.sort_order ASC, gc.position_in_group ASC, gc.id ASC
+                    )
+                ) as student_data
+            FROM public.gradebook_column_students gcs
+            INNER JOIN public.gradebook_columns gc ON gc.id = gcs.gradebook_column_id
+            INNER JOIN public.gradebook_column_groups gcg ON gcg.id = gc.gradebook_column_group_id
+            WHERE gcs.class_id = p_class_id
+            GROUP BY gcs.student_id
+        ) grouped_data
+    );
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.get_gradebook_records_for_all_students_array(p_class_id bigint)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ STABLE PARALLEL SAFE SECURITY DEFINER
+ SET search_path TO 'pg_catalog', 'public'
+AS $function$
+BEGIN
+    -- Early authorization guard - return immediately if unauthorized
+    IF NOT public.authorizeforclassgrader(p_class_id) THEN
+        RETURN '[]'::jsonb;
+    END IF;
+    
+    -- Only execute heavy query if authorized
+    RETURN (
+        SELECT COALESCE(jsonb_agg(
+            jsonb_build_object(
+                'private_profile_id', student_id::text,
+                'entries', entries_array
+            ) ORDER BY student_id
+        ), '[]'::jsonb)
+        FROM (
+            SELECT 
+                gcs.student_id,
+                jsonb_agg(
+                    ARRAY[
+                        gcs.id::text,
+                        gcs.gradebook_column_id::text, 
+                        gcs.is_private::text,
+                        COALESCE(gcs.score::text, ''),
+                        COALESCE(gcs.score_override::text, ''),
+                        gcs.is_missing::text,
+                        gcs.is_excused::text,
+                        gcs.is_droppable::text,
+                        gcs.released::text,
+                        COALESCE(gcs.score_override_note, ''),
+                        gcs.is_recalculating::text,
+                        COALESCE(gcs.incomplete_values::text, '')
+                    ] ORDER BY gcg.sort_order ASC, gc.position_in_group ASC, gc.id ASC
+                ) as entries_array
+            FROM public.gradebook_column_students gcs
+            INNER JOIN public.gradebook_columns gc ON gc.id = gcs.gradebook_column_id
+            INNER JOIN public.gradebook_column_groups gcg ON gcg.id = gc.gradebook_column_group_id
+            WHERE gcs.class_id = p_class_id
+            GROUP BY gcs.student_id
+        ) array_data
+    );
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.gradebook_auto_layout(p_gradebook_id bigint)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_class_id bigint;
+  v_placed bigint[] := '{}';
+  v_next bigint[];
+  v_rank integer := 0;
+  v_remaining integer;
+  v_placed_now integer;
+BEGIN
+  SELECT class_id INTO v_class_id FROM public.gradebooks WHERE id = p_gradebook_id;
+  IF v_class_id IS NULL THEN
+    RAISE EXCEPTION 'gradebook % not found', p_gradebook_id;
+  END IF;
+
+  IF NOT public.authorizeforclassinstructor(v_class_id) THEN
+    RAISE EXCEPTION 'insufficient permissions: instructor access required for class %', v_class_id;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(p_gradebook_id);
+  PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || p_gradebook_id::text, 'true', true);
+
+  BEGIN
+    DROP TABLE IF EXISTS _al_col_deps;
+    DROP TABLE IF EXISTS _al_cols;
+    DROP TABLE IF EXISTS _al_edges;
+    DROP TABLE IF EXISTS _al_rank;
+
+    -- Every dependency edge between two columns of this gradebook. Ids that are not
+    -- well-formed are skipped rather than cast, so one bad row cannot abort the layout.
+    CREATE TEMP TABLE _al_col_deps ON COMMIT DROP AS
+    SELECT DISTINCT dep.id                        AS from_col,
+                    gc.id                         AS to_col,
+                    dep.gradebook_column_group_id AS from_group,
+                    gc.gradebook_column_group_id  AS to_group
+      FROM public.gradebook_columns gc
+      CROSS JOIN LATERAL jsonb_array_elements_text(
+                   CASE WHEN jsonb_typeof(gc.dependencies -> 'gradebook_columns') = 'array'
+                        THEN gc.dependencies -> 'gradebook_columns'
+                        ELSE '[]'::jsonb END) AS d(dep_id)
+      JOIN public.gradebook_columns dep
+        ON dep.id = CASE WHEN d.dep_id ~ '^\d{1,18}$' THEN d.dep_id::bigint END
+     WHERE gc.gradebook_id = p_gradebook_id
+       AND dep.gradebook_id = p_gradebook_id
+       AND dep.id <> gc.id;
+
+    -- Inside each group, the natural slug order (hw2 before hw10), except that a column comes
+    -- after every column of its own group it depends on. Kahn's algorithm, taking the earliest
+    -- ready column in natural order each round, so a group whose natural order already puts
+    -- every dependency first comes out in exactly that order.
+    CREATE TEMP TABLE _al_cols ON COMMIT DROP AS
+    SELECT id,
+           gradebook_column_group_id AS group_id,
+           ROW_NUMBER() OVER (
+             PARTITION BY gradebook_column_group_id
+             ORDER BY regexp_replace(slug, '\d+', '', 'g'),
+                      COALESCE((regexp_match(slug, '\d{1,9}'))[1]::integer, 0),
+                      slug,
+                      id
+           ) AS nat,
+           NULL::integer AS pos
+      FROM public.gradebook_columns
+     WHERE gradebook_id = p_gradebook_id;
+
+    LOOP
+      -- One column per group per round; the placed count read here predates this UPDATE.
+      UPDATE _al_cols c
+         SET pos = (SELECT count(*) FROM _al_cols x
+                     WHERE x.group_id = c.group_id AND x.pos IS NOT NULL)
+        FROM (
+          SELECT DISTINCT ON (r.group_id) r.id
+            FROM _al_cols r
+           WHERE r.pos IS NULL
+             AND NOT EXISTS (
+               SELECT 1
+                 FROM _al_col_deps e
+                 JOIN _al_cols f ON f.id = e.from_col
+                WHERE e.to_col = r.id
+                  AND e.from_group = e.to_group
+                  AND f.pos IS NULL)
+           ORDER BY r.group_id, r.nat
+        ) ready
+       WHERE c.id = ready.id;
+      GET DIAGNOSTICS v_placed_now = ROW_COUNT;
+      EXIT WHEN v_placed_now = 0;
+    END LOOP;
+
+    -- Only a dependency cycle inside a group leaves columns unplaced; they go last, in natural order.
+    IF EXISTS (SELECT 1 FROM _al_cols WHERE pos IS NULL) THEN
+      RAISE WARNING 'Circular dependency between columns of one group in gradebook %. Putting them at the end of their group.',
+        p_gradebook_id;
+      UPDATE _al_cols c
+         SET pos = sub.pos
+        FROM (
+          SELECT r.id,
+                 (SELECT count(*) FROM _al_cols x WHERE x.group_id = r.group_id AND x.pos IS NOT NULL)
+                   + ROW_NUMBER() OVER (PARTITION BY r.group_id ORDER BY r.nat) - 1 AS pos
+            FROM _al_cols r
+           WHERE r.pos IS NULL
+        ) sub
+       WHERE c.id = sub.id;
+    END IF;
+
+    UPDATE public.gradebook_columns gc
+       SET position_in_group = oc.pos
+      FROM _al_cols oc
+     WHERE gc.id = oc.id
+       AND gc.position_in_group IS DISTINCT FROM oc.pos;
+
+    CREATE TEMP TABLE _al_edges ON COMMIT DROP AS
+    SELECT DISTINCT from_group, to_group
+      FROM _al_col_deps
+     WHERE from_group <> to_group;
+
+    CREATE TEMP TABLE _al_rank (group_id bigint PRIMARY KEY, rank integer NOT NULL) ON COMMIT DROP;
+
+    LOOP
+      SELECT array_agg(g.id ORDER BY g.is_default, g.sort_order, g.id) INTO v_next
+        FROM public.gradebook_column_groups g
+       WHERE g.gradebook_id = p_gradebook_id
+         AND NOT (g.id = ANY (v_placed))
+         AND NOT EXISTS (
+           SELECT 1 FROM _al_edges e
+            WHERE e.to_group = g.id
+              AND NOT (e.from_group = ANY (v_placed))
+         );
+
+      EXIT WHEN v_next IS NULL OR array_length(v_next, 1) = 0;
+
+      INSERT INTO _al_rank (group_id, rank)
+      SELECT t.id, v_rank + (t.ordinality - 1)::integer
+        FROM unnest(v_next) WITH ORDINALITY AS t(id, ordinality);
+
+      v_rank   := v_rank + array_length(v_next, 1);
+      v_placed := v_placed || v_next;
+    END LOOP;
+
+    SELECT count(*) INTO v_remaining
+      FROM public.gradebook_column_groups g
+     WHERE g.gradebook_id = p_gradebook_id AND NOT (g.id = ANY (v_placed));
+
+    IF v_remaining > 0 THEN
+      RAISE WARNING 'Circular dependency between column groups in gradebook %. Leaving % group(s) where they were.',
+        p_gradebook_id, v_remaining;
+      INSERT INTO _al_rank (group_id, rank)
+      SELECT g.id, v_rank + ROW_NUMBER() OVER (ORDER BY g.sort_order, g.id)
+        FROM public.gradebook_column_groups g
+       WHERE g.gradebook_id = p_gradebook_id AND NOT (g.id = ANY (v_placed));
+    END IF;
+
+    UPDATE public.gradebook_column_groups g
+       SET sort_order = sub.pos
+      FROM (
+        SELECT r.group_id,
+               ROW_NUMBER() OVER (ORDER BY r.rank, r.group_id) - 1 AS pos
+          FROM _al_rank r
+          JOIN public.gradebook_column_groups gg ON gg.id = r.group_id
+         WHERE NOT gg.is_default
+      ) sub
+     WHERE g.id = sub.group_id
+       AND g.sort_order IS DISTINCT FROM sub.pos;
+
+  EXCEPTION
+    WHEN OTHERS THEN
+      PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || p_gradebook_id::text, 'false', true);
+      RAISE;
+  END;
+
+  PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || p_gradebook_id::text, 'false', true);
+END;
+$$;
+
+NOTIFY pgrst, 'reload schema';
+
+
+-- ============================================================================
+-- gradebook_column_group_naming
+-- ============================================================================
+
+ALTER TABLE public.gradebook_column_groups
+  ADD COLUMN IF NOT EXISTS name_is_auto boolean NOT NULL DEFAULT true;
+
+COMMENT ON COLUMN public.gradebook_column_groups.name_is_auto IS
+  'True while the name is derived from the member column names. Set false by any hand edit, after which the derivation leaves it alone.';
+
+UPDATE public.gradebook_column_groups SET name_is_auto = true WHERE name_is_auto IS NULL;
+
+-- The header a group's members suggest, or NULL. Only columns students may see count
+-- (an instructor_only column's name must not leak through a header), and at least two
+-- of them are needed: one member's full name is not a group name. The shared prefix is
+-- cut back to a word boundary ("Home" is not a word of "Homework"), then trailing
+-- numbering and punctuation are trimmed, and the result must be at least 3 characters.
+-- min/max use COLLATE "C" so the shared prefix of the extremes is the shared prefix of all.
+CREATE OR REPLACE FUNCTION public.gradebook_column_group_common_name(p_group_id bigint)
+RETURNS text
+LANGUAGE sql
+STABLE
+SET search_path = public, pg_temp
+AS $$
+  WITH names AS (
+    SELECT name
+      FROM public.gradebook_columns
+     WHERE gradebook_column_group_id = p_group_id
+       AND NOT COALESCE(instructor_only, false)
+       AND name IS NOT NULL
+  ),
+  b AS (
+    SELECT min(name COLLATE "C") AS lo, max(name COLLATE "C") AS hi, count(*) AS cnt FROM names
+  ),
+  l AS (
+    SELECT b.lo,
+           (SELECT COALESCE(max(i), 0)
+              FROM generate_series(1, least(length(b.lo), length(b.hi))) AS i
+             WHERE left(b.lo, i) = left(b.hi, i)) AS lcp
+      FROM b
+     WHERE b.cnt >= 2
+  ),
+  p AS (
+    -- Back to the default collation: under "C", regex classes such as [[:alpha:]] may see only ASCII.
+    SELECT left(l.lo, l.lcp) COLLATE "default" AS prefix, l.lcp FROM l WHERE l.lcp > 0
+  ),
+  w AS (
+    SELECT CASE
+             WHEN EXISTS (
+               SELECT 1 FROM names n
+                WHERE length(n.name) > p.lcp
+                  AND (   (right(p.prefix, 1) ~ '[[:alpha:]]' AND substr(n.name, p.lcp + 1, 1) ~ '[[:alpha:]]')
+                       OR (right(p.prefix, 1) ~ '[0-9]'       AND substr(n.name, p.lcp + 1, 1) ~ '[0-9]')))
+             THEN CASE WHEN right(p.prefix, 1) ~ '[0-9]'
+                       THEN regexp_replace(p.prefix, '[0-9]+$', '')
+                       ELSE regexp_replace(p.prefix, '[[:alpha:]]+$', '')
+                  END
+             ELSE p.prefix
+           END AS prefix
+      FROM p
+  ),
+  t AS (
+    SELECT btrim(regexp_replace(w.prefix, '[[:space:][:punct:]]*[0-9]*[[:space:][:punct:]]*$', '')) AS name
+      FROM w
+  )
+  SELECT CASE WHEN length(t.name) >= 3 THEN t.name END FROM t;
+$$;
+
+REVOKE ALL ON FUNCTION public.gradebook_column_group_common_name(bigint) FROM PUBLIC, anon, authenticated;
+
+-- Applies the derived name when it is an improvement. It never replaces a name with a
+-- shorter one (dragging "Home Project" into "Homework" keeps "Homework") unless the current
+-- name is empty or still the placeholder that slug routing or the backfill gave the group.
+-- It also leaves the name alone when the derived one would read the same as another
+-- group's header, singular or plural.
+CREATE OR REPLACE FUNCTION public.gradebook_column_group_refresh_name(p_group_id bigint)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_group public.gradebook_column_groups;
+  v_derived text;
+  v_current text;
+  v_placeholder boolean;
+BEGIN
+  SELECT * INTO v_group FROM public.gradebook_column_groups WHERE id = p_group_id;
+  IF v_group.id IS NULL OR v_group.is_default OR NOT v_group.name_is_auto THEN
+    RETURN;
+  END IF;
+
+  IF v_group.slug IN ('assignment-lab', 'assignment-individual', 'assignment-group')
+     OR v_group.auto_assign_slug_base IN ('assignment-lab', 'assignment-individual', 'assignment-group') THEN
+    RETURN;
+  END IF;
+
+  v_derived := public.gradebook_column_group_common_name(p_group_id);
+  IF v_derived IS NULL OR v_derived IS NOT DISTINCT FROM v_group.name THEN
+    RETURN;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM public.gradebook_column_groups o
+     WHERE o.gradebook_id = v_group.gradebook_id
+       AND o.id <> p_group_id
+       AND lower(regexp_replace(btrim(o.name), 's$', ''))
+           = lower(regexp_replace(btrim(v_derived), 's$', ''))
+  ) THEN
+    RETURN;
+  END IF;
+
+  v_current := btrim(COALESCE(v_group.name, ''));
+  v_placeholder := COALESCE(
+    v_current = ''
+    OR lower(v_current) IN ('other', 'ungrouped')
+    OR lower(v_current) = lower(public.gradebook_column_group_display_name(v_group.auto_assign_slug_base))
+    OR lower(v_current) = lower(public.gradebook_column_group_display_name(v_group.slug))
+    OR lower(v_current) = lower(public.gradebook_column_group_display_name(
+                                  public.gradebook_column_base_group_name(v_group.slug))),
+    false);
+
+  IF NOT v_placeholder AND length(v_derived) < length(v_current) THEN
+    RETURN;
+  END IF;
+
+  -- Tells mark_manual_name this rename is the derivation, whatever the trigger depth.
+  PERFORM set_config('pawtograder.gradebook_group_auto_rename', 'on', true);
+  UPDATE public.gradebook_column_groups
+     SET name = v_derived
+   WHERE id = p_group_id AND name_is_auto;
+  PERFORM set_config('pawtograder.gradebook_group_auto_rename', 'off', true);
+END $$;
+
+REVOKE ALL ON FUNCTION public.gradebook_column_group_refresh_name(bigint) FROM PUBLIC, anon, authenticated;
+
+CREATE OR REPLACE FUNCTION public.gradebook_columns_refresh_group_name()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  -- instructor_only is in the trigger's column list because only visible columns name a group.
+  IF TG_OP IN ('INSERT', 'UPDATE') AND NEW.gradebook_column_group_id IS NOT NULL THEN
+    PERFORM public.gradebook_column_group_refresh_name(NEW.gradebook_column_group_id);
+  END IF;
+  IF TG_OP IN ('UPDATE', 'DELETE') AND OLD.gradebook_column_group_id IS NOT NULL
+     AND (TG_OP = 'DELETE' OR OLD.gradebook_column_group_id IS DISTINCT FROM NEW.gradebook_column_group_id) THEN
+    PERFORM public.gradebook_column_group_refresh_name(OLD.gradebook_column_group_id);
+  END IF;
+  RETURN NULL;
+END $$;
+
+DROP TRIGGER IF EXISTS gradebook_columns_refresh_group_name_tr ON public.gradebook_columns;
+CREATE TRIGGER gradebook_columns_refresh_group_name_tr
+  AFTER INSERT OR UPDATE OF name, gradebook_column_group_id, instructor_only OR DELETE ON public.gradebook_columns
+  FOR EACH ROW EXECUTE FUNCTION public.gradebook_columns_refresh_group_name();
+
+CREATE OR REPLACE FUNCTION public.gradebook_column_groups_mark_manual_name()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  IF NEW.name IS DISTINCT FROM OLD.name
+     AND COALESCE(current_setting('pawtograder.gradebook_group_auto_rename', true), '') <> 'on' THEN
+    NEW.name_is_auto := false;
+  END IF;
+  RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS gradebook_column_groups_mark_manual_name_tr ON public.gradebook_column_groups;
+CREATE TRIGGER gradebook_column_groups_mark_manual_name_tr
+  BEFORE UPDATE OF name ON public.gradebook_column_groups
+  FOR EACH ROW EXECUTE FUNCTION public.gradebook_column_groups_mark_manual_name();
+
+-- Slug routing (_gradebook_column_group_for_slug) is redefined in 20260920120400, on top of
+-- the shared helper _gradebook_column_group_slug_route that the Add Column preview also reads.
+
+ALTER TABLE public.gradebook_column_groups DISABLE TRIGGER broadcast_gradebook_column_groups_update;
+
+DO $$
+DECLARE
+  g record;
+BEGIN
+  FOR g IN SELECT id FROM public.gradebook_column_groups WHERE NOT is_default AND name_is_auto
+  LOOP
+    PERFORM public.gradebook_column_group_refresh_name(g.id);
+  END LOOP;
+END $$;
+
+ALTER TABLE public.gradebook_column_groups ENABLE TRIGGER broadcast_gradebook_column_groups_update;
+
+NOTIFY pgrst, 'reload schema';
+
+
+-- ============================================================================
+-- gradebook_column_group_expressions
+-- ============================================================================
+
+-- gradebook_column_group("<slug>") in score expressions.
+--
+-- Evaluators expand a group call into its member columns at evaluation time, and the
+-- saved dependencies carry both the group id (dependencies.gradebook_column_groups) and
+-- the member ids (dependencies.gradebook_columns). The existing recalculation joins read
+-- only the member ids, so this migration keeps them current as columns join and leave.
+--
+-- A member whose own dependencies.gradebook_column_groups names its group is a "total" of
+-- that group. Totals are left out of every other column's expansion of the same group, so
+-- two totals of one group never depend on each other. Every rule below uses that
+-- definition: a member counts for a dependent D of group G when it sits in G, is not D,
+-- and is not a total of G.
+
+-- Columns whose score expressions name the group, as "Name (slug)" text for error messages.
+CREATE OR REPLACE FUNCTION public._gradebook_column_group_assert_unreferenced(p_group_id bigint, p_action text)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_slug text;
+  v_dependents text;
+BEGIN
+  SELECT string_agg(format('%s (%s)', gc.name, gc.slug), ', ' ORDER BY gc.id)
+    INTO v_dependents
+    FROM public.gradebook_column_groups g
+    JOIN public.gradebook_columns gc ON gc.gradebook_id = g.gradebook_id
+   WHERE g.id = p_group_id
+     AND gc.dependencies -> 'gradebook_column_groups' @> jsonb_build_array(p_group_id);
+
+  IF v_dependents IS NOT NULL THEN
+    SELECT slug INTO v_slug FROM public.gradebook_column_groups WHERE id = p_group_id;
+    RAISE EXCEPTION 'Cannot % group "%": it is referenced by the score expression of %. Edit those expressions first.',
+      p_action, v_slug, v_dependents
+      USING ERRCODE = 'foreign_key_violation';
+  END IF;
+END $$;
+
+REVOKE ALL ON FUNCTION public._gradebook_column_group_assert_unreferenced(bigint, text) FROM PUBLIC, anon, authenticated;
+
+-- Expressions name groups by slug, so a referenced slug must not change underneath them.
+CREATE OR REPLACE FUNCTION public.gradebook_column_groups_protect_referenced_slug()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  IF NEW.slug IS DISTINCT FROM OLD.slug THEN
+    PERFORM public._gradebook_column_group_assert_unreferenced(OLD.id, 'change the slug of');
+  END IF;
+  RETURN NEW;
+END $$;
+
+REVOKE ALL ON FUNCTION public.gradebook_column_groups_protect_referenced_slug() FROM PUBLIC, anon, authenticated;
+
+DROP TRIGGER IF EXISTS gradebook_column_groups_protect_referenced_slug_tr ON public.gradebook_column_groups;
+CREATE TRIGGER gradebook_column_groups_protect_referenced_slug_tr
+  BEFORE UPDATE OF slug ON public.gradebook_column_groups
+  FOR EACH ROW EXECUTE FUNCTION public.gradebook_column_groups_protect_referenced_slug();
+
+-- The same refusal for a plain DELETE, so a PostgREST delete cannot skip what
+-- gradebook_column_group_delete checks. A cascade from a deleted gradebook or class is let
+-- through: the RI action runs after the parent row is gone, so the parent lookup below sees
+-- it missing. Such a cascade cannot orphan an expression anyway, because the columns carrying
+-- the expressions block it first (gradebook_columns_group_fk is ON DELETE RESTRICT and
+-- gradebook_columns.gradebook_id has no cascade).
+CREATE OR REPLACE FUNCTION public.gradebook_column_groups_protect_referenced_delete()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM public.gradebooks WHERE id = OLD.gradebook_id)
+     OR NOT EXISTS (SELECT 1 FROM public.classes WHERE id = OLD.class_id) THEN
+    RETURN OLD;
+  END IF;
+  PERFORM public._gradebook_column_group_assert_unreferenced(OLD.id, 'delete');
+  RETURN OLD;
+END $$;
+
+REVOKE ALL ON FUNCTION public.gradebook_column_groups_protect_referenced_delete() FROM PUBLIC, anon, authenticated;
+
+DROP TRIGGER IF EXISTS gradebook_column_groups_protect_referenced_delete_tr ON public.gradebook_column_groups;
+CREATE TRIGGER gradebook_column_groups_protect_referenced_delete_tr
+  BEFORE DELETE ON public.gradebook_column_groups
+  FOR EACH ROW EXECUTE FUNCTION public.gradebook_column_groups_protect_referenced_delete();
+
+-- True when a string literal in the expression is the slug, or a glob that matches it.
+-- It errs toward true: glob syntax beyond * and ? (classes, braces, extglobs, escapes)
+-- counts as a match, and so does any error. Callers use it to decide whether a column id
+-- may be dropped from dependencies, where a wrong true only keeps an unneeded id.
+CREATE OR REPLACE FUNCTION public._gradebook_expression_names_slug(p_expression text, p_slug text)
+RETURNS boolean
+LANGUAGE plpgsql
+IMMUTABLE
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_literal text;
+  v_pattern text;
+BEGIN
+  IF p_expression IS NULL OR p_slug IS NULL THEN
+    RETURN false;
+  END IF;
+
+  FOR v_literal IN
+    SELECT COALESCE(m[1], m[2])
+      FROM regexp_matches(p_expression, '"([^"]*)"|''([^'']*)''', 'g') AS m
+  LOOP
+    CONTINUE WHEN v_literal IS NULL;
+    IF lower(v_literal) = lower(p_slug) THEN
+      RETURN true;
+    END IF;
+    IF v_literal ~ '[][{}()!+@\\]' THEN
+      RETURN true;
+    END IF;
+    IF v_literal ~ '[*?]' THEN
+      v_pattern := regexp_replace(v_literal, '([.^$|])', '\\\1', 'g');
+      v_pattern := replace(replace(v_pattern, '*', '.*'), '?', '.');
+      IF p_slug ~* ('^' || v_pattern || '$') THEN
+        RETURN true;
+      END IF;
+    END IF;
+  END LOOP;
+
+  RETURN false;
+EXCEPTION
+  WHEN OTHERS THEN
+    RETURN true;
+END $$;
+
+REVOKE ALL ON FUNCTION public._gradebook_expression_names_slug(text, text) FROM PUBLIC, anon, authenticated;
+
+-- Whoever writes dependencies (the gradebook-column-inserted edge function, the browser's
+-- expression save) computes them from a snapshot of group membership. A column that joined
+-- after the snapshot would be erased, and one that left after it would come back. So on
+-- every write of dependencies that names a group, this trigger:
+--   * adds each current counting member of the named groups;
+--   * drops ids the write adds (not in the old value) that belong to a column of this
+--     gradebook which counts for no named group and whose slug no literal in the
+--     expression names;
+--   * refuses a merged-in member that already depends on this column.
+-- The membership trigger below also writes dependencies; its values already agree with
+-- current membership, so for it this is a pass-through. The trigger writes no rows, so it
+-- cannot recurse.
+CREATE OR REPLACE FUNCTION public.gradebook_columns_merge_group_dependencies()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_groups jsonb := NEW.dependencies -> 'gradebook_column_groups';
+  v_given jsonb;
+  v_old jsonb := '[]'::jsonb;
+  v_members bigint[];
+  v_ids bigint[];
+  v_added bigint[];
+  v_cycle record;
+BEGIN
+  -- Nested IFs: SQL does not promise to short-circuit OR, and jsonb_array_* raise on a non-array.
+  IF COALESCE(jsonb_typeof(v_groups), '') <> 'array' THEN
+    RETURN NEW;
+  END IF;
+  IF jsonb_array_length(v_groups) = 0 THEN
+    RETURN NEW;
+  END IF;
+
+  v_given := COALESCE(NEW.dependencies -> 'gradebook_columns', '[]'::jsonb);
+  IF jsonb_typeof(v_given) <> 'array' THEN
+    RETURN NEW;
+  END IF;
+  IF EXISTS (SELECT 1 FROM jsonb_array_elements(v_given) e WHERE jsonb_typeof(e.value) <> 'number')
+     OR EXISTS (SELECT 1 FROM jsonb_array_elements(v_groups) e WHERE jsonb_typeof(e.value) <> 'number') THEN
+    RETURN NEW;
+  END IF;
+
+  IF TG_OP = 'UPDATE' THEN
+    IF jsonb_typeof(OLD.dependencies -> 'gradebook_columns') = 'array' THEN
+      v_old := OLD.dependencies -> 'gradebook_columns';
+    END IF;
+  END IF;
+
+  SELECT COALESCE(array_agg(DISTINCT m.id), '{}'::bigint[])
+    INTO v_members
+    FROM jsonb_array_elements(v_groups) e
+    JOIN public.gradebook_columns m
+      ON m.gradebook_column_group_id = (e.value #>> '{}')::numeric::bigint
+   WHERE m.gradebook_id = NEW.gradebook_id
+     AND m.id IS DISTINCT FROM NEW.id
+     AND NOT COALESCE(m.dependencies -> 'gradebook_column_groups', '[]'::jsonb)
+             @> jsonb_build_array(m.gradebook_column_group_id);
+
+  SELECT COALESCE(array_agg(DISTINCT x.id ORDER BY x.id), '{}'::bigint[])
+    INTO v_ids
+    FROM (
+      SELECT g.id
+        FROM (SELECT (e.value #>> '{}')::numeric::bigint AS id FROM jsonb_array_elements(v_given) e) g
+       WHERE v_old @> jsonb_build_array(g.id)
+          OR g.id = ANY (v_members)
+          OR NOT EXISTS (
+               SELECT 1 FROM public.gradebook_columns c
+                WHERE c.id = g.id
+                  AND c.gradebook_id = NEW.gradebook_id
+                  AND NOT public._gradebook_expression_names_slug(NEW.score_expression, c.slug))
+      UNION
+      SELECT unnest(v_members)
+    ) x;
+
+  v_added := ARRAY(
+    SELECT unnest(v_members)
+    EXCEPT
+    SELECT (e.value #>> '{}')::numeric::bigint FROM jsonb_array_elements(v_given) e);
+
+  IF cardinality(v_added) > 0 THEN
+    WITH RECURSIVE reach(id) AS (
+      SELECT unnest(v_added)
+      UNION
+      SELECT dep.value::numeric::bigint
+        FROM reach r
+        JOIN public.gradebook_columns gc ON gc.id = r.id
+        CROSS JOIN LATERAL jsonb_array_elements_text(
+          CASE WHEN jsonb_typeof(gc.dependencies -> 'gradebook_columns') = 'array'
+               THEN gc.dependencies -> 'gradebook_columns' ELSE '[]'::jsonb END) AS dep(value)
+       WHERE r.id IS DISTINCT FROM NEW.id
+    )
+    SELECT 1 AS hit INTO v_cycle FROM reach WHERE id = NEW.id LIMIT 1;
+
+    IF FOUND THEN
+      RAISE EXCEPTION 'Cycle detected: a column that joined a group named by the score expression of % (%) depends on % itself',
+        NEW.name, NEW.slug, NEW.name
+        USING ERRCODE = 'check_violation';
+    END IF;
+  END IF;
+
+  IF NOT (to_jsonb(v_ids) @> v_given AND v_given @> to_jsonb(v_ids)) THEN
+    NEW.dependencies := jsonb_set(NEW.dependencies, '{gradebook_columns}', to_jsonb(v_ids));
+  END IF;
+
+  RETURN NEW;
+END $$;
+
+REVOKE ALL ON FUNCTION public.gradebook_columns_merge_group_dependencies() FROM PUBLIC, anon, authenticated;
+
+DROP TRIGGER IF EXISTS gradebook_columns_merge_group_dependencies_tr ON public.gradebook_columns;
+CREATE TRIGGER gradebook_columns_merge_group_dependencies_tr
+  BEFORE INSERT OR UPDATE OF dependencies ON public.gradebook_columns
+  FOR EACH ROW EXECUTE FUNCTION public.gradebook_columns_merge_group_dependencies();
+
+-- Keeps dependents' member ids in step with membership, once per statement.
+--
+-- Join: the joining column's id is appended to each dependent of the joined group, unless
+-- the column is a total of that group. The recalculator then loads its values, and later
+-- edits to its scores reach the dependent.
+--
+-- Leave (a move or a delete): the column's id is removed from each dependent of the group it
+-- left, unless it still counts for another group that dependent names, or a string literal
+-- in the dependent's expression names its slug directly (see _gradebook_expression_names_slug).
+-- Removing it lets the column be deleted and stops cycle checks from following an edge the
+-- evaluator no longer has.
+--
+-- The cycle check runs after both edits, so it walks the edges as they now stand, including
+-- ones added by this same statement.
+--
+-- A leave also deletes groups it left empty when they were created by slug routing
+-- (auto_assign_slug_base set), are not the default, and are named by no expression.
+-- Groups an instructor created by hand stay.
+--
+-- Recalculation: a join by INSERT enqueues nothing, because a new column's cells start with
+-- a NULL score (insert_gradebook_column_students_for_new_column sets none) and group
+-- functions ignore NULLs; if the new column computes scores, the row recalculation queued by
+-- recalculate_new_gradebook_column_students recomputes the dependents in the same pass. A
+-- move or delete enqueues each affected student row once, under a source other than
+-- 'deps_update', so rows already queued and not yet running are skipped.
+CREATE OR REPLACE FUNCTION public.gradebook_columns_sync_group_dependents()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_changes jsonb;
+  v_new_edges jsonb;
+  v_cycle record;
+  v_rows jsonb[];
+  v_cleaned_gradebooks bigint[];
+  v_gradebook_id bigint;
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    SELECT jsonb_agg(jsonb_build_object(
+             'column_id', n.id, 'gradebook_id', n.gradebook_id,
+             'joined_group_id', n.gradebook_column_group_id, 'left_group_id', NULL,
+             'slug', n.slug, 'old_slug', n.slug,
+             'column_groups', n.dependencies -> 'gradebook_column_groups',
+             'old_column_groups', n.dependencies -> 'gradebook_column_groups'))
+      INTO v_changes
+      FROM new_table n;
+  ELSIF TG_OP = 'UPDATE' THEN
+    SELECT jsonb_agg(jsonb_build_object(
+             'column_id', n.id, 'gradebook_id', n.gradebook_id,
+             'joined_group_id', n.gradebook_column_group_id, 'left_group_id', o.gradebook_column_group_id,
+             'slug', n.slug, 'old_slug', o.slug,
+             'column_groups', n.dependencies -> 'gradebook_column_groups',
+             'old_column_groups', o.dependencies -> 'gradebook_column_groups'))
+      INTO v_changes
+      FROM new_table n
+      JOIN old_table o ON o.id = n.id
+     WHERE n.gradebook_column_group_id IS DISTINCT FROM o.gradebook_column_group_id;
+  ELSE
+    SELECT jsonb_agg(jsonb_build_object(
+             'column_id', o.id, 'gradebook_id', o.gradebook_id,
+             'joined_group_id', NULL, 'left_group_id', o.gradebook_column_group_id,
+             'slug', o.slug, 'old_slug', o.slug,
+             'column_groups', o.dependencies -> 'gradebook_column_groups',
+             'old_column_groups', o.dependencies -> 'gradebook_column_groups'))
+      INTO v_changes
+      FROM old_table o;
+  END IF;
+
+  IF v_changes IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  -- Leave: drop the id from dependents it no longer counts for.
+  IF TG_OP IN ('UPDATE', 'DELETE') THEN
+    WITH leaving AS (
+      SELECT c.*
+        FROM jsonb_to_recordset(v_changes)
+               AS c(column_id bigint, gradebook_id bigint, joined_group_id bigint, left_group_id bigint,
+                    slug text, old_slug text, column_groups jsonb)
+       WHERE c.left_group_id IS NOT NULL
+    ),
+    removals AS (
+      SELECT d.id, array_agg(DISTINCT l.column_id::text) AS ids
+        FROM leaving l
+        JOIN public.gradebook_columns d
+          ON d.gradebook_id = l.gradebook_id
+         AND d.dependencies -> 'gradebook_column_groups' @> jsonb_build_array(l.left_group_id)
+         AND d.dependencies -> 'gradebook_columns' @> jsonb_build_array(l.column_id)
+       WHERE d.id <> l.column_id
+         AND NOT (l.joined_group_id IS NOT NULL
+                  AND d.dependencies -> 'gradebook_column_groups' @> jsonb_build_array(l.joined_group_id)
+                  AND NOT COALESCE(l.column_groups, '[]'::jsonb) @> jsonb_build_array(l.joined_group_id))
+         AND NOT public._gradebook_expression_names_slug(d.score_expression, l.slug)
+         AND NOT public._gradebook_expression_names_slug(d.score_expression, l.old_slug)
+       GROUP BY d.id
+    )
+    UPDATE public.gradebook_columns d
+       SET dependencies = jsonb_set(
+             d.dependencies,
+             '{gradebook_columns}',
+             COALESCE((SELECT jsonb_agg(e.value ORDER BY e.ord)
+                         FROM jsonb_array_elements(d.dependencies -> 'gradebook_columns')
+                                WITH ORDINALITY AS e(value, ord)
+                        WHERE NOT ((e.value #>> '{}') = ANY (r.ids))),
+                      '[]'::jsonb))
+      FROM removals r
+     WHERE d.id = r.id;
+  END IF;
+
+  -- Join: append the id to dependents it now counts for.
+  WITH joins AS (
+    SELECT d2.id AS dependent_id, c.column_id
+      FROM jsonb_to_recordset(v_changes)
+             AS c(column_id bigint, gradebook_id bigint, joined_group_id bigint, column_groups jsonb)
+      JOIN public.gradebook_columns d2
+        ON d2.gradebook_id = c.gradebook_id
+       AND d2.dependencies -> 'gradebook_column_groups' @> jsonb_build_array(c.joined_group_id)
+     WHERE c.joined_group_id IS NOT NULL
+       AND d2.id <> c.column_id
+       AND NOT COALESCE(c.column_groups, '[]'::jsonb) @> jsonb_build_array(c.joined_group_id)
+       AND NOT COALESCE(d2.dependencies -> 'gradebook_columns', '[]'::jsonb) @> jsonb_build_array(c.column_id)
+  ),
+  additions AS (
+    SELECT j.dependent_id, array_agg(DISTINCT j.column_id ORDER BY j.column_id) AS ids
+      FROM joins j
+     GROUP BY j.dependent_id
+  ),
+  upd AS (
+    UPDATE public.gradebook_columns d
+       SET dependencies = jsonb_set(
+             COALESCE(d.dependencies, '{}'::jsonb),
+             '{gradebook_columns}',
+             COALESCE(d.dependencies -> 'gradebook_columns', '[]'::jsonb) || to_jsonb(a.ids))
+      FROM additions a
+     WHERE d.id = a.dependent_id
+    RETURNING d.id
+  )
+  SELECT jsonb_agg(jsonb_build_object('dependent_id', a.dependent_id, 'column_id', x.column_id))
+    INTO v_new_edges
+    FROM additions a
+    JOIN upd u ON u.id = a.dependent_id
+    CROSS JOIN LATERAL unnest(a.ids) AS x(column_id);
+
+  -- A new edge dependent -> joiner closes a cycle when the joiner, over the edges as they
+  -- stand after the edits above, already reaches the dependent.
+  IF v_new_edges IS NOT NULL THEN
+    WITH RECURSIVE reach(dependent_id, column_id, reached_id) AS (
+      SELECT e.dependent_id, e.column_id, e.column_id
+        FROM jsonb_to_recordset(v_new_edges) AS e(dependent_id bigint, column_id bigint)
+      UNION
+      SELECT r.dependent_id, r.column_id, dep.value::numeric::bigint
+        FROM reach r
+        JOIN public.gradebook_columns gc ON gc.id = r.reached_id
+        CROSS JOIN LATERAL jsonb_array_elements_text(
+          CASE WHEN jsonb_typeof(gc.dependencies -> 'gradebook_columns') = 'array'
+               THEN gc.dependencies -> 'gradebook_columns' ELSE '[]'::jsonb END) AS dep(value)
+       WHERE r.reached_id <> r.dependent_id
+    )
+    SELECT joiner.name AS joiner_name, joiner.slug AS joiner_slug, dependent.name AS dependent_name,
+           dependent.slug AS dependent_slug
+      INTO v_cycle
+      FROM reach r
+      JOIN public.gradebook_columns joiner ON joiner.id = r.column_id
+      JOIN public.gradebook_columns dependent ON dependent.id = r.dependent_id
+     WHERE r.reached_id = r.dependent_id
+     LIMIT 1;
+
+    IF FOUND THEN
+      RAISE EXCEPTION 'Cycle detected: % (%) depends on % (%), so it cannot join a group that %''s score expression includes',
+        v_cycle.joiner_name, v_cycle.joiner_slug, v_cycle.dependent_name, v_cycle.dependent_slug,
+        v_cycle.dependent_name
+        USING ERRCODE = 'check_violation';
+    END IF;
+  END IF;
+
+  -- Leave: delete routed groups left empty and unreferenced, then close the gap in sort_order
+  -- the way gradebook_column_group_delete does.
+  IF TG_OP IN ('UPDATE', 'DELETE') THEN
+    FOR v_gradebook_id IN
+      SELECT DISTINCT c.gradebook_id
+        FROM jsonb_to_recordset(v_changes) AS c(gradebook_id bigint, left_group_id bigint)
+       WHERE c.left_group_id IS NOT NULL
+       ORDER BY c.gradebook_id
+    LOOP
+      PERFORM pg_advisory_xact_lock(v_gradebook_id);
+    END LOOP;
+
+    WITH gone AS (
+      DELETE FROM public.gradebook_column_groups g
+       WHERE g.id IN (
+               SELECT c.left_group_id
+                 FROM jsonb_to_recordset(v_changes) AS c(left_group_id bigint)
+                WHERE c.left_group_id IS NOT NULL)
+         AND NOT g.is_default
+         AND g.auto_assign_slug_base IS NOT NULL
+         AND EXISTS (SELECT 1 FROM public.gradebooks gb WHERE gb.id = g.gradebook_id)
+         AND NOT EXISTS (SELECT 1 FROM public.gradebook_columns m WHERE m.gradebook_column_group_id = g.id)
+         AND NOT EXISTS (
+               SELECT 1 FROM public.gradebook_columns d
+                WHERE d.gradebook_id = g.gradebook_id
+                  AND d.dependencies -> 'gradebook_column_groups' @> jsonb_build_array(g.id))
+      RETURNING g.gradebook_id
+    )
+    SELECT array_agg(DISTINCT gone.gradebook_id) INTO v_cleaned_gradebooks FROM gone;
+
+    IF v_cleaned_gradebooks IS NOT NULL THEN
+      UPDATE public.gradebook_column_groups g
+         SET sort_order = sub.pos
+        FROM (
+          SELECT id, ROW_NUMBER() OVER (PARTITION BY gradebook_id ORDER BY sort_order, id) - 1 AS pos
+            FROM public.gradebook_column_groups
+           WHERE gradebook_id = ANY (v_cleaned_gradebooks) AND NOT is_default
+        ) sub
+       WHERE g.id = sub.id AND g.sort_order IS DISTINCT FROM sub.pos;
+    END IF;
+  END IF;
+
+  IF TG_OP = 'INSERT' THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT array_agg(jsonb_build_object(
+           'class_id', r.class_id,
+           'gradebook_id', r.gradebook_id,
+           'student_id', r.student_id,
+           'is_private', r.is_private,
+           'source', 'gradebook_column_group_membership'))
+    INTO v_rows
+    FROM (
+      SELECT DISTINCT gcs.class_id, gcs.gradebook_id, gcs.student_id, gcs.is_private
+        FROM (
+          SELECT c.column_id, c.gradebook_id, g.group_id
+            FROM jsonb_to_recordset(v_changes)
+                   AS c(column_id bigint, gradebook_id bigint, joined_group_id bigint, left_group_id bigint,
+                        column_groups jsonb, old_column_groups jsonb)
+            CROSS JOIN LATERAL (VALUES (c.joined_group_id, c.column_groups),
+                                       (c.left_group_id, c.old_column_groups)) AS g(group_id, groups_of_column)
+           WHERE g.group_id IS NOT NULL
+             AND NOT COALESCE(g.groups_of_column, '[]'::jsonb) @> jsonb_build_array(g.group_id)
+        ) affected
+        JOIN public.gradebook_columns d
+          ON d.gradebook_id = affected.gradebook_id
+         AND d.dependencies -> 'gradebook_column_groups' @> jsonb_build_array(affected.group_id)
+        JOIN public.gradebook_column_students gcs ON gcs.gradebook_column_id = d.id
+       WHERE d.score_expression IS NOT NULL
+         AND d.id <> affected.column_id
+    ) r;
+
+  IF array_length(v_rows, 1) > 0 THEN
+    PERFORM public.enqueue_gradebook_row_recalculation_batch(v_rows);
+  END IF;
+
+  RETURN NULL;
+END $$;
+
+REVOKE ALL ON FUNCTION public.gradebook_columns_sync_group_dependents() FROM PUBLIC, anon, authenticated;
+
+DROP TRIGGER IF EXISTS gradebook_columns_sync_group_dependents_insert ON public.gradebook_columns;
+CREATE TRIGGER gradebook_columns_sync_group_dependents_insert
+  AFTER INSERT ON public.gradebook_columns
+  REFERENCING NEW TABLE AS new_table
+  FOR EACH STATEMENT EXECUTE FUNCTION public.gradebook_columns_sync_group_dependents();
+
+-- Transition tables cannot be combined with a column list, so this fires on every UPDATE
+-- statement and filters to rows whose group changed. That includes the dependents UPDATEs
+-- this function issues, which change no group and so return at the first check.
+DROP TRIGGER IF EXISTS gradebook_columns_sync_group_dependents_update ON public.gradebook_columns;
+CREATE TRIGGER gradebook_columns_sync_group_dependents_update
+  AFTER UPDATE ON public.gradebook_columns
+  REFERENCING OLD TABLE AS old_table NEW TABLE AS new_table
+  FOR EACH STATEMENT EXECUTE FUNCTION public.gradebook_columns_sync_group_dependents();
+
+DROP TRIGGER IF EXISTS gradebook_columns_sync_group_dependents_delete ON public.gradebook_columns;
+CREATE TRIGGER gradebook_columns_sync_group_dependents_delete
+  AFTER DELETE ON public.gradebook_columns
+  REFERENCING OLD TABLE AS old_table
+  FOR EACH STATEMENT EXECUTE FUNCTION public.gradebook_columns_sync_group_dependents();
+
+-- Same as 20260920120100, plus the refusal to delete a group an expression names.
+CREATE OR REPLACE FUNCTION public.gradebook_column_group_delete(p_group_id bigint)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_group public.gradebook_column_groups;
+  v_default_id bigint;
+  v_base integer;
+BEGIN
+  SELECT * INTO v_group FROM public.gradebook_column_groups WHERE id = p_group_id;
+  IF v_group.id IS NULL THEN
+    RAISE EXCEPTION 'gradebook column group % not found', p_group_id;
+  END IF;
+
+  IF NOT public.authorizeforclassinstructor(v_group.class_id) THEN
+    RAISE EXCEPTION 'insufficient permissions: instructor access required for class %', v_group.class_id;
+  END IF;
+
+  IF v_group.is_default THEN
+    RAISE EXCEPTION 'the default group cannot be deleted; it is where columns go when nothing else claims them';
+  END IF;
+
+  PERFORM public._gradebook_column_group_assert_unreferenced(p_group_id, 'delete');
+
+  PERFORM pg_advisory_xact_lock(v_group.gradebook_id);
+
+  SELECT id INTO v_default_id
+    FROM public.gradebook_column_groups
+   WHERE gradebook_id = v_group.gradebook_id AND is_default;
+
+  SELECT COALESCE(MAX(position_in_group), -1) + 1 INTO v_base
+    FROM public.gradebook_columns WHERE gradebook_column_group_id = v_default_id;
+
+  PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_group.gradebook_id::text, 'true', true);
+  BEGIN
+    UPDATE public.gradebook_columns gc
+       SET gradebook_column_group_id = v_default_id,
+           position_in_group = v_base + sub.rn
+      FROM (
+        SELECT id, ROW_NUMBER() OVER (ORDER BY position_in_group, id) - 1 AS rn
+          FROM public.gradebook_columns
+         WHERE gradebook_column_group_id = p_group_id
+      ) sub
+     WHERE gc.id = sub.id;
+  EXCEPTION
+    WHEN OTHERS THEN
+      PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_group.gradebook_id::text, 'false', true);
+      RAISE;
+  END;
+  PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_group.gradebook_id::text, 'false', true);
+
+  DELETE FROM public.gradebook_column_groups WHERE id = p_group_id;
+
+  UPDATE public.gradebook_column_groups g
+     SET sort_order = sub.pos
+    FROM (
+      SELECT id, ROW_NUMBER() OVER (ORDER BY sort_order, id) - 1 AS pos
+        FROM public.gradebook_column_groups
+       WHERE gradebook_id = v_group.gradebook_id AND NOT is_default
+    ) sub
+   WHERE g.id = sub.id AND g.sort_order IS DISTINCT FROM sub.pos;
+END $$;
+
+REVOKE ALL ON FUNCTION public.gradebook_column_group_delete(bigint) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.gradebook_column_group_delete(bigint) TO authenticated, service_role;
+
+NOTIFY pgrst, 'reload schema';
+
+
+-- ============================================================================
+-- gradebook_column_group_slug_preview
+-- ============================================================================
+
+-- A read-only preview of slug routing for the Add Column dialog, with the routing rule moved into
+-- one helper that both the preview and the writer call.
+
+-- The routing rule on its own and read-only, so the Add Column dialog can show where a slug will
+-- land without creating anything. _gradebook_column_group_for_slug below is the only writer.
+--
+-- route_base is the auto_assign_slug_base of the group the slug belongs in:
+--   * the legacy base (gradebook_column_base_group_name: first dash token, or assignment-<type>
+--     for assignment-<type>-...) when that base is a subtyped assignment-<x>; code-walk slugs
+--     assignment-<x>-code-walk land here, under assignment-<x>;
+--   * for a bare two-token assignment-<x> linked to an assignment of the class, the kind of that
+--     assignment: assignment-lab, assignment-group or assignment-individual. The link is by
+--     assignment slug, since create_gradebook_column_for_assignment inserts the column before it
+--     sets assignments.gradebook_column_id; an existing column with that slug linked through
+--     gradebook_column_id also counts;
+--   * for a bare assignment-<x> with no linked assignment, the slug itself (a group of its own);
+--   * otherwise the legacy base.
+-- The 20260920120000 backfill keys its groups by the same rule.
+CREATE OR REPLACE FUNCTION public._gradebook_column_group_slug_route(
+  p_class_id bigint, p_slug text, OUT route_base text, OUT route_name text)
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_legacy text;
+  v_assignment public.assignments;
+BEGIN
+  v_legacy := public.gradebook_column_base_group_name(p_slug);
+
+  IF v_legacy = 'assignment' AND array_length(string_to_array(p_slug, '-'), 1) = 2 THEN
+    SELECT a.* INTO v_assignment
+      FROM public.assignments a
+     WHERE a.class_id = p_class_id
+       AND (a.slug = split_part(p_slug, '-', 2)
+            OR a.gradebook_column_id IN (
+                 SELECT gc.id FROM public.gradebook_columns gc
+                  WHERE gc.class_id = p_class_id AND gc.slug = p_slug))
+     ORDER BY (a.slug = split_part(p_slug, '-', 2)) DESC, a.id
+     LIMIT 1;
+
+    IF v_assignment.id IS NULL THEN
+      route_base := p_slug;
+      route_name := public.gradebook_column_group_display_name(p_slug);
+    ELSIF v_assignment.minutes_due_after_lab IS NOT NULL THEN
+      route_base := 'assignment-lab';
+      route_name := 'Labs';
+    ELSIF v_assignment.group_config <> 'individual' THEN
+      route_base := 'assignment-group';
+      route_name := 'Group Assignments';
+    ELSE
+      route_base := 'assignment-individual';
+      route_name := 'Assignments';
+    END IF;
+    RETURN;
+  END IF;
+
+  route_base := v_legacy;
+  route_name := public.gradebook_column_group_display_name(v_legacy);
+END $$;
+
+REVOKE ALL ON FUNCTION public._gradebook_column_group_slug_route(bigint, text) FROM PUBLIC, anon, authenticated;
+
+-- Same as 20260920120100, with the routing rule read from the helper above. When several groups
+-- share the base, the last one in display order receives the column.
+CREATE OR REPLACE FUNCTION public._gradebook_column_group_for_slug(
+  p_gradebook_id bigint, p_class_id bigint, p_slug text)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_base text;
+  v_name text;
+  v_slug text;
+  v_suffix integer := 1;
+  v_id   bigint;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM public.gradebooks WHERE id = p_gradebook_id AND class_id = p_class_id) THEN
+    RAISE EXCEPTION 'gradebook % does not belong to class %', p_gradebook_id, p_class_id;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(p_gradebook_id);
+
+  SELECT r.route_base, r.route_name INTO v_base, v_name FROM public._gradebook_column_group_slug_route(p_class_id, p_slug) r;
+
+  SELECT g.id INTO v_id
+    FROM public.gradebook_column_groups g
+   WHERE g.gradebook_id = p_gradebook_id
+     AND g.auto_assign_slug_base = v_base
+   ORDER BY g.sort_order DESC, g.id DESC
+   LIMIT 1;
+
+  IF v_id IS NOT NULL THEN
+    RETURN v_id;
+  END IF;
+
+  -- A group already holding this slug has opted out of auto-routing, so make a new one beside it.
+  v_slug := v_base;
+  WHILE EXISTS (SELECT 1 FROM public.gradebook_column_groups
+                 WHERE gradebook_id = p_gradebook_id AND slug = v_slug) LOOP
+    v_suffix := v_suffix + 1;
+    v_slug := v_base || '-' || v_suffix;
+  END LOOP;
+
+  INSERT INTO public.gradebook_column_groups
+         (class_id, gradebook_id, name, slug, sort_order, auto_assign_slug_base)
+  VALUES (p_class_id, p_gradebook_id, v_name, v_slug,
+          COALESCE((SELECT MAX(sort_order) + 1
+                      FROM public.gradebook_column_groups
+                     WHERE gradebook_id = p_gradebook_id AND NOT is_default), 0),
+          v_base)
+  RETURNING id INTO v_id;
+
+  RETURN v_id;
+END $$;
+
+REVOKE ALL ON FUNCTION public._gradebook_column_group_for_slug(bigint, bigint, text) FROM PUBLIC, anon, authenticated;
+
+-- Where a new column with this slug would go: an existing group, or the name of the group that
+-- would be created for it. Reads only.
+CREATE OR REPLACE FUNCTION public.gradebook_column_group_preview_for_slug(
+  p_gradebook_id bigint, p_class_id bigint, p_slug text)
+RETURNS TABLE (group_id bigint, group_name text, is_new boolean)
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_base text;
+  v_name text;
+BEGIN
+  IF NOT public.authorizeforclassgrader(p_class_id) THEN
+    RAISE EXCEPTION 'insufficient permissions: grader access required for class %', p_class_id;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM public.gradebooks WHERE id = p_gradebook_id AND class_id = p_class_id) THEN
+    RAISE EXCEPTION 'gradebook % does not belong to class %', p_gradebook_id, p_class_id;
+  END IF;
+
+  SELECT r.route_base, r.route_name INTO v_base, v_name FROM public._gradebook_column_group_slug_route(p_class_id, p_slug) r;
+
+  RETURN QUERY
+    SELECT g.id, g.name, false
+      FROM public.gradebook_column_groups g
+     WHERE g.gradebook_id = p_gradebook_id
+       AND g.auto_assign_slug_base = v_base
+     ORDER BY g.sort_order DESC, g.id DESC
+     LIMIT 1;
+  IF NOT FOUND THEN
+    RETURN QUERY SELECT NULL::bigint, v_name, true;
+  END IF;
+END $$;
+
+REVOKE ALL ON FUNCTION public.gradebook_column_group_preview_for_slug(bigint, bigint, text) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.gradebook_column_group_preview_for_slug(bigint, bigint, text)
+  TO authenticated, service_role;
+
+NOTIFY pgrst, 'reload schema';
+
+
