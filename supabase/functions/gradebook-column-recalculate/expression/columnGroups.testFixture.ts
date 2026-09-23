@@ -17,6 +17,10 @@ export type FixtureColumn = {
   gradebook_column_group_id: number;
   position_in_group: number;
   max_score: number;
+  /** Set on a calculated column other than the one a case evaluates. */
+  score_expression?: string;
+  /** Stored dependencies, as the save path would have written them. */
+  dependencies?: { gradebook_columns?: number[]; gradebook_column_groups?: number[] };
 };
 
 /** Listed out of display order on purpose: expansion must sort by position_in_group. */
@@ -49,12 +53,47 @@ export function baseValues(): Record<string, FixtureValue> {
   };
 }
 
+/**
+ * A second total of the homework group, living inside it. Its max_score differs from the
+ * homework columns', so counting it (stale or recalculated) would visibly change a mean.
+ */
+export const HW_AVG_COLUMN: FixtureColumn = {
+  id: 7,
+  slug: "hw-avg",
+  gradebook_column_group_id: HOMEWORK_GROUP,
+  position_in_group: 2,
+  max_score: 200,
+  score_expression: 'mean(gradebook_column_group("hw"))',
+  dependencies: { gradebook_column_groups: [HOMEWORK_GROUP], gradebook_columns: [1, 2] }
+};
+
+/** A total outside the homework group. */
+export const FINAL_COLUMN: FixtureColumn = {
+  id: 8,
+  slug: "final",
+  gradebook_column_group_id: EXAM_GROUP,
+  position_in_group: 1,
+  max_score: 100
+};
+
 export type ParityCase = {
   label: string;
   expression: string;
   values: Record<string, FixtureValue>;
   expected: number | null;
+  /** The gradebook's columns, including the evaluated one. Defaults to FIXTURE_COLUMNS and TOTAL_COLUMN. */
+  columns?: FixtureColumn[];
+  /** The column the expression is evaluated for. Defaults to TOTAL_COLUMN. */
+  evaluatedColumn?: FixtureColumn;
 };
+
+export function parityCaseColumns(parityCase: Pick<ParityCase, "columns">): FixtureColumn[] {
+  return parityCase.columns ?? [...FIXTURE_COLUMNS, TOTAL_COLUMN];
+}
+
+export function parityCaseEvaluatedColumn(parityCase: Pick<ParityCase, "evaluatedColumn">): FixtureColumn {
+  return parityCase.evaluatedColumn ?? TOTAL_COLUMN;
+}
 
 function withValues(overrides: Record<string, FixtureValue>): Record<string, FixtureValue> {
   return { ...baseValues(), ...overrides };
@@ -90,6 +129,21 @@ export const PARITY_CASES: ParityCase[] = [
     expression: 'mean(gradebook_column_group("hw"))',
     values: withValues({ "hw-2": { score: null, is_missing: true, is_excused: true } }),
     expected: 85
+  },
+  {
+    // hw holds hw-1, hw-2 and hw-avg, which totals hw. final (outside hw) must not count hw-avg.
+    label: "another total inside the group is left out",
+    expression: 'mean(gradebook_column_group("hw"))',
+    values: withValues({ "hw-avg": { score: 5 } }),
+    expected: 70,
+    columns: [
+      FIXTURE_COLUMNS.find((c) => c.slug === "hw-1")!,
+      FIXTURE_COLUMNS.find((c) => c.slug === "hw-2")!,
+      HW_AVG_COLUMN,
+      FIXTURE_COLUMNS.find((c) => c.slug === "exam-1")!,
+      FINAL_COLUMN
+    ],
+    evaluatedColumn: FINAL_COLUMN
   },
   {
     label: "an empty group",

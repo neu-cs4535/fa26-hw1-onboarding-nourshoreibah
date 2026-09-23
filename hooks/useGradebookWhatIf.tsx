@@ -313,8 +313,11 @@ export class GradebookWhatIfController {
           console.log("context", context);
           console.log("columnSlug", columnSlug);
         }
-        const findOne = (slug: string) => {
-          const matchingColumns = allColumns.filter((c) => minimatch(c.slug, slug));
+        // A slug from a list (a group expansion or a hand-written array) is matched exactly, like
+        // the recalculator does, so a slug with glob characters such as `?` or `[` still resolves.
+        // A single string argument keeps its glob meaning, e.g. gradebook_columns("hw-*").
+        const findOne = (slug: string, exact = false) => {
+          const matchingColumns = allColumns.filter((c) => (exact ? c.slug === slug : minimatch(c.slug, slug)));
           if (!matchingColumns.length) return null;
           if (TRACE_WHAT_IF_CALCULATIONS) {
             console.log("matchingColumns", matchingColumns);
@@ -448,7 +451,7 @@ export class GradebookWhatIfController {
             pushMissingDependenciesToContext(context, ret);
             return ret;
           };
-          if (matchingColumns.length === 1 && !slug.includes("*")) {
+          if (matchingColumns.length === 1 && (exact || !slug.includes("*"))) {
             return scoreForColumnID(matchingColumns[0].id);
           } else {
             return matchingColumns.map((col) => scoreForColumnID(col.id));
@@ -456,7 +459,7 @@ export class GradebookWhatIfController {
         };
         const slugList = slugListArgument(columnSlug);
         if (slugList) {
-          const ret = slugList.map(findOne);
+          const ret = slugList.map((slug) => findOne(slug, true));
           return ret;
         } else {
           const ret = findOne(columnSlug as string);

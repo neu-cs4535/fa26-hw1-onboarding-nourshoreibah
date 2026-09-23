@@ -1,7 +1,14 @@
 import { assertEquals, assertThrows } from "jsr:@std/assert@^1";
 import { create, all } from "mathjs";
-import { columnGroupCallSlugs, expandColumnGroup, slugListArgument } from "./columnGroups.ts";
-import { FIXTURE_COLUMNS, FIXTURE_GROUPS, TOTAL_COLUMN } from "./columnGroups.testFixture.ts";
+import { columnGroupCallSlugs, expandColumnGroup, referencedColumnGroupIds, slugListArgument } from "./columnGroups.ts";
+import {
+  EXAM_GROUP,
+  FIXTURE_COLUMNS,
+  FIXTURE_GROUPS,
+  HOMEWORK_GROUP,
+  HW_AVG_COLUMN,
+  TOTAL_COLUMN
+} from "./columnGroups.testFixture.ts";
 
 const ALL_COLUMNS = [...FIXTURE_COLUMNS, TOTAL_COLUMN];
 const math = create(all, {});
@@ -14,6 +21,29 @@ Deno.test("expandColumnGroup: display order, and the evaluated column left out",
     excludeColumnId: TOTAL_COLUMN.id
   });
   assertEquals(expanded?.slugs, ["hw-1", "hw-2", "hw-3"]);
+});
+
+Deno.test("expandColumnGroup: another total of the same group is left out, a total of another group is not", () => {
+  const examTotal = {
+    ...HW_AVG_COLUMN,
+    id: 9,
+    slug: "exam-total",
+    dependencies: { gradebook_column_groups: [EXAM_GROUP] }
+  };
+  const expanded = expandColumnGroup({
+    groupSlug: "hw",
+    groups: FIXTURE_GROUPS,
+    columns: [...ALL_COLUMNS, HW_AVG_COLUMN, examTotal],
+    excludeColumnId: TOTAL_COLUMN.id
+  });
+  assertEquals(expanded?.slugs, ["hw-1", "hw-2", "hw-3", "exam-total"]);
+});
+
+Deno.test("referencedColumnGroupIds: tolerates any stored dependencies shape", () => {
+  assertEquals(referencedColumnGroupIds({ gradebook_column_groups: [HOMEWORK_GROUP] }), [HOMEWORK_GROUP]);
+  assertEquals(referencedColumnGroupIds({ gradebook_columns: [1] }), []);
+  assertEquals(referencedColumnGroupIds(null), []);
+  assertEquals(referencedColumnGroupIds("junk"), []);
 });
 
 Deno.test("expandColumnGroup: unknown slug is undefined, empty group is []", () => {

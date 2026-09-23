@@ -8,14 +8,12 @@ import type { SupabaseClient } from "jsr:@supabase/supabase-js@2";
 import type { Database } from "../_shared/SupabaseTypes.d.ts";
 import { processGradebookRowsCalculation } from "./GradebookProcessor.ts";
 import {
-  FIXTURE_COLUMNS,
   FIXTURE_GROUPS,
   PARITY_CASES,
-  TOTAL_COLUMN,
-  type FixtureValue
+  parityCaseColumns,
+  parityCaseEvaluatedColumn,
+  type ParityCase
 } from "./expression/columnGroups.testFixture.ts";
-
-const ALL_COLUMNS = [...FIXTURE_COLUMNS, TOTAL_COLUMN];
 
 type Row = Record<string, unknown>;
 
@@ -39,19 +37,27 @@ function fakeAdminClient(tables: Record<string, Row[]>, gradebookColumnStudents:
   } as unknown as SupabaseClient<Database>;
 }
 
-async function evaluateOnServer(expression: string, values: Record<string, FixtureValue>): Promise<number | null> {
-  const columns = ALL_COLUMNS.map((c) => ({
+async function evaluateOnServer(parityCase: ParityCase): Promise<number | null> {
+  const { expression, values } = parityCase;
+  const allColumns = parityCaseColumns(parityCase);
+  const evaluated = parityCaseEvaluatedColumn(parityCase);
+  const columns = allColumns.map((c) => ({
     ...c,
     class_id: 1,
     gradebook_id: 1,
     name: c.slug,
     released: true,
     instructor_only: false,
-    score_expression: c.id === TOTAL_COLUMN.id ? expression : null,
-    dependencies: c.id === TOTAL_COLUMN.id ? { gradebook_columns: FIXTURE_COLUMNS.map((f) => f.id) } : null,
+    score_expression: c.id === evaluated.id ? expression : (c.score_expression ?? null),
+    // The evaluated column depends on every other column: enough to load their values and
+    // to order it after any other calculated column.
+    dependencies:
+      c.id === evaluated.id
+        ? { gradebook_columns: allColumns.filter((f) => f.id !== evaluated.id).map((f) => f.id) }
+        : (c.dependencies ?? null),
     gradebooks: { expression_prefix: null }
   }));
-  const gcs = ALL_COLUMNS.map((c) => ({
+  const gcs = allColumns.map((c) => ({
     id: 100 + c.id,
     class_id: 1,
     gradebook_id: 1,
@@ -73,15 +79,15 @@ async function evaluateOnServer(expression: string, values: Record<string, Fixtu
     gradebook_id: 1,
     rows: [{ student_id: "alice", is_private: false, gcsRows: gcs }]
   });
-  const update = result.get("alice")?.find((u) => u.gradebook_column_id === TOTAL_COLUMN.id);
+  const update = result.get("alice")?.find((u) => u.gradebook_column_id === evaluated.id);
   // No update means the recalculated score equals the stale stored one, which no case expects.
-  if (!update) throw new Error(`no update for ${TOTAL_COLUMN.slug}`);
+  if (!update) throw new Error(`no update for ${evaluated.slug}`);
   return update.score ?? null;
 }
 
 for (const parityCase of PARITY_CASES) {
   Deno.test(`recalculator parity: ${parityCase.label}`, async () => {
-    const score = await evaluateOnServer(parityCase.expression, parityCase.values);
+    const score = await evaluateOnServer(parityCase);
     if (parityCase.expected === null) assertEquals(score, null);
     else assertAlmostEquals(score as number, parityCase.expected, 1e-9);
   });

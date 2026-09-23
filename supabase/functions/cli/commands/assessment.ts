@@ -41,7 +41,13 @@ import { parseByteCap, parseNonNegativeInt } from "../utils/paramValidation.ts";
 import { pageAll } from "../utils/paging.ts";
 import { type IdentityMode, type Tokenizer } from "../utils/tokenization.ts";
 
-const SCHEMA_VERSION = 1;
+/**
+ * Version of every record shape this export streams. 2: a gradebook_column's `sort_order`
+ * is its class-wide display index (it was the column's own sort_order column), and
+ * `group_id` / `group_slug` were added so `gradebook_column_group("slug")` in an
+ * expression can be resolved.
+ */
+const SCHEMA_VERSION = 2;
 const STUDENT_PAGE_SIZE = 500;
 const FACT_PAGE_SIZE = 1000;
 /** Group ids per `.in()`; member rows within each batch are drained by pageAll. */
@@ -362,7 +368,7 @@ async function streamGradebookColumns(
 
   const { data: groupRows, error: groupsError } = await supabase
     .from("gradebook_column_groups")
-    .select("id, name, sort_order")
+    .select("id, slug, name, sort_order")
     .eq("class_id", classId);
   if (groupsError) throw new CLICommandError(`Failed to load gradebook column groups: ${groupsError.message}`, 500);
   const groupsById = new Map((groupRows ?? []).map((g) => [g.id, g]));
@@ -380,6 +386,8 @@ async function streamGradebookColumns(
     ...r,
     slug: r.slug,
     display_index: index,
+    group_id: r.gradebook_column_group_id,
+    group_slug: groupsById.get(r.gradebook_column_group_id)?.slug ?? null,
     group_name: groupsById.get(r.gradebook_column_group_id)?.name ?? null
   }));
   const { resolved, unmatched } = resolveSelectors(selectors, candidates);
@@ -403,7 +411,11 @@ async function streamGradebookColumns(
       max_score: c.max_score,
       instructor_only: c.instructor_only,
       released: c.released,
+      // The column's 0-based position in gradebook display order across the class (groups by
+      // sort_order, then position_in_group). Kept under this name for older readers.
       sort_order: c.display_index,
+      group_id: c.group_id,
+      group_slug: c.group_slug,
       group_name: c.group_name,
       position_in_group: c.position_in_group,
       score_expression: c.score_expression,

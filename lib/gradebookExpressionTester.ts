@@ -380,8 +380,11 @@ function buildImports(math: MathJSInstance, gradebookController: GradebookContro
     },
     slugInput: string | string[]
   ) => {
-    const findOne = (slug: string) => {
-      const matchingColumns = allColumns.filter((c) => c.slug && minimatch(c.slug, slug));
+    // A slug from a list (a group expansion or a hand-written array) is matched exactly, like
+    // the recalculator does, so a slug with glob characters such as `?` or `[` still resolves.
+    // A single string argument keeps its glob meaning, e.g. gradebook_columns("hw-*").
+    const findOne = (slug: string, exact = false) => {
+      const matchingColumns = allColumns.filter((c) => c.slug && (exact ? c.slug === slug : minimatch(c.slug, slug)));
       if (!matchingColumns.length) return null;
 
       const scoreForColumn = (colId: number) => {
@@ -426,7 +429,7 @@ function buildImports(math: MathJSInstance, gradebookController: GradebookContro
         return ret;
       };
 
-      if (matchingColumns.length === 1 && !slug.includes("*")) {
+      if (matchingColumns.length === 1 && (exact || !slug.includes("*"))) {
         return scoreForColumn(matchingColumns[0].id);
       }
       return matchingColumns.map((c) => scoreForColumn(c.id));
@@ -434,7 +437,7 @@ function buildImports(math: MathJSInstance, gradebookController: GradebookContro
 
     const slugList = slugListArgument(slugInput);
     if (slugList) {
-      return slugList.map(findOne);
+      return slugList.map((slug) => findOne(slug, true));
     }
     const ret = findOne(slugInput as string);
     if (ret && !(slugInput as string).includes("*")) return ret;
@@ -637,9 +640,11 @@ export function evaluateForStudent(params: {
   const localMath: MathJSInstance = math.create(math.all, {});
   buildImports(localMath, gradebookController, studentId);
 
-  // gradebook_column_group("x") becomes gradebook_columns([...member slugs]). The
-  // rewritten text is mapped back to the original call so hover spans still line up.
-  const groupCallRewrites: { rewritten: string; original: string }[] = [];
+  // gradebook_column_group("x") becomes gradebook_columns([...member slugs]). Each rewritten
+  // node remembers the call it replaced, and hover text prints that call in its place, so
+  // spans line up with what the user typed. Keyed by node, not by text: two calls can
+  // expand to the same list, or match a hand-written one.
+  const groupCallOriginals = new WeakMap<MathNode, string>();
   const membership = {
     groups: gradebookController.gradebook_column_groups.rows ?? [],
     columns: gradebookController.columns as ColumnWithEntries[]
@@ -650,7 +655,7 @@ export function evaluateForStudent(params: {
     const rewritten = new localMath.FunctionNode("gradebook_columns", [
       new localMath.ArrayNode(slugs.map((slug) => new localMath.ConstantNode(slug)))
     ]);
-    groupCallRewrites.push({ rewritten: rewritten.toString(), original: node.toString() });
+    groupCallOriginals.set(rewritten, node.toString());
     return rewritten;
   });
   // For every context-aware function call, prepend the `context` symbol to
@@ -670,14 +675,21 @@ export function evaluateForStudent(params: {
   const injectContextArg = (node: MathNode): MathNode => {
     // Recurse into children first so inner calls also get transformed.
     const mapped = (node as unknown as { map: (cb: (child: MathNode) => MathNode) => MathNode }).map(injectContextArg);
+    let result = mapped;
     if (mapped.type === "FunctionNode") {
       const fn = mapped as FunctionNode;
       if (CONTEXT_FUNCTIONS.includes(fn.fn.name)) {
         const contextSymbol = new SymbolNodeCtor("context");
-        return new FunctionNodeCtor(fn.fn, [contextSymbol, ...fn.args]);
+        result = new FunctionNodeCtor(fn.fn, [contextSymbol, ...fn.args]);
       }
     }
-    return mapped;
+    // `map` and the rebuild above make new nodes, so carry the group-call origin across.
+    const original = groupCallOriginals.get(node);
+    if (original !== undefined) groupCallOriginals.set(result, original);
+    return result;
+  };
+  const groupCallAwareToString = {
+    handler: (node: MathNode) => groupCallOriginals.get(node)
   };
   const transformed = injectContextArg(parsed);
 
@@ -834,7 +846,7 @@ export function evaluateForStudent(params: {
       if (!shouldCaptureNode(node)) continue;
       let source: string;
       try {
-        source = node.toString();
+        source = node.toString(groupCallAwareToString);
       } catch {
         source = node.type;
       }
@@ -844,10 +856,7 @@ export function evaluateForStudent(params: {
       // `sum(gradebook_columns("hw-*"))` stringify to
       // `sum(context, gradebook_columns(context, "hw-*"))` and we need to
       // clean both levels.
-      let pretty = source.replace(contextArgStrip, "$1(");
-      for (const { rewritten, original } of groupCallRewrites) {
-        pretty = pretty.split(rewritten).join(original);
-      }
+      const pretty = source.replace(contextArgStrip, "$1(");
 
       const searchFrom = nextSearchFromBySource.get(pretty) ?? 0;
       const span = findRawSpan(pretty, searchFrom);

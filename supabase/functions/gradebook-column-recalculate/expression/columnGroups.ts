@@ -22,15 +22,27 @@ export type ColumnGroupMember = {
   slug: string | null;
   gradebook_column_group_id: number;
   position_in_group: number;
+  /** The column's stored `dependencies` JSON. Only `gradebook_column_groups` is read. */
+  dependencies?: unknown;
 };
+
+/** The group ids a column's stored `dependencies` JSON says its expression references. */
+export function referencedColumnGroupIds(dependencies: unknown): number[] {
+  if (!dependencies || typeof dependencies !== "object") return [];
+  const ids = (dependencies as { gradebook_column_groups?: unknown }).gradebook_column_groups;
+  return Array.isArray(ids) ? ids.filter((id): id is number => typeof id === "number") : [];
+}
 
 export type ExpandedColumnGroup = { groupId: number; columnIds: number[]; slugs: string[] };
 
 /**
  * The one definition of group membership: the group's columns in display order
- * (position_in_group, then id). `excludeColumnId` drops the column being evaluated,
- * so a total column can live inside the group it totals. Returns undefined for an
- * unknown slug.
+ * (position_in_group, then id). Two kinds of member are left out, so a total column can
+ * live inside the group it totals:
+ * - `excludeColumnId`, the column being evaluated;
+ * - any member whose own dependencies reference this group, i.e. another total of it.
+ *   Without this, two totals in one group would each count the other.
+ * Returns undefined for an unknown slug.
  */
 export function expandColumnGroup(args: {
   groupSlug: string;
@@ -41,7 +53,13 @@ export function expandColumnGroup(args: {
   const group = args.groups.find((g) => g.slug === args.groupSlug);
   if (!group) return undefined;
   const members = args.columns
-    .filter((c) => c.gradebook_column_group_id === group.id && c.id !== args.excludeColumnId && c.slug)
+    .filter(
+      (c) =>
+        c.gradebook_column_group_id === group.id &&
+        c.id !== args.excludeColumnId &&
+        c.slug &&
+        !referencedColumnGroupIds(c.dependencies).includes(group.id)
+    )
     .sort((a, b) => a.position_in_group - b.position_in_group || a.id - b.id);
   return {
     groupId: group.id,

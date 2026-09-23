@@ -152,14 +152,15 @@ Deno.serve(async (req) => {
     .filter((a: AssignmentRow) => a.slug !== null)
     .map((a: AssignmentRow) => ({ id: a.id, slug: a.slug as string }));
 
-  const { data: allColumns, error: columnsError } = await admin
-    .from("gradebook_columns")
-    .select("id, slug, score_expression, dependencies, max_score, gradebook_column_group_id, position_in_group")
-    .eq("gradebook_id", gradebookId);
-  const { data: groups, error: groupsError } = await admin
-    .from("gradebook_column_groups")
-    .select("id, slug")
-    .eq("gradebook_id", gradebookId);
+  // One snapshot of columns and groups, read together before the loop. Membership that changes
+  // after this read is merged back in by the BEFORE UPDATE OF dependencies trigger.
+  const [{ data: allColumns, error: columnsError }, { data: groups, error: groupsError }] = await Promise.all([
+    admin
+      .from("gradebook_columns")
+      .select("id, slug, score_expression, dependencies, max_score, gradebook_column_group_id, position_in_group")
+      .eq("gradebook_id", gradebookId),
+    admin.from("gradebook_column_groups").select("id, slug").eq("gradebook_id", gradebookId)
+  ]);
 
   if (columnsError || !allColumns || groupsError || !groups) {
     return new Response(JSON.stringify({ error: "Failed to load gradebook columns" }), {
@@ -188,16 +189,30 @@ Deno.serve(async (req) => {
     (c) => c.score_expression !== null && c.id !== excludeColumnId
   );
 
-  let updated = 0;
-  for (const col of targetColumns) {
-    const expr = col.score_expression as string;
-    const deps = extractDependenciesFromExpression(expr, validAssignments, validColumns, {
+  // A group expansion leaves out members that are themselves totals of the group, which it reads
+  // from each member's dependencies.gradebook_column_groups. Those group ids come from the
+  // expression alone, so compute them for every target first and expand against the result;
+  // otherwise a column that just became a total would still be counted by the others.
+  const snapshotColumns = (allColumns as ColumnRow[]).map((c) => ({ ...c }));
+  const computeDependencies = (col: ColumnRow) =>
+    extractDependenciesFromExpression(col.score_expression as string, validAssignments, validColumns, {
       groups,
-      columns: allColumns as ColumnRow[],
+      columns: snapshotColumns,
       columnId: col.id
     });
+  const referencedGroups = new Map(targetColumns.map((c) => [c.id, computeDependencies(c)?.gradebook_column_groups]));
+  for (const c of snapshotColumns) {
+    if (!referencedGroups.has(c.id)) continue;
+    const groupIds = referencedGroups.get(c.id);
+    c.dependencies = { ...(c.dependencies ?? {}), gradebook_column_groups: groupIds };
+    if (!groupIds) delete c.dependencies.gradebook_column_groups;
+  }
+
+  let updated = 0;
+  for (const col of targetColumns) {
     const current = normalized(col.dependencies);
-    const next = normalized(deps);
+    const next = normalized(computeDependencies(col));
+    // Skip the write when nothing changed, so untouched columns keep their stored row.
     const changed = JSON.stringify(current) !== JSON.stringify(next);
     if (changed) {
       console.log(
