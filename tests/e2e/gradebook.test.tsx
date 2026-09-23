@@ -1760,4 +1760,48 @@ test.describe("Gradebook column reorder (issue #531)", () => {
       expect(colRestored!.gradebook_column_group_id).toBe(groupBefore);
     }).toPass({ timeout: 5000 });
   });
+
+  test("Edit Column moves a column to another group", async ({ page }) => {
+    const region = page.getByRole("region", { name: "Instructor Gradebook Table" });
+    await region.getByRole("button", { name: "Expand all groups" }).click();
+    await waitForVirtualizerIdle(page);
+
+    const { data: groups } = await supabase
+      .from("gradebook_column_groups")
+      .select("id, name, is_default")
+      .eq("class_id", reorderCourse.id);
+    const { data: cols } = await supabase
+      .from("gradebook_columns")
+      .select("id, name, gradebook_column_group_id")
+      .eq("class_id", reorderCourse.id)
+      .order("id");
+    const column = cols!.find((c) => !groups!.find((g) => g.id === c.gradebook_column_group_id)?.is_default)!;
+    const target = groups!.find((g) => g.id !== column.gradebook_column_group_id)!;
+    expect(column, "the fixture needs a grouped column").toBeTruthy();
+    expect(target, "the fixture needs a second group").toBeTruthy();
+
+    const headerCell = region
+      .locator("thead tr")
+      .filter({ has: page.locator("th").filter({ hasText: "Student Name" }) })
+      .locator("[data-col-id]")
+      .filter({ hasText: column.name });
+    await headerCell.getByRole("button", { name: "Column options" }).click();
+    await page.getByRole("menuitem", { name: "Edit Column", exact: true }).click();
+
+    const dialog = page.getByRole("dialog", { name: /Edit Column/ });
+    const groupSelect = dialog.getByLabel("Group", { exact: true });
+    await expect(groupSelect).toHaveValue(String(column.gradebook_column_group_id));
+    await groupSelect.selectOption(String(target.id));
+    await dialog.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(dialog).toBeHidden({ timeout: 15_000 });
+
+    await expect(async () => {
+      const { data: moved } = await supabase
+        .from("gradebook_columns")
+        .select("gradebook_column_group_id")
+        .eq("id", column.id)
+        .single();
+      expect(moved!.gradebook_column_group_id).toBe(target.id);
+    }).toPass({ timeout: 10_000 });
+  });
 });

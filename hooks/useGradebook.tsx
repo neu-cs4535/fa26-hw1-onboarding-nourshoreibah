@@ -2198,12 +2198,23 @@ export function GradebookProvider({
     };
   }, []);
 
+  // Close on the next tick rather than in the cleanup itself. React StrictMode runs this cleanup
+  // and the setup back to back on mount, and children re-run their effects against the same
+  // controller in between, so closing synchronously hands them a closed TableController.
+  const pendingClose = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
+    if (pendingClose.current) {
+      clearTimeout(pendingClose.current);
+      pendingClose.current = null;
+    }
     return () => {
-      if (controller.current) {
-        controller.current.close();
-        controller.current = null;
-      }
+      pendingClose.current = setTimeout(() => {
+        pendingClose.current = null;
+        if (controller.current) {
+          controller.current.close();
+          controller.current = null;
+        }
+      }, 0);
     };
   }, []);
 

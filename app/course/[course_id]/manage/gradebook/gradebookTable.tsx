@@ -661,6 +661,7 @@ function AddColumnDialog() {
 
 function EditColumnDialog({ columnId, onClose }: { columnId: number; onClose: () => void }) {
   const gradebookController = useGradebookController();
+  const editDialogGroups = useGradebookColumnGroups();
   const { mutateAsync: updateColumn } = useUpdate<GradebookColumn>({
     resource: "gradebook_columns"
   });
@@ -676,6 +677,7 @@ function EditColumnDialog({ columnId, onClose }: { columnId: number; onClose: ()
     renderExpression?: string;
     showCalculatedRanges?: boolean;
     instructorOnly: boolean;
+    gradebookColumnGroupId: string;
   };
 
   const {
@@ -695,7 +697,8 @@ function EditColumnDialog({ columnId, onClose }: { columnId: number; onClose: ()
       scoreExpression: column?.score_expression ?? "",
       renderExpression: column?.render_expression ?? "",
       showCalculatedRanges: column?.show_calculated_ranges ?? false,
-      instructorOnly: column?.instructor_only ?? false
+      instructorOnly: column?.instructor_only ?? false,
+      gradebookColumnGroupId: column ? String(column.gradebook_column_group_id) : ""
     }
   });
 
@@ -716,7 +719,8 @@ function EditColumnDialog({ columnId, onClose }: { columnId: number; onClose: ()
         scoreExpression: expr,
         renderExpression: column.render_expression ?? "",
         showCalculatedRanges: column.show_calculated_ranges ?? false,
-        instructorOnly: column.instructor_only ?? false
+        instructorOnly: column.instructor_only ?? false,
+        gradebookColumnGroupId: String(column.gradebook_column_group_id)
       });
       // Clear any ValidationResult cached from a previously-edited column so
       // a stale error state can't briefly gate the Save button before
@@ -773,6 +777,18 @@ function EditColumnDialog({ columnId, onClose }: { columnId: number; onClose: ()
       const submittedInstructorOnly = effectiveInstructorOnlyForSubmit(data.scoreExpression, data.instructorOnly);
       if ((column.instructor_only ?? false) !== submittedInstructorOnly) settingsChanged.push("instructor_only");
 
+      // Moving goes through the RPC, which keeps positions in both groups dense. It runs first so a
+      // move the database refuses (a cycle through a group total) leaves the rest unsaved too.
+      const targetGroupId = Number(data.gradebookColumnGroupId);
+      if (Number.isFinite(targetGroupId) && targetGroupId > 0 && targetGroupId !== column.gradebook_column_group_id) {
+        const { error: moveError } = await createClient().rpc("gradebook_column_assign_group", {
+          p_column_id: columnId,
+          p_group_id: targetGroupId
+        });
+        if (moveError) throw moveError;
+        settingsChanged.push("group");
+      }
+
       await updateColumn({
         resource: "gradebook_columns",
         id: columnId,
@@ -788,6 +804,13 @@ function EditColumnDialog({ columnId, onClose }: { columnId: number; onClose: ()
           dependencies
         }
       });
+      if (settingsChanged.includes("group")) {
+        await Promise.all([
+          gradebookController.gradebook_columns.refetchAll(),
+          gradebookController.gradebook_column_groups.refetchAll(),
+          gradebookController.gradebook_row.refetchAll()
+        ]);
+      }
 
       setIsLoading(false);
       toaster.dismiss();
@@ -897,6 +920,22 @@ function EditColumnDialog({ columnId, onClose }: { columnId: number; onClose: ()
                       {errors.slug.message as string}
                     </Text>
                   )}
+                </Box>
+                <Box>
+                  <Label htmlFor="editGradebookColumnGroupId">Group</Label>
+                  <NativeSelect.Root size="sm">
+                    <NativeSelect.Field id="editGradebookColumnGroupId" {...register("gradebookColumnGroupId")}>
+                      {editDialogGroups.map((g) => (
+                        <option key={g.id} value={String(g.id)}>
+                          {g.name}
+                        </option>
+                      ))}
+                    </NativeSelect.Field>
+                    <NativeSelect.Indicator />
+                  </NativeSelect.Root>
+                  <Text fontSize="xs" color="fg.muted" mt={1}>
+                    Moving a column puts it at the end of the new group. Totals that name the group pick it up.
+                  </Text>
                 </Box>
                 <Box>
                   {canEditScoreExpression ? (
