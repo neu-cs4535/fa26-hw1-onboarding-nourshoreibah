@@ -2,9 +2,8 @@
 
 import { toaster } from "@/components/ui/toaster";
 import { useGradebookColumnGroups, useGradebookColumns, useGradebookController } from "@/hooks/useGradebook";
-import { formatGroupWeight, formatWeightPercent } from "@/lib/gradebookColumnGroups";
 import { createClient } from "@/utils/supabase/client";
-import { Box, Button, Dialog, HStack, Icon, IconButton, Input, Portal, Table, Text, VStack } from "@chakra-ui/react";
+import { Button, Dialog, HStack, Icon, IconButton, Input, Portal, Table, Text, VStack } from "@chakra-ui/react";
 import { useCallback, useMemo, useState } from "react";
 import { LuChevronDown, LuChevronUp, LuPlus, LuTrash2 } from "react-icons/lu";
 
@@ -90,22 +89,6 @@ export default function ManageColumnGroupsDialog() {
     [run, supabase]
   );
 
-  const setWeight = useCallback(
-    async (id: number, raw: string) => {
-      const trimmed = raw.trim();
-      const weight = trimmed === "" ? null : Number(trimmed) / 100;
-      if (weight !== null && (!Number.isFinite(weight) || weight < 0)) {
-        toaster.error({ title: "Weight must be a number of percent, or blank" });
-        return;
-      }
-      await run("Weight saved", async () => {
-        const { error } = await supabase.from("gradebook_column_groups").update({ weight }).eq("id", id);
-        if (error) throw error;
-      });
-    },
-    [run, supabase]
-  );
-
   const move = useCallback(
     async (id: number, delta: -1 | 1) => {
       const index = reorderable.findIndex((g) => g.id === id);
@@ -134,9 +117,6 @@ export default function ManageColumnGroupsDialog() {
     },
     [run, supabase]
   );
-
-  const weightTotal = useMemo(() => reorderable.reduce((sum, g) => sum + (g.weight ?? 0), 0), [reorderable]);
-  const anyWeighted = useMemo(() => reorderable.some((g) => g.weight !== null), [reorderable]);
 
   return (
     <Dialog.Root open={isOpen} onOpenChange={(e) => setIsOpen(e.open)} size="lg" placement="center" lazyMount>
@@ -171,7 +151,6 @@ export default function ManageColumnGroupsDialog() {
                     <Table.Row>
                       <Table.ColumnHeader>Group</Table.ColumnHeader>
                       <Table.ColumnHeader>Columns</Table.ColumnHeader>
-                      <Table.ColumnHeader>Weight %</Table.ColumnHeader>
                       <Table.ColumnHeader>Order</Table.ColumnHeader>
                       <Table.ColumnHeader />
                     </Table.Row>
@@ -192,17 +171,6 @@ export default function ManageColumnGroupsDialog() {
                           />
                         </Table.Cell>
                         <Table.Cell>{countsByGroup.get(group.id) ?? 0}</Table.Cell>
-                        <Table.Cell>
-                          <Input
-                            size="sm"
-                            width="5rem"
-                            inputMode="decimal"
-                            defaultValue={group.weight === null ? "" : formatWeightPercent(group.weight)}
-                            aria-label={`Weight of group ${group.name}, in percent`}
-                            disabled={busy || group.is_default}
-                            onBlur={(e) => setWeight(group.id, e.target.value)}
-                          />
-                        </Table.Cell>
                         <Table.Cell>
                           {group.is_default ? null : (
                             <HStack gap={1}>
@@ -249,17 +217,6 @@ export default function ManageColumnGroupsDialog() {
                     ))}
                   </Table.Body>
                 </Table.Root>
-
-                {anyWeighted ? (
-                  <Box>
-                    <Text fontSize="sm" color={Math.abs(weightTotal - 1) < 1e-9 ? "fg.muted" : "fg.error"}>
-                      Weights total {formatGroupWeight(weightTotal)}
-                      {Math.abs(weightTotal - 1) < 1e-9
-                        ? "."
-                        : ". Nothing is recalculated from weights until a column's score expression calls weighted_total()."}
-                    </Text>
-                  </Box>
-                ) : null}
 
                 <Text fontSize="xs" color="fg.muted">
                   Deleting a group moves its columns to Ungrouped; it never deletes a column.

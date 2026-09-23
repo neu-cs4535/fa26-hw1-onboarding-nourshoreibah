@@ -1,7 +1,6 @@
 "use client";
 import { ClassRealTimeController } from "@/lib/ClassRealTimeController";
 import { sortColumnsForDisplay, type GradebookColumnGroup } from "@/lib/gradebookColumnGroups";
-import { buildWeightedTotalSpecs } from "@/supabase/functions/gradebook-column-recalculate/expression/weightedTotal";
 import TableController, {
   fetchPostgrestAllPages,
   type BroadcastMessage,
@@ -1853,19 +1852,6 @@ export class GradebookController {
     exprNode.traverse((node: MathNode) => {
       if (node.type === "FunctionNode") {
         const functionName = (node as FunctionNode).fn.name;
-        if (functionName === "weighted_total") {
-          for (const spec of buildWeightedTotalSpecs({
-            columns: this.gradebook_columns.rows,
-            groups: this.gradebook_column_groups.rows ?? [],
-            excludeColumnId: column_id
-          })) {
-            if (!("gradebook_columns" in dependencies)) {
-              dependencies["gradebook_columns"] = new Set();
-            }
-            dependencies["gradebook_columns"].add(spec.column_id);
-          }
-          return;
-        }
         if (functionName in availableDependencies) {
           const args = (node as FunctionNode).args;
           const argType = args[0].type;

@@ -1,8 +1,6 @@
 import {
   buildColumnGroupKeyMap,
   buildGroupedColumns,
-  formatGroupWeight,
-  formatWeightPercent,
   groupKey,
   planColumnDrag,
   sortColumnsForDisplay,
@@ -21,7 +19,6 @@ function group(id: number, name: string, sort_order: number, extra: Partial<Grad
     created_at: "",
     updated_at: "",
     description: null,
-    weight: null,
     is_default: false,
     auto_assign_slug_base: null,
     name_is_auto: true,
@@ -251,24 +248,5 @@ describe("display order with the default group pinned at the top of int4", () =>
     const columns = [col(11, 1, 0), col(21, 2, 0), col(31, 3, 0), col(41, 999, 0)];
     expect(sortColumnsForDisplay(columns, groups).map((c) => c.id)).toEqual([31, 21, 11, 41]);
     expect(visibleGroupsInOrder(columns, groups).map((g) => g.id)).toEqual([3, 2, 1]);
-  });
-});
-
-describe("weights", () => {
-  it("shows a weight as a percentage without float noise", () => {
-    expect(formatWeightPercent(0.07)).toBe("7");
-    expect(formatWeightPercent(0.125)).toBe("12.5");
-    expect(formatWeightPercent(0)).toBe("0");
-    expect(formatGroupWeight(0.07)).toBe("7%");
-    expect(formatGroupWeight(0)).toBe("0%");
-  });
-
-  it("reads a share of the course as a percentage", () => {
-    expect(formatGroupWeight(0.4)).toBe("40%");
-    expect(formatGroupWeight(0.125)).toBe("12.5%");
-  });
-
-  it("says nothing when a group carries no weight", () => {
-    expect(formatGroupWeight(null)).toBeNull();
   });
 });

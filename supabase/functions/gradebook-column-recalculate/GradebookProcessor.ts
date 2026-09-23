@@ -8,15 +8,9 @@ import {
   ContextFunctions,
   ExprDependencyInstance,
   ExpressionContext,
-  getGradebookColumnsDependencySource,
   setRowOverrideValues,
   clearRowOverrideValues
 } from "./expression/DependencySource.ts";
-import {
-  buildWeightedTotalSpecs,
-  makeWeightedTotalSource,
-  type WeightedTotalSpec
-} from "./expression/weightedTotal.ts";
 import * as Sentry from "npm:@sentry/deno@10.10.0";
 
 const DEBUG_LOG = Boolean(Deno.env.get("DEBUG_GRADEBOOK_CALCULATION")) || false;
@@ -368,17 +362,19 @@ function topoSortColumns(columns: ColumnWithPrefix[]): number[] {
   return order;
 }
 
-async function loadColumnsAndWeightedTotalSpecs(
+type OrderedColumnGroup = { id: number; slug: string; sort_order: number };
+
+async function loadOrderedColumns(
   adminSupabase: SupabaseClient<Database>,
   scope: Sentry.Scope,
   gradebook_id: number
-): Promise<{ columns: ColumnWithPrefix[]; weightedTotalSpecs: WeightedTotalSpec[] } | null> {
+): Promise<{ columns: ColumnWithPrefix[]; groups: OrderedColumnGroup[] } | null> {
   const [{ data: columns, error: colsError }, { data: groups, error: groupsError }] = await Promise.all([
     adminSupabase
       .from("gradebook_columns")
       .select("*, gradebooks!gradebook_columns_gradebook_id_fkey(expression_prefix)")
       .eq("gradebook_id", gradebook_id),
-    adminSupabase.from("gradebook_column_groups").select("id, weight, sort_order").eq("gradebook_id", gradebook_id)
+    adminSupabase.from("gradebook_column_groups").select("id, slug, sort_order").eq("gradebook_id", gradebook_id)
   ]);
   if (colsError || !columns) {
     Sentry.captureException(colsError || new Error("Missing columns"), scope);
@@ -398,32 +394,7 @@ async function loadColumnsAndWeightedTotalSpecs(
     if (a.position_in_group !== b.position_in_group) return a.position_in_group - b.position_in_group;
     return a.id - b.id;
   });
-  return { columns: sortedColumns, weightedTotalSpecs: buildWeightedTotalSpecs({ columns: sortedColumns, groups }) };
-}
-
-function createWeightedTotalAttacher({
-  math,
-  class_id,
-  specs
-}: {
-  math: ReturnType<typeof create>;
-  class_id: number;
-  specs: readonly WeightedTotalSpec[];
-}): (context: ExpressionContext, columnId: number) => void {
-  const source = getGradebookColumnsDependencySource(math);
-  const specsByColumnId = new Map<number, WeightedTotalSpec[]>();
-
-  return (context, columnId) => {
-    if (!source) return;
-    let specsForColumn = specsByColumnId.get(columnId);
-    if (!specsForColumn) {
-      specsForColumn = specs.filter((spec) => spec.column_id !== columnId);
-      specsByColumnId.set(columnId, specsForColumn);
-    }
-    context.weighted_total_source = makeWeightedTotalSource(specsForColumn, (slug) =>
-      source.execute({ function_name: "gradebook_columns", context, key: slug, class_id })
-    );
-  };
+  return { columns: sortedColumns, groups };
 }
 
 export async function processGradebookRowCalculation(
@@ -455,9 +426,9 @@ export async function processGradebookRowCalculation(
     >[];
   }
 ): Promise<RowUpdate[]> {
-  const loaded = await loadColumnsAndWeightedTotalSpecs(adminSupabase, scope, gradebook_id);
+  const loaded = await loadOrderedColumns(adminSupabase, scope, gradebook_id);
   if (!loaded) return [];
-  const { columns, weightedTotalSpecs } = loaded;
+  const { columns } = loaded;
 
   const columnById = new Map<number, ColumnWithPrefix>();
   const columnBySlug = new Map<string, ColumnWithPrefix>();
@@ -486,7 +457,6 @@ export async function processGradebookRowCalculation(
   }
 
   await addDependencySourceFunctions({ math, keys, supabase: adminSupabase });
-  const attachWeightedTotalSource = createWeightedTotalAttacher({ math, class_id, specs: weightedTotalSpecs });
 
   // Compile expressions
   const compiledById = new Map<number, EvalFunction>();
@@ -585,7 +555,6 @@ export async function processGradebookRowCalculation(
       scope,
       class_id
     };
-    attachWeightedTotalSource(context, columnId);
 
     let nextScore: number | null = null;
     let isMissing = false;
@@ -771,9 +740,9 @@ export async function processGradebookRowsCalculation(
     }[];
   }
 ): Promise<Map<string, RowUpdate[]>> {
-  const loaded = await loadColumnsAndWeightedTotalSpecs(adminSupabase, scope, gradebook_id);
+  const loaded = await loadOrderedColumns(adminSupabase, scope, gradebook_id);
   if (!loaded) return new Map();
-  const { columns, weightedTotalSpecs } = loaded;
+  const { columns } = loaded;
 
   const math = create(all, {});
   // Build keys for all students in this batch
@@ -794,7 +763,6 @@ export async function processGradebookRowsCalculation(
     console.log(`Working on ${keys.length} keys for gradebook ${gradebook_id}`);
   }
   await addDependencySourceFunctions({ math, keys, supabase: adminSupabase });
-  const attachWeightedTotalSource = createWeightedTotalAttacher({ math, class_id, specs: weightedTotalSpecs });
 
   const compiledById = new Map<number, EvalFunction>();
   for (const c of columns as unknown as ColumnWithPrefix[]) {
@@ -897,7 +865,6 @@ export async function processGradebookRowsCalculation(
         scope,
         class_id
       };
-      attachWeightedTotalSource(context, columnId);
 
       let nextScore: number | null = null;
       let isMissing = false;

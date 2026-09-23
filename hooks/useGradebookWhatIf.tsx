@@ -18,11 +18,6 @@ import {
   COMMON_CONTEXT_FUNCTIONS
 } from "@/supabase/functions/gradebook-column-recalculate/expression/commonMathFunctions";
 import type { IncompleteValuesAdvice } from "@/supabase/functions/gradebook-column-recalculate/expression/shared";
-import {
-  buildWeightedTotalSpecs,
-  makeWeightedTotalSource,
-  type WeightedTotalSource
-} from "@/supabase/functions/gradebook-column-recalculate/expression/weightedTotal";
 
 const TRACE_WHAT_IF_CALCULATIONS = false;
 
@@ -33,7 +28,6 @@ export type ExpressionContext = {
   incomplete_values_policy: "assume_max" | "assume_zero" | "report_only";
   scope: Sentry.Scope;
   class_id: number;
-  weighted_total_source?: WeightedTotalSource;
 };
 //These functions should be called with a context object as the first argument
 export const ContextFunctions = [...COMMON_CONTEXT_FUNCTIONS, "gradebook_columns", "assignments"];
@@ -526,11 +520,6 @@ export class GradebookWhatIfController {
           assume_zero: undefined,
           gradebook_score: this._grades[columnId]?.gradebook_score
         };
-        const weightedTotalSpecs = buildWeightedTotalSpecs({
-          columns: allColumns,
-          groups: this.gradebookController.gradebook_column_groups.rows ?? [],
-          excludeColumnId: columnId
-        });
         for (const policy of ["assume_max", "assume_zero", "report_only"]) {
           const context: ExpressionContext = {
             student_id: this.private_profile_id,
@@ -540,12 +529,6 @@ export class GradebookWhatIfController {
             scope: new Sentry.Scope(),
             class_id: this.gradebookController.class_id
           };
-          context.weighted_total_source = makeWeightedTotalSource(weightedTotalSpecs, (slug) =>
-            (imports["gradebook_columns"] as unknown as (ctx: ExpressionContext, slug: string) => unknown)(
-              context,
-              slug
-            )
-          );
           let result;
           let evalError: Error | null = null;
           try {

@@ -32,7 +32,6 @@ CREATE TABLE IF NOT EXISTS public.gradebook_column_groups (
   slug         text NOT NULL,
   description  text,
   sort_order   integer NOT NULL,
-  weight       numeric,
   is_default   boolean NOT NULL DEFAULT false,
   auto_assign_slug_base text,
   CONSTRAINT gradebook_column_groups_slug_key
@@ -41,8 +40,6 @@ CREATE TABLE IF NOT EXISTS public.gradebook_column_groups (
     UNIQUE (id, gradebook_id),
   CONSTRAINT gradebook_column_groups_order_key
     UNIQUE (gradebook_id, sort_order) DEFERRABLE INITIALLY DEFERRED,
-  CONSTRAINT gradebook_column_groups_weight_chk
-    CHECK (weight IS NULL OR weight >= 0),
   -- The default group is pinned last. Pinning it at a sentinel rather than at count(groups)
   -- keeps MAX(sort_order) + 1 over the other groups from ever landing on it.
   CONSTRAINT gradebook_column_groups_default_last_chk
@@ -55,8 +52,6 @@ COMMENT ON COLUMN public.gradebook_column_groups.sort_order IS
   'Position among this gradebook''s groups. Columns are ordered within a group by gradebook_columns.position_in_group. The default group is always 2147483647.';
 COMMENT ON COLUMN public.gradebook_column_groups.auto_assign_slug_base IS
   'Legacy slug base that routes new columns here. NULL means the group does not auto-receive columns.';
-COMMENT ON COLUMN public.gradebook_column_groups.weight IS
-  'Share of the course total, read by the weighted_total() expression function. NULL means unweighted.';
 
 CREATE UNIQUE INDEX IF NOT EXISTS gradebook_column_groups_one_default
   ON public.gradebook_column_groups (gradebook_id) WHERE is_default;
@@ -246,8 +241,7 @@ $$;
 
 ALTER TABLE public.gradebook_columns
   ADD COLUMN IF NOT EXISTS gradebook_column_group_id bigint,
-  ADD COLUMN IF NOT EXISTS position_in_group integer,
-  ADD COLUMN IF NOT EXISTS weight numeric;
+  ADD COLUMN IF NOT EXISTS position_in_group integer;
 
 DROP POLICY IF EXISTS "everyone in class can view column groups" ON public.gradebook_column_groups;
 CREATE POLICY "everyone in class can view column groups"
@@ -257,7 +251,7 @@ CREATE POLICY "everyone in class can view column groups"
     public.authorizeforclassgrader(class_id)
     OR (
       public.authorizeforclass(class_id)
-      -- A group's name and weight can be derived from a single column, so students see a
+      -- A group's name can be derived from a single column, so students see a
       -- group only once it holds a column they could read under gradebook_columns RLS.
       AND EXISTS (
         SELECT 1 FROM public.gradebook_columns c
@@ -269,8 +263,6 @@ CREATE POLICY "everyone in class can view column groups"
 
 COMMENT ON COLUMN public.gradebook_columns.position_in_group IS
   'Position within gradebook_column_group_id. Replaces the former global sort_order; display order is (group.sort_order, position_in_group, id).';
-COMMENT ON COLUMN public.gradebook_columns.weight IS
-  'Relative share within this column''s group, read by weighted_total(). NULL means 1.';
 
 CREATE OR REPLACE VIEW public.gradebook_column_legacy_groups AS
 WITH cols AS (

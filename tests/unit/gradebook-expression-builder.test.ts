@@ -31,12 +31,12 @@ type ColumnSpec = {
   score_expression?: string | null;
   dependencies?: { gradebook_columns?: number[]; assignments?: number[] } | null;
   gradebook_column_group_id?: number;
-  weight?: number | null;
+  position_in_group?: number;
 };
 
 type GroupSpec = {
   id: number;
-  weight?: number | null;
+  slug: string;
 };
 
 type StudentEntry = {
@@ -83,7 +83,7 @@ function createFakeController(params: {
     },
     gradebook_column_groups: {
       get rows() {
-        return groups.map((g) => ({ id: g.id, weight: g.weight ?? null }));
+        return groups;
       }
     },
     /** Mirrors GradebookController.getGradebookColumnStudent's `GradebookColumnStudent | undefined` return. */

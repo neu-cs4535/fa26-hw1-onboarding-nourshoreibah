@@ -1,7 +1,6 @@
 import { isArray, isDenseMatrix, Matrix } from "mathjs";
-import { computeWeightedTotal, type WeightedTotalSource } from "./weightedTotal.ts";
 
-export const COMMON_CONTEXT_FUNCTIONS = ["mean", "countif", "sum", "drop_lowest", "weighted_total"] as const;
+export const COMMON_CONTEXT_FUNCTIONS = ["mean", "countif", "sum", "drop_lowest"] as const;
 
 export type GradebookExpressionValue = {
   score: number | null;
@@ -22,7 +21,6 @@ export type ExpressionContextForCommonFunctions = {
     setTag?: (key: string, value: unknown) => void;
     addBreadcrumb?: (payload: { message: string; level: string }) => void;
   };
-  weighted_total_source?: WeightedTotalSource;
 };
 
 type ImportMap = Record<string, (...args: never[]) => unknown>;
@@ -299,15 +297,6 @@ export function addCommonExpressionFunctions(
       }
     }
     return ret;
-  }) as (...args: never[]) => unknown;
-
-  imports["weighted_total"] = ((context: ExpressionContextForCommonFunctions) => {
-    if (!context.weighted_total_source) {
-      throw new Error(
-        "weighted_total() is not available in this evaluation context: no column group weights were supplied"
-      );
-    }
-    return computeWeightedTotal(context.weighted_total_source());
   }) as (...args: never[]) => unknown;
 
   imports["case_when"] = ((conditions: Matrix<unknown>) => {

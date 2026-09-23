@@ -15,7 +15,6 @@ import {
   pickPreferredGradebookValue,
   pushMissingDependenciesToContext
 } from "./shared.ts";
-import type { WeightedTotalSource } from "./weightedTotal.ts";
 
 export type PrivateProfileId = string;
 
@@ -26,7 +25,6 @@ export type ExpressionContext = {
   incomplete_values_policy: "assume_max" | "assume_zero" | "report_only";
   scope: Sentry.Scope;
   class_id: number;
-  weighted_total_source?: WeightedTotalSource;
 };
 export type ResolvedExprDependencyInstance = ExprDependencyInstance & {
   value: unknown;
@@ -623,11 +621,4 @@ export async function addDependencySourceFunctions({
     includeSecurityGuards: true
   });
   math.import(imports, { override: true });
-}
-
-export function getGradebookColumnsDependencySource(math: MathJsInstance): DependencySource | undefined {
-  const batchDependencySourceMap = (math as unknown as Record<string, unknown>)._batchDependencySourceMap as
-    | Record<string, DependencySource>
-    | undefined;
-  return batchDependencySourceMap?.gradebook_columns;
 }

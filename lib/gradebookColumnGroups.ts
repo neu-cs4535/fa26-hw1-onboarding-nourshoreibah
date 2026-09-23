@@ -69,18 +69,6 @@ export function visibleGroupsInOrder<T extends GroupableColumn>(
   return groups.filter((g) => populated.has(g.id)).sort((a, b) => a.sort_order - b.sort_order || a.id - b.id);
 }
 
-export function formatGroupWeight(weight: number | null): string | null {
-  if (weight === null || Number.isNaN(weight)) return null;
-  return `${formatWeightPercent(weight, 1)}%`;
-}
-
-/** A weight fraction as a plain percentage number, without float noise: 0.07 becomes "7", not "7.000000000000001". */
-export function formatWeightPercent(weight: number, decimals = 4): string {
-  const factor = 10 ** decimals;
-  const rounded = Math.round(weight * 100 * factor) / factor;
-  return String(Object.is(rounded, -0) ? 0 : rounded);
-}
-
 export async function resolveGroupForSlug(
   client: SupabaseClient<Database>,
   gradebookId: number,

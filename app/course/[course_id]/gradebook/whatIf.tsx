@@ -1,4 +1,4 @@
-import { buildGroupedColumns, formatGroupWeight, sortColumnsForDisplay } from "@/lib/gradebookColumnGroups";
+import { buildGroupedColumns, sortColumnsForDisplay } from "@/lib/gradebookColumnGroups";
 import Markdown from "@/components/ui/markdown";
 import { Tooltip } from "@/components/ui/tooltip";
 import { useClassProfiles } from "@/hooks/useClassProfiles";
@@ -442,13 +442,11 @@ function GradebookCard({
 function GroupHeader({
   groupName,
   columnCount,
-  weightLabel,
   isCollapsed,
   onToggle
 }: {
   groupName: string;
   columnCount: number;
-  weightLabel: string | null;
   isCollapsed: boolean;
   onToggle: () => void;
 }) {
@@ -478,11 +476,6 @@ function GroupHeader({
               {columnCount} {pluralize(groupName.charAt(0).toUpperCase() + groupName.slice(1))}...
             </Text>
           </HStack>
-          {weightLabel ? (
-            <Text as="span" fontSize="sm" color="fg.muted">
-              {weightLabel} of the course
-            </Text>
-          ) : null}
         </HStack>
       </button>
     </Card.Root>
@@ -547,8 +540,6 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
 
   const groupedColumns = useMemo(() => buildGroupedColumns(sortedColumns, columnGroups), [sortedColumns, columnGroups]);
 
-  const groupById = useMemo(() => new Map(columnGroups.map((g) => [g.id, g])), [columnGroups]);
-
   // Initialize all groups as collapsed by default, but preserve existing collapsed state
   useEffect(() => {
     const collapsibleKeys = Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1);
@@ -605,9 +596,6 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
         );
       } else {
         const isCollapsed = collapsedGroups.has(groupKey);
-        const weightLabel = formatGroupWeight(
-          groupById.get(group.columns[0].gradebook_column_group_id)?.weight ?? null
-        );
 
         // Add group header
         items.push(
@@ -615,7 +603,6 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
             key={`header-${groupKey}`}
             groupName={group.groupName}
             columnCount={group.columns.length}
-            weightLabel={weightLabel}
             isCollapsed={isCollapsed}
             onToggle={() => toggleGroup(groupKey)}
           />

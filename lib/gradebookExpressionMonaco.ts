@@ -132,13 +132,6 @@ export const GRADEBOOK_BUILTIN_FUNCTIONS: GradebookBuiltinFunction[] = [
     insertText: 'drop_lowest(${1:gradebook_columns("hw-*")}, ${2:1})'
   },
   {
-    name: "weighted_total",
-    signature: "weighted_total()",
-    description:
-      "Course percentage (0-100) from the column groups' weights. Each weighted group contributes sum(score)/sum(max_score) across its columns, scaled by each column's own weight, and the result is normalised over the groups that have something graded. Unweighted groups and excused columns are skipped, missing work counts as zero, and the column holding the call never counts itself.",
-    insertText: "weighted_total()"
-  },
-  {
     name: "case_when",
     signature: "case_when(matrix)",
     description:

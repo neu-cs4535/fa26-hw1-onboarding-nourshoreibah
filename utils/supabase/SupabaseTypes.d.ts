@@ -3595,7 +3595,6 @@ export type Database = {
           slug: string;
           sort_order: number;
           updated_at: string;
-          weight: number | null;
         };
         Insert: {
           auto_assign_slug_base?: string | null;
@@ -3610,7 +3609,6 @@ export type Database = {
           slug: string;
           sort_order: number;
           updated_at?: string;
-          weight?: number | null;
         };
         Update: {
           auto_assign_slug_base?: string | null;
@@ -3625,7 +3623,6 @@ export type Database = {
           slug?: string;
           sort_order?: number;
           updated_at?: string;
-          weight?: number | null;
         };
         Relationships: [
           {
@@ -3775,7 +3772,6 @@ export type Database = {
           show_max_score: boolean;
           slug: string;
           updated_at: string;
-          weight: number | null;
         };
         Insert: {
           class_id: number;
@@ -3797,7 +3793,6 @@ export type Database = {
           show_max_score?: boolean;
           slug: string;
           updated_at?: string;
-          weight?: number | null;
         };
         Update: {
           class_id?: number;
@@ -3819,7 +3814,6 @@ export type Database = {
           show_max_score?: boolean;
           slug?: string;
           updated_at?: string;
-          weight?: number | null;
         };
         Relationships: [
           {
@@ -13523,7 +13517,6 @@ export type Database = {
           show_max_score: boolean;
           slug: string;
           updated_at: string;
-          weight: number | null;
         };
         SetofOptions: {
           from: "*";
@@ -13586,7 +13579,6 @@ export type Database = {
           show_max_score: boolean;
           slug: string;
           updated_at: string;
-          weight: number | null;
         };
         SetofOptions: {
           from: "*";
@@ -13617,7 +13609,6 @@ export type Database = {
           show_max_score: boolean;
           slug: string;
           updated_at: string;
-          weight: number | null;
         };
         SetofOptions: {
           from: "*";

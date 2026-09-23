@@ -33,7 +33,6 @@ import {
   planColumnDrag,
   resolveGroupForSlug,
   buildGroupedColumns,
-  formatGroupWeight,
   sortColumnsForDisplay
 } from "@/lib/gradebookColumnGroups";
 import ManageColumnGroupsDialog from "./manageColumnGroups";
@@ -2589,8 +2588,6 @@ export default function GradebookTable() {
     [cachedColumnsKey, columnGroups]
   );
 
-  const columnGroupById = useMemo(() => new Map(columnGroups.map((g) => [g.id, g])), [columnGroups]);
-
   // Initialize all groups as collapsed by default, but preserve existing collapsed state
   useEffect(() => {
     const collapsibleKeys = Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1);
@@ -3271,7 +3268,6 @@ export default function GradebookTable() {
       key: string;
       groupKey: string;
       groupName: string;
-      groupWeight: number | null;
       isCollapsed: boolean;
       groupColumnsLen: number;
     };
@@ -3306,7 +3302,6 @@ export default function GradebookTable() {
           key: `grp-${groupKeyForColumn}-${columnId}`,
           groupKey: groupKeyForColumn!,
           groupName: group.groupName,
-          groupWeight: columnGroupById.get(groupColumns[0].gradebook_column_group_id)?.weight ?? null,
           isCollapsed,
           groupColumnsLen: groupColumns.length
         });
@@ -3319,15 +3314,7 @@ export default function GradebookTable() {
       }
     }
     return segments;
-  }, [
-    scrollableLeafColumns,
-    columnGroupKeyById,
-    columnGroupById,
-    groupedColumns,
-    collapsedGroups,
-    findBestColumnToShow,
-    getColWidth
-  ]);
+  }, [scrollableLeafColumns, columnGroupKeyById, groupedColumns, collapsedGroups, findBestColumnToShow, getColWidth]);
 
   const filterHeader = useCallback(
     (header: Header<UserProfile, unknown>) => {
@@ -3744,11 +3731,6 @@ export default function GradebookTable() {
                               {pluralize(seg.groupName.charAt(0).toUpperCase() + seg.groupName.slice(1))}
                               ...
                             </Text>
-                            {formatGroupWeight(seg.groupWeight) ? (
-                              <Text fontSize="xs" color="fg.muted">
-                                {formatGroupWeight(seg.groupWeight)}
-                              </Text>
-                            ) : null}
                           </HStack>
                         </Box>
                       ))}
