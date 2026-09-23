@@ -29,12 +29,12 @@ import {
 import { useDraggable } from "@dnd-kit/core";
 import { Select, type GroupBase } from "chakra-react-select";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { FiChevronDown } from "react-icons/fi";
 import {
   LuArrowLeft,
   LuArrowRight,
-  LuChevronDown,
-  LuChevronRight,
-  LuEllipsisVertical,
+  LuChevronsLeftRight,
+  LuChevronsRightLeft,
   LuGripVertical,
   LuPencil,
   LuPlus,
@@ -62,24 +62,35 @@ export type ColumnGroupActions = {
   onDelete: (group: GradebookColumnGroup) => void;
   onAddColumn: (group: GradebookColumnGroup) => void;
   onMove: (group: GradebookColumnGroup, delta: -1 | 1) => void;
+  onToggleCollapse: (group: GradebookColumnGroup) => void;
 };
 
 function ColumnGroupOptionsMenu({
   group,
   actions,
   canMoveLeft,
-  canMoveRight
+  canMoveRight,
+  isCollapsed,
+  canCollapse
 }: {
   group: GradebookColumnGroup;
   actions: ColumnGroupActions;
   canMoveLeft: boolean;
   canMoveRight: boolean;
+  isCollapsed: boolean;
+  canCollapse: boolean;
 }) {
   return (
     <MenuRoot>
       <MenuTrigger asChild>
-        <IconButton size="2xs" variant="ghost" aria-label={`Options for group ${group.name}`} flexShrink={0}>
-          <Icon as={LuEllipsisVertical} />
+        <IconButton
+          size="2xs"
+          variant="surface"
+          aria-label={`Options for group ${group.name}`}
+          flexShrink={0}
+          borderRadius={0}
+        >
+          <Icon as={FiChevronDown} />
         </IconButton>
       </MenuTrigger>
       <MenuContent minW="180px">
@@ -91,6 +102,12 @@ function ColumnGroupOptionsMenu({
           <Icon as={LuPlus} boxSize={3} mr={2} />
           Add column to group
         </MenuItem>
+        {(canCollapse || isCollapsed) && (
+          <MenuItem value="toggle-collapse" onClick={() => actions.onToggleCollapse(group)}>
+            <Icon as={isCollapsed ? LuChevronsLeftRight : LuChevronsRightLeft} boxSize={3} mr={2} />
+            {isCollapsed ? "Expand group" : "Collapse group"}
+          </MenuItem>
+        )}
         <MenuSeparator />
         <MenuItem value="move-left" disabled={!canMoveLeft} onClick={() => actions.onMove(group, -1)}>
           <Icon as={LuArrowLeft} boxSize={3} mr={2} />
@@ -118,7 +135,6 @@ export function ColumnGroupHeader({
   width,
   columnCount,
   isCollapsed,
-  onToggle,
   isInstructor,
   actions,
   canMoveLeft,
@@ -133,7 +149,6 @@ export function ColumnGroupHeader({
   width: number;
   columnCount: number;
   isCollapsed: boolean;
-  onToggle: () => void;
   isInstructor: boolean;
   actions: ColumnGroupActions;
   canMoveLeft: boolean;
@@ -147,8 +162,9 @@ export function ColumnGroupHeader({
     id: `${GROUP_DRAG_PREFIX}${group.id}`,
     disabled: !movable || dragDisabled
   });
-  const collapsible = columnCount > 1;
   const narrow = width < 170;
+  // A collapsed group's strip is too thin for a name; the strip below shows it running down.
+  const compact = width < 60;
 
   return (
     <Box
@@ -170,7 +186,8 @@ export function ColumnGroupHeader({
       display="flex"
       alignItems="center"
       gap={1}
-      px={2}
+      px={compact ? 0 : 2}
+      justifyContent={compact ? "center" : undefined}
       overflow="hidden"
       opacity={isDragging ? 0.4 : 1}
       pointerEvents={anyDragging ? "none" : "auto"}
@@ -178,7 +195,7 @@ export function ColumnGroupHeader({
       aria-label={`Column group ${group.name}`}
       data-group-id={group.id}
     >
-      {movable && (
+      {movable && !compact && (
         <Box
           {...attributes}
           {...listeners}
@@ -191,24 +208,13 @@ export function ColumnGroupHeader({
           <Icon as={LuGripVertical} boxSize={3} color="fg.muted" />
         </Box>
       )}
-      {collapsible && (
-        <IconButton
-          size="2xs"
-          variant="ghost"
-          color="fg.muted"
-          onClick={onToggle}
-          aria-label={isCollapsed ? `Expand group ${group.name}` : `Collapse group ${group.name}`}
-          aria-expanded={!isCollapsed}
-          flexShrink={0}
-        >
-          <Icon as={isCollapsed ? LuChevronRight : LuChevronDown} />
-        </IconButton>
+      {!compact && (
+        <WrappedTooltip content={`${group.name} · ${group.slug}`}>
+          <Text fontWeight="semibold" fontSize="sm" color={group.is_default ? "fg.muted" : "fg"} truncate minW={0}>
+            {group.name}
+          </Text>
+        </WrappedTooltip>
       )}
-      <WrappedTooltip content={`${group.name} · ${group.slug}`}>
-        <Text fontWeight="semibold" fontSize="sm" color={group.is_default ? "fg.muted" : "fg"} truncate minW={0}>
-          {group.name}
-        </Text>
-      </WrappedTooltip>
       {!narrow && (
         <Text fontSize="xs" color="fg.subtle" flexShrink={0}>
           {columnCount === 0 ? "empty" : columnCount}
@@ -216,12 +222,14 @@ export function ColumnGroupHeader({
       )}
       <Box flex="1" />
       {movable && (
-        <Box flexShrink={0} color="fg.muted">
+        <Box flexShrink={0}>
           <ColumnGroupOptionsMenu
             group={group}
             actions={actions}
             canMoveLeft={canMoveLeft}
             canMoveRight={canMoveRight}
+            isCollapsed={isCollapsed}
+            canCollapse={columnCount > 1}
           />
         </Box>
       )}

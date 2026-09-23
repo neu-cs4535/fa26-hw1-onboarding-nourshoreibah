@@ -124,6 +124,7 @@ import {
   LuCheck,
   LuChevronDown,
   LuChevronRight,
+  LuChevronsLeftRight,
   LuColumns3,
   LuFile,
   LuGripVertical,
@@ -142,6 +143,8 @@ import { GradebookPopoverProvider, useGradebookPopover } from "./GradebookPopove
 import ImportGradebookColumn from "./importGradebookColumn";
 
 const GRADE_COL_WIDTH = 120;
+/** Width a collapsed group shrinks to. */
+const COLLAPSED_GROUP_COL_WIDTH = 32;
 /** Width of the placeholder an empty group shows, wide enough for its call to action. */
 const EMPTY_GROUP_COL_WIDTH = 200;
 /** Leaf ids of the placeholder column an empty group renders, alongside `grade_<id>`. */
@@ -2393,8 +2396,8 @@ function ColumnResizeHandle({
 
 type CollapsedGroupMeta = { isCollapsed?: boolean; groupKey?: string; groupName?: string; hiddenCount?: number };
 
-/** Header of the single stub column a collapsed group shrinks to. */
-function CollapsedGroupStubHeader({
+/** The thin strip a collapsed group shrinks to: its name running down, and a click to expand. */
+function CollapsedGroupStrip({
   meta,
   onToggleGroup
 }: {
@@ -2402,32 +2405,34 @@ function CollapsedGroupStubHeader({
   onToggleGroup?: (key: string) => void;
 }) {
   return (
-    <chakra.button
-      type="button"
-      display="flex"
-      flexDirection="column"
-      alignItems="center"
-      onClick={() => meta.groupKey && onToggleGroup?.(meta.groupKey)}
-      aria-label={`Show the ${meta.hiddenCount} hidden columns of ${meta.groupName}`}
-      w="100%"
-      h="100%"
-      minH="inherit"
-      gap={0}
-      p={2}
-      justifyContent="center"
-      cursor="pointer"
-      _hover={{ bg: "bg.info" }}
-    >
-      <HStack gap={1}>
-        <Icon as={LuChevronRight} boxSize={3} />
-        <Text fontSize="sm" fontWeight="semibold">
-          {meta.hiddenCount} columns
+    <WrappedTooltip content={`${meta.groupName}: ${meta.hiddenCount} columns. Click to show them.`}>
+      <chakra.button
+        type="button"
+        onClick={() => meta.groupKey && onToggleGroup?.(meta.groupKey)}
+        aria-label={`Show all ${meta.hiddenCount} columns of ${meta.groupName}`}
+        position="absolute"
+        inset={0}
+        display="flex"
+        flexDirection="column"
+        alignItems="center"
+        gap={1}
+        pt={1}
+        cursor="pointer"
+        _hover={{ bg: "bg.info" }}
+        overflow="hidden"
+      >
+        <Icon as={LuChevronsLeftRight} boxSize={3} color="fg.muted" flexShrink={0} />
+        <Text
+          fontSize="xs"
+          fontWeight="semibold"
+          color="fg.muted"
+          whiteSpace="nowrap"
+          style={{ writingMode: "vertical-rl" }}
+        >
+          {meta.groupName}
         </Text>
-      </HStack>
-      <Text fontSize="xs" color="fg.muted">
-        hidden, click to show
-      </Text>
-    </chakra.button>
+      </chakra.button>
+    </WrappedTooltip>
   );
 }
 
@@ -2506,7 +2511,8 @@ function DraggableGradebookHeaderBox({
 }) {
   const collapsedMeta = header.column.columnDef.meta as CollapsedGroupMeta | undefined;
   const isEmptyGroup = header.column.id.startsWith(EMPTY_GROUP_PREFIX);
-  const isCollapsedStub = Boolean(collapsedMeta?.isCollapsed) || isEmptyGroup;
+  const isCollapsedGroup = Boolean(collapsedMeta?.isCollapsed);
+  const isCollapsedStub = isCollapsedGroup || isEmptyGroup;
   const { attributes, listeners, setNodeRef } = useDraggable({
     id: header.column.id,
     disabled: !showDragHandle || reorderDisabled || isCollapsedStub
@@ -2530,13 +2536,13 @@ function DraggableGradebookHeaderBox({
       </Box>
     ) : undefined;
 
-  const headerBody = isEmptyGroup ? (
+  const headerBody = isCollapsedGroup ? (
+    <CollapsedGroupStrip meta={collapsedMeta!} onToggleGroup={onToggleGroup} />
+  ) : isEmptyGroup ? (
     <EmptyGroupPlaceholderHeader
       groupId={Number(header.column.id.slice(EMPTY_GROUP_PREFIX.length))}
       onAddColumn={onAddColumnToGroup}
     />
-  ) : isCollapsedStub ? (
-    <CollapsedGroupStubHeader meta={collapsedMeta!} onToggleGroup={onToggleGroup} />
   ) : header.column.id.startsWith("grade_") ? (
     <GradebookColumnHeader
       column_id={Number(header.column.id.slice(6))}
@@ -2586,7 +2592,7 @@ function DraggableGradebookHeaderBox({
       data-col-id={header.column.id}
     >
       {headerBody}
-      {liveWidthsRef && getColWidth && onResizeEnd && (
+      {liveWidthsRef && getColWidth && onResizeEnd && !isCollapsedGroup && (
         <ColumnResizeHandle
           columnId={header.column.id}
           liveWidthsRef={liveWidthsRef}
@@ -2879,7 +2885,15 @@ export default function GradebookTable() {
       onEdit: (group) => setGroupDialog({ kind: "edit", group }),
       onDelete: (group) => setGroupDialog({ kind: "delete", group }),
       onAddColumn: (group) => setAddColumnDialog({ groupId: group.id }),
-      onMove: (group, delta) => void moveGroup(group, delta)
+      onMove: (group, delta) => void moveGroup(group, delta),
+      onToggleCollapse: (group) =>
+        setCollapsedGroups((prev) => {
+          const next = new Set(prev);
+          const key = `group-${group.id}`;
+          if (next.has(key)) next.delete(key);
+          else next.add(key);
+          return next;
+        })
     }),
     [moveGroup]
   );
@@ -3194,8 +3208,8 @@ export default function GradebookTable() {
         // Multiple columns - handle collapsed state using base group name
         const isCollapsed = collapsedGroups.has(groupKey);
         if (isCollapsed) {
-          // One stub stands in for the whole group. It borrows a member's id so the layout code that
-          // keys on grade_<id> keeps working, but it shows no member's grades.
+          // A collapsed group shrinks to one thin strip. It borrows a member's id so the layout code
+          // that keys on grade_<id> keeps working, but it shows no grades.
           const representative = findBestColumnToShow(group.columns);
           cols.push({
             id: `grade_${representative.id}`,
@@ -3327,10 +3341,21 @@ export default function GradebookTable() {
   // Column resize state: committed widths (triggers re-render) + live ref (no re-render during drag)
   const [columnWidths, setColumnWidths] = useState<Record<string, number>>({});
   const liveWidthsRef = useRef<Map<string, number>>(new Map());
+  const collapsedLeafIds = useMemo(
+    () =>
+      new Set(
+        scrollableLeafColumns
+          .filter((leaf) => (leaf.columnDef.meta as CollapsedGroupMeta | undefined)?.isCollapsed)
+          .map((leaf) => leaf.id)
+      ),
+    [scrollableLeafColumns]
+  );
   const getColWidth = useCallback(
-    (colId: string): number =>
-      columnWidths[colId] ?? (colId.startsWith(EMPTY_GROUP_PREFIX) ? EMPTY_GROUP_COL_WIDTH : GRADE_COL_WIDTH),
-    [columnWidths]
+    (colId: string): number => {
+      if (collapsedLeafIds.has(colId)) return COLLAPSED_GROUP_COL_WIDTH;
+      return columnWidths[colId] ?? (colId.startsWith(EMPTY_GROUP_PREFIX) ? EMPTY_GROUP_COL_WIDTH : GRADE_COL_WIDTH);
+    },
+    [columnWidths, collapsedLeafIds]
   );
 
   const scrollableWidth = useMemo(
@@ -4056,7 +4081,6 @@ export default function GradebookTable() {
                             width={seg.width}
                             columnCount={seg.groupColumnsLen}
                             isCollapsed={seg.isCollapsed}
-                            onToggle={() => toggleGroup(seg.groupKey)}
                             isInstructor={isInstructor}
                             actions={columnGroupActions}
                             canMoveLeft={order > 0}
@@ -4239,7 +4263,7 @@ export default function GradebookTable() {
                                       No columns yet
                                     </Text>
                                   ) : (header.column.columnDef.meta as CollapsedGroupMeta | undefined)?.isCollapsed ? (
-                                    <CollapsedGroupStubHeader
+                                    <CollapsedGroupStrip
                                       meta={header.column.columnDef.meta as CollapsedGroupMeta}
                                       onToggleGroup={toggleGroup}
                                     />
