@@ -5,6 +5,7 @@ import {
   groupKey,
   groupOrderPatches,
   groupSlugProblem,
+  ORPHAN_GROUP_KEY,
   planColumnDrop,
   slugForGroupName,
   sortColumnsForDisplay,
@@ -89,6 +90,27 @@ describe("grouping", () => {
     expect(grouped[groupKey(groups[0])].columns.map((c) => c.id)).toEqual([11, 13]);
   });
 
+  it("keeps a column whose group is not loaded, in a headerless bucket after the others", () => {
+    // A student whose group row has not loaded yet still sees the column.
+    const groups = [group(1, "Labs", 0)];
+    const columns = [col(31, 3, 1), col(11, 1, 0), col(21, 2, 0), col(32, 3, 0)];
+
+    const grouped = buildGroupedColumns(columns, groups);
+
+    expect(Object.keys(grouped)).toEqual([groupKey(groups[0]), ORPHAN_GROUP_KEY]);
+    expect(grouped[groupKey(groups[0])].isFallback).toBeUndefined();
+    expect(grouped[ORPHAN_GROUP_KEY]).toEqual({
+      groupName: "",
+      isFallback: true,
+      columns: [col(21, 2, 0), col(32, 3, 0), col(31, 3, 1)]
+    });
+  });
+
+  it("has no orphan bucket when every column's group is loaded", () => {
+    const groups = [group(1, "Labs", 0)];
+    expect(Object.keys(buildGroupedColumns([col(11, 1, 0)], groups))).toEqual([groupKey(groups[0])]);
+  });
+
   it("maps every column to the key of the group it renders under", () => {
     const groups = [group(1, "Labs", 0), group(2, "Exams", 1)];
     const columns = [col(11, 1, 0), col(21, 2, 0)];
@@ -141,6 +163,32 @@ describe("what dropping a column does", () => {
   it("does nothing when the column lands where it already is", () => {
     expect(drop(11, 1, 12)).toEqual({ kind: "noop" });
     expect(drop(12, 1, null)).toEqual({ kind: "noop" });
+  });
+
+  it("does nothing when a column is dropped on itself", () => {
+    expect(drop(11, 1, 11)).toEqual({ kind: "noop" });
+    expect(drop(12, 1, 12)).toEqual({ kind: "noop" });
+    expect(drop(31, 3, 31)).toEqual({ kind: "noop" });
+  });
+
+  it("does nothing when a column is dropped in the gap just after it", () => {
+    expect(drop(11, 1, 12)).toEqual({ kind: "noop" });
+    expect(drop(21, 2, 22)).toEqual({ kind: "noop" });
+    expect(drop(22, 2, null)).toEqual({ kind: "noop" });
+    expect(drop(31, 3, null)).toEqual({ kind: "noop" });
+  });
+
+  it("still moves a column two places along", () => {
+    const ids = [11, 12, 13];
+    const byId = new Map(ids.map((id) => [id, 1]));
+    expect(
+      planColumnDrop({
+        orderedColumnIds: ids,
+        groupIdByColumnId: byId,
+        draggedColumnId: 11,
+        target: { groupId: 1, beforeColumnId: 13 }
+      })
+    ).toEqual({ kind: "reorder-in-group", groupId: 1, orderedColumnIds: [12, 11, 13] });
   });
 
   it("does nothing for a column it does not know", () => {

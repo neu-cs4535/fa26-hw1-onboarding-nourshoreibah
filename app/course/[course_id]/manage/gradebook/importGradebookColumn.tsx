@@ -4,7 +4,6 @@ import { toaster } from "@/components/ui/toaster";
 import { useClassProfiles } from "@/hooks/useClassProfiles";
 import { useCourseController, useStudentRoster } from "@/hooks/useCourseController";
 import { getScore, useGradebookColumns, useGradebookController } from "@/hooks/useGradebook";
-import { resolveGroupForSlug } from "@/lib/gradebookColumnGroups";
 import { createClient } from "@/utils/supabase/client";
 import { GradebookColumn, UserProfile } from "@/utils/supabase/DatabaseTypes";
 import { Box, Button, Dialog, HStack, Icon, NativeSelect, Portal, Table, Text, VStack } from "@chakra-ui/react";
@@ -108,12 +107,10 @@ export default function ImportGradebookColumns() {
           description: null,
           dependencies: null,
           slug,
-          gradebook_column_group_id: await resolveGroupForSlug(
-            supabase,
-            gradebookController.gradebook_id,
-            gradebookController.class_id,
-            slug
-          )
+          // Null lets the BEFORE INSERT trigger pick the group from the slug in the same statement, so a
+          // failed insert leaves no empty group behind. The generated Insert type marks the column
+          // required because it is NOT NULL, though the trigger fills it before that is checked.
+          gradebook_column_group_id: null as unknown as number
         };
         const { data, error } = await supabase.from("gradebook_columns").insert(insertObj).select().single();
         if (error) {

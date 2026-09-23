@@ -10,7 +10,16 @@ export type GroupableColumn = {
   position_in_group: number;
 };
 
-export type GroupedColumns<T extends GroupableColumn> = Record<string, { groupName: string; columns: T[] }>;
+export type GroupedColumns<T extends GroupableColumn> = Record<
+  string,
+  { groupName: string; columns: T[]; isFallback?: boolean }
+>;
+
+/**
+ * Key of the bucket that holds columns whose group is not in the loaded groups, e.g. a student who
+ * cannot read a group row yet. The bucket comes last and has no name; render it without a header.
+ */
+export const ORPHAN_GROUP_KEY = "group-orphan";
 
 export function groupKey(group: Pick<GradebookColumnGroup, "id">): string {
   return `group-${group.id}`;
@@ -34,15 +43,23 @@ export function buildGroupedColumns<T extends GroupableColumn>(
   const byId = new Map(groups.map((g) => [g.id, g]));
   const ordered = sortColumnsForDisplay(columns, groups);
   const result: GroupedColumns<T> = {};
+  const orphans: T[] = [];
 
   for (const column of ordered) {
     const group = byId.get(column.gradebook_column_group_id);
-    if (!group) continue;
+    if (!group) {
+      orphans.push(column);
+      continue;
+    }
     const key = groupKey(group);
     if (!result[key]) {
       result[key] = { groupName: group.name, columns: [] };
     }
     result[key].columns.push(column);
+  }
+
+  if (orphans.length > 0) {
+    result[ORPHAN_GROUP_KEY] = { groupName: "", columns: orphans, isFallback: true };
   }
 
   return result;
@@ -134,6 +151,14 @@ export function planColumnDrop(args: {
   const { orderedColumnIds, groupIdByColumnId, draggedColumnId, target } = args;
   const sourceGroupId = groupIdByColumnId.get(draggedColumnId);
   if (sourceGroupId === undefined) return { kind: "noop" };
+  // Dropping a column onto itself, or onto the gap just after it in its own group, leaves it put.
+  if (target.beforeColumnId === draggedColumnId) return { kind: "noop" };
+  if (sourceGroupId === target.groupId) {
+    const current = orderedColumnIds.filter((id) => groupIdByColumnId.get(id) === sourceGroupId);
+    const index = current.indexOf(draggedColumnId);
+    const after = index + 1 < current.length ? current[index + 1] : null;
+    if (target.beforeColumnId === after) return { kind: "noop" };
+  }
 
   const members = orderedColumnIds.filter(
     (id) => id !== draggedColumnId && groupIdByColumnId.get(id) === target.groupId

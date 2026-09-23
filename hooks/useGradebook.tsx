@@ -1411,6 +1411,9 @@ type RendererParams = {
   is_droppable: boolean;
   released: boolean;
 };
+/** TableController.refetchAll refuses calls within 3s of the last; wait a little longer than that. */
+const LAYOUT_REFETCH_THROTTLE_MS = 3100;
+
 export class GradebookController {
   private _studentDetailView: string | null = null;
   private studentDetailViewSubscribers: ((view: string | null) => void)[] = [];
@@ -1424,6 +1427,11 @@ export class GradebookController {
   private _isAnyTableRefetching: boolean = false;
   private _refetchStatusListeners: ((isRefetching: boolean) => void)[] = [];
   private _tableRefetchUnsubscribes: (() => void)[] = [];
+
+  // Layout reconcile: the run in flight, and at most one run queued behind it.
+  private _layoutReconcile: Promise<void> | null = null;
+  private _layoutReconcileQueued: Promise<void> | null = null;
+  private _closed = false;
 
   // --- TableController instances ---
   /** Single-row controller for this gradebook (hydrates expression_prefix, etc.). */
@@ -1545,7 +1553,7 @@ export class GradebookController {
 
   private _setupRefetchTracking() {
     // Track refetch status for tables (GradebookCellController doesn't expose refetch status)
-    const tables = [this.gradebook_row, this.gradebook_columns, this.assignments_table];
+    const tables = [this.gradebook_row, this.gradebook_columns, this.gradebook_column_groups, this.assignments_table];
 
     tables.forEach((table) => {
       const unsubscribe = table.subscribeToRefetchStatus(() => {
@@ -1558,7 +1566,10 @@ export class GradebookController {
   private _updateRefetchStatus() {
     // Check if any table is currently refetching
     const isAnyRefetching =
-      this.gradebook_row.isRefetching || this.gradebook_columns.isRefetching || this.assignments_table.isRefetching;
+      this.gradebook_row.isRefetching ||
+      this.gradebook_columns.isRefetching ||
+      this.gradebook_column_groups.isRefetching ||
+      this.assignments_table.isRefetching;
 
     if (this._isAnyTableRefetching !== isAnyRefetching) {
       this._isAnyTableRefetching = isAnyRefetching;
@@ -1567,8 +1578,10 @@ export class GradebookController {
   }
 
   close() {
+    this._closed = true;
     this.gradebook_row.close();
     this.gradebook_columns.close();
+    this.gradebook_column_groups.close();
     this.table.close();
     this.assignments_table.close();
     this._unsubscribes.forEach((unsubscribe) => unsubscribe());
@@ -1997,7 +2010,72 @@ export class GradebookController {
 
   // Removed get gradebook() method - use new GradebookCellController data directly instead
   get isReady() {
-    return this.gradebook_row.ready && this.gradebook_columns.ready && this.table.ready && this.assignments_table.ready;
+    return (
+      this.gradebook_row.ready &&
+      this.gradebook_columns.ready &&
+      this.gradebook_column_groups.ready &&
+      this.table.ready &&
+      this.assignments_table.ready
+    );
+  }
+
+  /**
+   * Reloads the columns, the column groups and the gradebook row, e.g. after a layout save whose
+   * realtime echo may be missed. Never throws: a failure is logged and the realtime feed is left to
+   * catch up. A call made while one is running queues one more run after it (calls made meanwhile
+   * share that run), so the data a caller awaits was read after its call.
+   */
+  reconcileLayout(): Promise<void> {
+    if (this._closed) return Promise.resolve();
+    if (!this._layoutReconcile) {
+      this._layoutReconcile = this._runLayoutReconcile().finally(() => {
+        this._layoutReconcile = null;
+      });
+      return this._layoutReconcile;
+    }
+    if (!this._layoutReconcileQueued) {
+      this._layoutReconcileQueued = this._layoutReconcile.then(() => {
+        this._layoutReconcileQueued = null;
+        return this.reconcileLayout();
+      });
+    }
+    return this._layoutReconcileQueued;
+  }
+
+  private async _runLayoutReconcile(): Promise<void> {
+    const tables: { name: string; controller: { refetchAll(): Promise<void> } }[] = [
+      { name: "gradebook_columns", controller: this.gradebook_columns },
+      { name: "gradebook_column_groups", controller: this.gradebook_column_groups },
+      { name: "gradebooks", controller: this.gradebook_row }
+    ];
+    await Promise.all(
+      tables.map(async ({ name, controller }) => {
+        try {
+          await controller.refetchAll();
+        } catch (error) {
+          // refetchAll refuses a second call within 3s of the last; wait out the window and retry.
+          if (!(error instanceof Error && error.message.includes("too frequently"))) {
+            console.error(`Could not reload ${name} for the gradebook layout`, error);
+            return;
+          }
+          await new Promise((resolve) => setTimeout(resolve, LAYOUT_REFETCH_THROTTLE_MS));
+          if (this._closed) return;
+          try {
+            await controller.refetchAll();
+          } catch (retryError) {
+            console.error(`Could not reload ${name} for the gradebook layout`, retryError);
+          }
+        }
+      })
+    );
+  }
+
+  /** Moves the loaded gradebook row to `version` of the column layout without a round trip. */
+  setLayoutVersion(version: number): void {
+    if (this._closed) return;
+    const row = this.gradebook_row.rows.find((r) => r.id === this.gradebook_id);
+    if (!row || row.column_layout_version === version) return;
+    this.gradebook_row.applyLocalPatches([{ id: this.gradebook_id, values: { column_layout_version: version } }]);
   }
 
   get isAnyTableRefetching() {

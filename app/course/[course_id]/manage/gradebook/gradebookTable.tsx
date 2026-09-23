@@ -36,6 +36,7 @@ import {
   type ColumnLayoutPatch,
   resolveGroupForSlug,
   buildGroupedColumns,
+  ORPHAN_GROUP_KEY,
   sortColumnsForDisplay,
   type GradebookColumnGroup
 } from "@/lib/gradebookColumnGroups";
@@ -95,6 +96,7 @@ import { useVirtualizer, VirtualItem } from "@tanstack/react-virtual";
 import {
   DndContext,
   DragOverlay,
+  KeyboardSensor,
   PointerSensor,
   closestCenter,
   useDraggable,
@@ -300,6 +302,33 @@ export function buildVisibleReorderUnits(args: {
 }
 
 const MemoizedGradebookCell = React.memo(GradebookCell);
+
+/**
+ * Whether a column-layout save (drag, group move, Move Left/Right, auto-layout) is in flight, and
+ * how to start one. While one runs every other way of moving columns is disabled, so two saves
+ * never race on the layout version.
+ */
+type GradebookLayoutSaveState = {
+  layoutSaveInFlight: boolean;
+  /** Marks a layout save as started; call the returned function when it ends. */
+  beginLayoutSave: () => () => void;
+};
+const GradebookLayoutSaveContext = React.createContext<GradebookLayoutSaveState>({
+  layoutSaveInFlight: false,
+  beginLayoutSave: () => () => {}
+});
+
+function isLayoutConflict(e: unknown): boolean {
+  return typeof e === "object" && e !== null && "code" in e && (e as { code?: unknown }).code === "40001";
+}
+
+function describeError(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (e && typeof e === "object" && "message" in e && typeof (e as { message?: unknown }).message === "string") {
+    return (e as { message: string }).message;
+  }
+  return "An unexpected error occurred";
+}
 
 const GradebookPointerOpener = React.forwardRef<HTMLDivElement, React.ComponentProps<typeof Box>>(
   function GradebookPointerOpener({ children, ...rest }, ref) {
@@ -548,7 +577,7 @@ function AddColumnDialog({
     setIsLoading(true);
     try {
       const dependencies = gradebookController.extractAndValidateDependencies(data.scoreExpression ?? "", -1);
-      await gradebookController.gradebook_columns.create({
+      const created = await gradebookController.gradebook_columns.create({
         name: data.name,
         description: data.description,
         max_score: data.maxScore,
@@ -559,15 +588,15 @@ function AddColumnDialog({
         dependencies,
         class_id: gradebookController.class_id,
         gradebook_id: gradebookController.gradebook_id,
-        gradebook_column_group_id: !data.autoGroup
-          ? Number(data.gradebookColumnGroupId)
-          : await resolveGroupForSlug(
-              createClient(),
-              gradebookController.gradebook_id,
-              gradebookController.class_id,
-              data.slug
-            )
+        // Left null when choosing automatically: the insert trigger picks (or makes) the group from the
+        // slug in the same statement, so a failed insert never leaves an empty group behind. The
+        // generated Insert type says number because the column is NOT NULL after the trigger runs.
+        gradebook_column_group_id: data.autoGroup ? (null as unknown as number) : Number(data.gradebookColumnGroupId)
       });
+      // A group the trigger just made may not have reached us over realtime yet.
+      if (!gradebookController.gradebook_column_groups.rows.some((g) => g.id === created.gradebook_column_group_id)) {
+        void gradebookController.reconcileLayout();
+      }
 
       setIsLoading(false);
       toaster.create({
@@ -803,6 +832,8 @@ function EditColumnDialog({ columnId, onClose }: { columnId: number; onClose: ()
   const renderExpressionValue = watch("renderExpression") ?? "";
   const maxScoreValue = watch("maxScore");
   const editAutoGroup = watch("autoGroup");
+  // The slug as typed, for the "choose automatically" preview and resolution.
+  const editSlugValue = watch("slug") ?? "";
   const [isExpressionBuilderExpanded, setIsExpressionBuilderExpanded] = useState(false);
   const [validation, setValidation] = useState<ValidationResult | null>(null);
 
@@ -876,46 +907,52 @@ function EditColumnDialog({ columnId, onClose }: { columnId: number; onClose: ()
       const submittedInstructorOnly = effectiveInstructorOnlyForSubmit(data.scoreExpression, data.instructorOnly);
       if ((column.instructor_only ?? false) !== submittedInstructorOnly) settingsChanged.push("instructor_only");
 
-      // Moving goes through the RPC, which keeps positions in both groups dense. It runs first so a
-      // move the database refuses (a cycle through a group total) leaves the rest unsaved too.
-      const targetGroupId = data.autoGroup
-        ? await resolveGroupForSlug(
-            createClient(),
-            gradebookController.gradebook_id,
-            gradebookController.class_id,
-            column.slug
-          )
-        : Number(data.gradebookColumnGroupId);
-      if (Number.isFinite(targetGroupId) && targetGroupId > 0 && targetGroupId !== column.gradebook_column_group_id) {
-        const { error: moveError } = await createClient().rpc("gradebook_column_assign_group", {
-          p_column_id: columnId,
-          p_group_id: targetGroupId
+      try {
+        await updateColumn({
+          resource: "gradebook_columns",
+          id: columnId,
+          values: {
+            name: data.name,
+            description: data.description,
+            max_score: data.maxScore,
+            slug: data.slug,
+            score_expression: normalizedExpr,
+            render_expression: data.renderExpression?.length ? data.renderExpression : null,
+            show_calculated_ranges: data.showCalculatedRanges ?? false,
+            instructor_only: submittedInstructorOnly,
+            dependencies
+          }
         });
-        if (moveError) throw moveError;
-        settingsChanged.push("group");
+      } catch (e) {
+        throw new Error(`Could not save the column: ${describeError(e)}`);
       }
 
-      await updateColumn({
-        resource: "gradebook_columns",
-        id: columnId,
-        values: {
-          name: data.name,
-          description: data.description,
-          max_score: data.maxScore,
-          slug: data.slug,
-          score_expression: normalizedExpr,
-          render_expression: data.renderExpression?.length ? data.renderExpression : null,
-          show_calculated_ranges: data.showCalculatedRanges ?? false,
-          instructor_only: submittedInstructorOnly,
-          dependencies
+      // The group move runs after the settings save, so a failed save never leaves the column moved
+      // (or a group made for its slug). Moving goes through the RPC, which keeps positions in both
+      // groups dense.
+      try {
+        const slugForGroup = data.slug || editSlugValue || column.slug;
+        const targetGroupId = data.autoGroup
+          ? await resolveGroupForSlug(
+              createClient(),
+              gradebookController.gradebook_id,
+              gradebookController.class_id,
+              slugForGroup
+            )
+          : Number(data.gradebookColumnGroupId);
+        if (Number.isFinite(targetGroupId) && targetGroupId > 0 && targetGroupId !== column.gradebook_column_group_id) {
+          const { error: moveError } = await createClient().rpc("gradebook_column_assign_group", {
+            p_column_id: columnId,
+            p_group_id: targetGroupId
+          });
+          if (moveError) throw moveError;
+          settingsChanged.push("group");
         }
-      });
+      } catch (e) {
+        throw new Error(`Saved the column's settings, but could not move it to the new group: ${describeError(e)}`);
+      }
       if (settingsChanged.includes("group")) {
-        await Promise.all([
-          gradebookController.gradebook_columns.refetchAll(),
-          gradebookController.gradebook_column_groups.refetchAll(),
-          gradebookController.gradebook_row.refetchAll()
-        ]);
+        void gradebookController.reconcileLayout();
       }
 
       setIsLoading(false);
@@ -1032,7 +1069,7 @@ function EditColumnDialog({ columnId, onClose }: { columnId: number; onClose: ()
                   groups={editDialogGroups}
                   autoGroup={editAutoGroup}
                   onAutoGroupChange={(checked) => setValue("autoGroup", checked)}
-                  slug={column.slug ?? ""}
+                  slug={editSlugValue || (column.slug ?? "")}
                   active
                   selectProps={register("gradebookColumnGroupId")}
                   manualHint="Moving a column puts it at the end of the new group. Totals that name the group pick it up."
@@ -1883,66 +1920,92 @@ function GradebookColumnHeader({
   const headerRef = useRef<HTMLDivElement>(null);
   const isMovingRef = useRef(false);
 
-  const moveLeft = useCallback(async () => {
-    if (isMovingRef.current) return;
+  const { layoutSaveInFlight, beginLayoutSave } = React.useContext(GradebookLayoutSaveContext);
 
-    isMovingRef.current = true;
-    setIsMovingLeft(true);
-    try {
-      const { error } = await supabase.rpc("gradebook_column_move_left", {
-        p_column_id: column_id
-      });
+  /**
+   * What Move Left/Right will do, read from the loaded layout the same way the RPC reads the table:
+   * swap with a neighbor in the group, else swap the whole group with the next movable group, else
+   * nothing (first/last group, or Ungrouped, which is pinned last).
+   */
+  const predictMove = useCallback(
+    (direction: "left" | "right"): "column" | "group" | "edge" => {
+      const before = (a: number, b: number) => (direction === "left" ? a < b : a > b);
+      const groupId = column.gradebook_column_group_id;
+      const hasNeighbor = gradebookController.gradebook_columns.rows.some(
+        (c) =>
+          c.id !== column_id &&
+          c.gradebook_column_group_id === groupId &&
+          before(c.position_in_group, column.position_in_group)
+      );
+      if (hasNeighbor) return "column";
+      const groups = gradebookController.gradebook_column_groups.rows;
+      const group = groups.find((g) => g.id === groupId);
+      if (!group || group.is_default) return "edge";
+      return groups.some((g) => !g.is_default && g.id !== group.id && before(g.sort_order, group.sort_order))
+        ? "group"
+        : "edge";
+    },
+    [column, column_id, gradebookController]
+  );
 
-      if (error) throw error;
-      await gradebookController.gradebook_columns.refetchByIds([column_id]);
+  const moveColumn = useCallback(
+    async (direction: "left" | "right") => {
+      if (isMovingRef.current || layoutSaveInFlight) return;
+      const expected = predictMove(direction);
+      if (expected === "edge") {
+        toaster.create({
+          title: "Already at the edge",
+          description: `"${column.name}" is already as far ${direction} as it can go.`,
+          type: "info"
+        });
+        return;
+      }
+      const groupName =
+        gradebookController.gradebook_column_groups.rows.find((g) => g.id === column.gradebook_column_group_id)?.name ??
+        "its group";
 
-      toaster.create({
-        title: "Column moved left",
-        description: `Successfully moved "${column.name}" to the left`,
-        type: "success"
-      });
-    } catch (error) {
-      toaster.create({
-        title: "Failed to move column",
-        description: error instanceof Error ? error.message : "An unexpected error occurred",
-        type: "error"
-      });
-    } finally {
-      isMovingRef.current = false;
-      setIsMovingLeft(false);
-    }
-  }, [column_id, column, supabase, gradebookController]);
+      isMovingRef.current = true;
+      const setMoving = direction === "left" ? setIsMovingLeft : setIsMovingRight;
+      setMoving(true);
+      const endLayoutSave = beginLayoutSave();
+      try {
+        const { error } = await supabase.rpc(
+          direction === "left" ? "gradebook_column_move_left" : "gradebook_column_move_right",
+          { p_column_id: column_id }
+        );
+        if (error) throw error;
 
-  const moveRight = useCallback(async () => {
-    if (isMovingRef.current) return;
-
-    isMovingRef.current = true;
-    setIsMovingRight(true);
-    try {
-      const { error } = await supabase.rpc("gradebook_column_move_right", {
-        p_column_id: column_id
-      });
-
-      if (error) throw error;
-
-      await gradebookController.gradebook_columns.refetchByIds([column_id]);
-
-      toaster.create({
-        title: "Column moved right",
-        description: `Successfully moved "${column.name}" to the right`,
-        type: "success"
-      });
-    } catch (error) {
-      toaster.create({
-        title: "Failed to move column",
-        description: error instanceof Error ? error.message : "An unexpected error occurred",
-        type: "error"
-      });
-    } finally {
-      isMovingRef.current = false;
-      setIsMovingRight(false);
-    }
-  }, [column_id, column, supabase, gradebookController]);
+        toaster.create(
+          expected === "column"
+            ? {
+                title: `Column moved ${direction}`,
+                description: `Moved "${column.name}" to the ${direction}`,
+                type: "success"
+              }
+            : {
+                title: `Group moved ${direction}`,
+                description: `"${column.name}" is at the ${direction} edge of ${groupName}, so the whole group moved ${direction}`,
+                type: "success"
+              }
+        );
+      } catch (error) {
+        toaster.create({
+          title: "Failed to move column",
+          description: describeError(error),
+          type: "error"
+        });
+      } finally {
+        // Moves touch neighbors and group order too, not only this column.
+        void gradebookController.reconcileLayout();
+        endLayoutSave();
+        isMovingRef.current = false;
+        setMoving(false);
+      }
+    },
+    [column_id, column, supabase, gradebookController, predictMove, layoutSaveInFlight, beginLayoutSave]
+  );
+  const moveLeft = useCallback(() => moveColumn("left"), [moveColumn]);
+  const moveRight = useCallback(() => moveColumn("right"), [moveColumn]);
 
   const releaseColumn = useCallback(async () => {
     if (column.instructor_only) {
@@ -2148,7 +2211,7 @@ function GradebookColumnHeader({
               <MenuItem
                 value="moveLeft"
                 onClick={moveLeft}
-                disabled={isMovingLeft || isMovingRight}
+                disabled={isMovingLeft || isMovingRight || layoutSaveInFlight}
                 _disabled={{ opacity: 0.5, cursor: "not-allowed" }}
               >
                 {isMovingLeft ? <Spinner size="xs" mr={2} /> : <Icon as={LuArrowLeft} boxSize={3} mr={2} />}
@@ -2157,7 +2220,7 @@ function GradebookColumnHeader({
               <MenuItem
                 value="moveRight"
                 onClick={moveRight}
-                disabled={isMovingLeft || isMovingRight}
+                disabled={isMovingLeft || isMovingRight || layoutSaveInFlight}
                 _disabled={{ opacity: 0.5, cursor: "not-allowed" }}
               >
                 {isMovingRight ? <Spinner size="xs" mr={2} /> : <Icon as={LuArrowRight} boxSize={3} mr={2} />}
@@ -2445,7 +2508,14 @@ function ColumnResizeHandle({
   );
 }
 
-type CollapsedGroupMeta = { isCollapsed?: boolean; groupKey?: string; groupName?: string; hiddenCount?: number };
+type CollapsedGroupMeta = {
+  isCollapsed?: boolean;
+  groupKey?: string;
+  groupName?: string;
+  hiddenCount?: number;
+  /** A column whose group is not loaded; see ORPHAN_GROUP_KEY. */
+  isOrphan?: boolean;
+};
 
 /** The thin strip a collapsed group shrinks to: its name running down, and a click to expand. */
 function CollapsedGroupStrip({
@@ -2884,18 +2954,35 @@ export default function GradebookTable() {
   >(null);
   const [addColumnDialog, setAddColumnDialog] = useState<{ groupId: number | null } | null>(null);
 
-  const [isReorderingColumns, setIsReorderingColumns] = useState(false);
+  const [layoutSavesInFlight, setLayoutSavesInFlight] = useState(0);
+  const isReorderingColumns = layoutSavesInFlight > 0;
+  const beginLayoutSave = useCallback(() => {
+    setLayoutSavesInFlight((n) => n + 1);
+    let ended = false;
+    return () => {
+      if (ended) return;
+      ended = true;
+      setLayoutSavesInFlight((n) => Math.max(0, n - 1));
+    };
+  }, []);
+  const layoutSaveState = useMemo<GradebookLayoutSaveState>(
+    () => ({ layoutSaveInFlight: isReorderingColumns, beginLayoutSave }),
+    [isReorderingColumns, beginLayoutSave]
+  );
 
   /**
    * Moves the table first and saves second. The rows change locally before the RPC runs; a failed
-   * save puts them back and says why, and a successful one is reconciled by a refetch while further
-   * drags stay disabled, so a later drag never races a stale refetch.
+   * save puts them back and says why, and a successful one is reconciled by a reload while further
+   * layout changes stay disabled, so a later one never races a stale reload.
+   *
+   * `save` returns the gradebook's new column_layout_version when its RPC reports one, so the next
+   * save sends the right expected version without waiting for the reload.
    */
   const runOptimisticLayoutChange = useCallback(
     async (opts: {
       columnPatches?: ColumnLayoutPatch[];
       groupPatches?: { id: number; values: { sort_order: number } }[];
-      save: () => Promise<void>;
+      save: () => Promise<number | void>;
       failureTitle: string;
     }) => {
       const rollbacks = [
@@ -2904,33 +2991,31 @@ export default function GradebookTable() {
           ? gradebookController.gradebook_column_groups.applyLocalPatches(opts.groupPatches)
           : null
       ].filter((r): r is () => void => r !== null);
-      setIsReorderingColumns(true);
+      const endLayoutSave = beginLayoutSave();
+      const saveAndRecordVersion = async () => {
+        const version = await opts.save();
+        if (typeof version === "number") gradebookController.setLayoutVersion(version);
+      };
       try {
         try {
-          await opts.save();
+          await saveAndRecordVersion();
         } catch (e) {
           // Someone else changed the layout between our read and our write: take their version and retry once.
-          const conflict = typeof e === "object" && e !== null && "code" in e && e.code === "40001";
-          if (!conflict) throw e;
-          await gradebookController.gradebook_row.refetchAll();
-          await opts.save();
+          if (!isLayoutConflict(e)) throw e;
+          await gradebookController.reconcileLayout();
+          await saveAndRecordVersion();
         }
       } catch (e) {
         rollbacks.forEach((rollback) => rollback());
-        toaster.error({
-          title: opts.failureTitle,
-          description: e instanceof Error ? e.message : String((e as { message?: string })?.message ?? e)
-        });
+        toaster.error({ title: opts.failureTitle, description: describeError(e) });
       } finally {
-        await Promise.all([
-          gradebookController.gradebook_columns.refetchAll(),
-          gradebookController.gradebook_column_groups.refetchAll(),
-          gradebookController.gradebook_row.refetchAll()
-        ]).catch(() => {});
-        setIsReorderingColumns(false);
+        // Not awaited: when throttled it waits ~3s, and the layout version the next save sends is
+        // already current (setLayoutVersion). Overlapping reloads coalesce, so the last one wins.
+        void gradebookController.reconcileLayout();
+        endLayoutSave();
       }
     },
-    [gradebookController]
+    [gradebookController, beginLayoutSave]
   );
 
   const reorderGroups = useCallback(
@@ -2939,12 +3024,13 @@ export default function GradebookTable() {
         groupPatches: groupOrderPatches(orderedGroupIds),
         failureTitle: "Could not move the group",
         save: async () => {
-          const { error } = await createClient().rpc("gradebook_column_groups_reorder", {
+          const { data, error } = await createClient().rpc("gradebook_column_groups_reorder", {
             p_gradebook_id: gradebookController.gradebook_id,
             p_ordered_group_ids: orderedGroupIds,
             p_expected_version: gradebookController.gradebook_row.rows[0]?.column_layout_version ?? 0
           });
           if (error) throw error;
+          return data;
         }
       }),
     [runOptimisticLayoutChange, gradebookController]
@@ -2952,6 +3038,7 @@ export default function GradebookTable() {
 
   const moveGroup = useCallback(
     async (group: GradebookColumnGroup, delta: -1 | 1) => {
+      if (isReorderingColumns) return;
       const index = movableGroupOrder.indexOf(group.id);
       const target = index + delta;
       if (index < 0 || target < 0 || target >= movableGroupOrder.length) return;
@@ -2959,7 +3046,7 @@ export default function GradebookTable() {
       [next[index], next[target]] = [next[target], next[index]];
       await reorderGroups(next);
     },
-    [movableGroupOrder, reorderGroups]
+    [movableGroupOrder, reorderGroups, isReorderingColumns]
   );
 
   const columnGroupActions = useMemo<ColumnGroupActions>(
@@ -2980,16 +3067,16 @@ export default function GradebookTable() {
     [moveGroup]
   );
 
-  // Groups start expanded. Forget collapse state for groups that no longer have two or more columns.
+  // Groups start expanded. Forget collapse state only for groups that are gone, and only once the
+  // groups have loaded: a group briefly holding fewer than two columns mid-move, or a reload, keeps it.
   useEffect(() => {
-    const collapsibleKeys = new Set(
-      Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1)
-    );
+    if (!gradebookController.gradebook_column_groups.ready) return;
+    const existingKeys = new Set(columnGroups.map((g) => `group-${g.id}`));
     setCollapsedGroups((prev) => {
-      const kept = [...prev].filter((key) => collapsibleKeys.has(key));
+      const kept = [...prev].filter((key) => existingKeys.has(key));
       return kept.length === prev.size ? prev : new Set(kept);
     });
-  }, [groupedColumns]);
+  }, [columnGroups, gradebookController]);
 
   // Force recalculation helper
   const forceRecalculation = useCallback(() => {
@@ -3046,7 +3133,9 @@ export default function GradebookTable() {
   const autoLayout = useCallback(async () => {
     const supabase = createClient();
 
+    if (isReorderingColumns) return;
     setIsAutoLayouting(true);
+    const endLayoutSave = beginLayoutSave();
     try {
       const { error } = await supabase.rpc("gradebook_auto_layout", {
         p_gradebook_id: gradebookController.gradebook_id
@@ -3066,9 +3155,11 @@ export default function GradebookTable() {
         type: "error"
       });
     } finally {
+      void gradebookController.reconcileLayout();
+      endLayoutSave();
       setIsAutoLayouting(false);
     }
-  }, [gradebookController]);
+  }, [gradebookController, beginLayoutSave, isReorderingColumns]);
 
   const downloadGradebookCsv = useCallback(() => {
     const csv = gradebookController.exportGradebook(courseController, {
@@ -3336,6 +3427,28 @@ export default function GradebookTable() {
       }
     });
 
+    // Columns whose group has not loaded (e.g. one the insert trigger just made) go last as plain
+    // columns: no band, no group controls, no drag handle, since there is no group to act on yet.
+    groupedColumns[ORPHAN_GROUP_KEY]?.columns.forEach((col) => {
+      cols.push({
+        id: `grade_${col.id}`,
+        header: col.name,
+        accessorFn: (row) => scoreMapsRef.current.sortVal.get(row.id)?.get(col.id) ?? null,
+        sortingFn: (rowA, rowB, columnId) =>
+          compareGradeColumnSortValues(rowA.getValue(columnId), rowB.getValue(columnId)),
+        cell: ({ row }) => {
+          return <MemoizedGradebookCell columnId={col.id} studentId={row.original.id} />;
+        },
+        enableColumnFilter: true,
+        filterFn: (row, columnId, filterValue) => {
+          const fv = scoreMapsRef.current.filterVal.get(row.original.id)?.get(col.id) ?? null;
+          return gradebookScoreFilterMatches(filterValue, gradebookScoreToFilterRawString(fv));
+        },
+        enableSorting: true,
+        meta: { isOrphan: true }
+      });
+    });
+
     return cols;
   }, [
     profileIdToSectionData,
@@ -3399,9 +3512,11 @@ export default function GradebookTable() {
       scrollableLeafColumns.map((leaf) => {
         if (leaf.id.startsWith(EMPTY_GROUP_PREFIX)) return Number(leaf.id.slice(EMPTY_GROUP_PREFIX.length));
         if (!leaf.id.startsWith("grade_")) return undefined;
-        return gradebookColumns.find((c) => c.id === Number(leaf.id.slice(6)))?.gradebook_column_group_id;
+        const groupId = gradebookColumns.find((c) => c.id === Number(leaf.id.slice(6)))?.gradebook_column_group_id;
+        // A column whose group is not loaded belongs to no group a drop could target.
+        return groupId !== undefined && columnGroupById.has(groupId) ? groupId : undefined;
       }),
-    [scrollableLeafColumns, gradebookColumns]
+    [scrollableLeafColumns, gradebookColumns, columnGroupById]
   );
 
   const leafGroupStyle = useMemo(() => {
@@ -3464,7 +3579,12 @@ export default function GradebookTable() {
 
   const supabaseForGradebook = useMemo(() => createClient(), []);
 
-  const dndSensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }));
+  // Drops are picked by closestCenter over the gap targets, so the keyboard sensor's default
+  // coordinates (arrow keys nudge the dragged header sideways) land on gaps the same way a pointer does.
+  const dndSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(KeyboardSensor)
+  );
 
   const handleGradebookColumnDragStart = useCallback((event: DragStartEvent) => {
     setActiveDragColumnId(String(event.active.id));
@@ -3478,7 +3598,7 @@ export default function GradebookTable() {
     async (event: DragEndEvent) => {
       const { active, over } = event;
       setActiveDragColumnId(null);
-      if (!isInstructor) return;
+      if (!isInstructor || isReorderingColumns) return;
 
       const overId = over?.id;
       if (typeof overId !== "string") return;
@@ -3497,7 +3617,7 @@ export default function GradebookTable() {
           columnPatches: columnLayoutPatches({ plan, orderedColumnIds: fullGradeColumnIdsOrdered, groupIdByColumnId }),
           failureTitle: "Could not move the column",
           save: async () => {
-            const { error } =
+            const { data, error } =
               plan.kind === "reorder-in-group"
                 ? await supabaseForGradebook.rpc("gradebook_columns_reorder_in_group", {
                     p_group_id: plan.groupId,
@@ -3510,6 +3630,8 @@ export default function GradebookTable() {
                     p_position: plan.position
                   });
             if (error) throw error;
+            // The reorder RPC returns the new layout version; assigning a group returns the column.
+            return typeof data === "number" ? data : undefined;
           }
         });
       };
@@ -3541,6 +3663,8 @@ export default function GradebookTable() {
         // A group lands before whichever group owns the column after the gap, or last.
         const draggedGroupId = Number(activeIdStr.slice(GROUP_DRAG_PREFIX.length));
         const anchorGroupId = leafGroupIds[gapIndex];
+        // Dropped on its own leading edge: it lands where it already is.
+        if (anchorGroupId === draggedGroupId) return;
         const without = movableGroupOrder.filter((id) => id !== draggedGroupId);
         const at = anchorGroupId === undefined ? -1 : without.indexOf(anchorGroupId);
         const next =
@@ -3556,6 +3680,8 @@ export default function GradebookTable() {
       const targetGroupId =
         side === "L" || gapIndex === visibleReorderUnits.length ? leafGroupIds[gapIndex - 1] : leafGroupIds[gapIndex];
       if (targetGroupId === undefined) return;
+      // A column dropped on its own leading gap names itself as beforeColumnId; planColumnDrop reads
+      // that as a no-op.
       await dropColumn(Number(activeIdStr.slice(6)), {
         groupId: targetGroupId,
         beforeColumnId:
@@ -3564,6 +3690,7 @@ export default function GradebookTable() {
     },
     [
       isInstructor,
+      isReorderingColumns,
       visibleReorderUnits,
       fullGradeColumnIdsOrdered,
       supabaseForGradebook,
@@ -3990,7 +4117,7 @@ export default function GradebookTable() {
     );
   }
 
-  return (
+  const body = (
     <VStack align="stretch" w="100%" gap={0} position="relative">
       {/* Gradebook data loading overlay */}
       {!isGradebookDataReady && (
@@ -4122,7 +4249,7 @@ export default function GradebookTable() {
                                   onClick={autoLayout}
                                   colorPalette="blue"
                                   aria-label="Auto-layout columns"
-                                  disabled={isAutoLayouting}
+                                  disabled={isAutoLayouting || isReorderingColumns}
                                   _disabled={{ opacity: 0.5, cursor: "not-allowed" }}
                                 >
                                   {isAutoLayouting ? <Spinner size="xs" /> : <Icon as={LuLayoutGrid} boxSize={3} />}
@@ -4184,10 +4311,11 @@ export default function GradebookTable() {
                             isCollapsed={seg.isCollapsed}
                             isInstructor={isInstructor}
                             actions={columnGroupActions}
-                            canMoveLeft={order > 0}
-                            canMoveRight={order !== -1 && order < movableGroupOrder.length - 1}
+                            canMoveLeft={!isReorderingColumns && order > 0}
+                            canMoveRight={!isReorderingColumns && order !== -1 && order < movableGroupOrder.length - 1}
                             isDragging={activeDragColumnId === `${GROUP_DRAG_PREFIX}${group.id}`}
                             dragDisabled={isReorderingColumns}
+                            isLayoutSaving={isReorderingColumns}
                             anyDragging={Boolean(activeDragColumnId)}
                           />
                         );
@@ -4325,7 +4453,9 @@ export default function GradebookTable() {
                                   coreRowModel={coreRowModel}
                                   classSections={classSections?.data}
                                   labSections={labSections}
-                                  showDragHandle
+                                  showDragHandle={
+                                    !(header.column.columnDef.meta as CollapsedGroupMeta | undefined)?.isOrphan
+                                  }
                                   groupStyle={leafGroupStyle.get(header.column.id)}
                                   onToggleGroup={toggleGroup}
                                   onAddColumnToGroup={(groupId) => setAddColumnDialog({ groupId })}
@@ -4518,4 +4648,5 @@ export default function GradebookTable() {
       )}
     </VStack>
   );
+  return <GradebookLayoutSaveContext.Provider value={layoutSaveState}>{body}</GradebookLayoutSaveContext.Provider>;
 }

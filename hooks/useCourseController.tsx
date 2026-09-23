@@ -1739,6 +1739,8 @@ export class CourseController {
     this._assignmentDueDateExceptions?.close();
     this._assignments?.close();
     this._assignmentGroupsWithMembers?.close();
+    this._gradebookColumns?.close();
+    this._gradebookColumnGroups?.close();
     this._classSections?.close();
     this._calendarEvents?.close();
     this._calendarEvents = undefined;

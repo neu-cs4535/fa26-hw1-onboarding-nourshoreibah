@@ -3198,7 +3198,12 @@ export default class TableController<
     }
   }
 
-  private _updateRow(id: IDType, newRow: ResultOne & { id: IDType }, is_pending: boolean = false) {
+  private _updateRow(
+    id: IDType,
+    newRow: ResultOne & { id: IDType },
+    is_pending: boolean = false,
+    options?: { skipListNotify?: boolean }
+  ) {
     const oldRow = this._rowsById.get(id);
     if (oldRow === undefined) {
       throw new Error("Row not found");
@@ -3225,6 +3230,9 @@ export default class TableController<
     // both `oldRow` and the freshly merged row so the helper can detect
     // field-value movement (row leaving one bucket and entering another).
     this._notifyIndexedListeners(id, "update", oldRow, this._rows[index]);
+
+    // Batch callers (applyLocalPatches) publish the list once themselves after every row is in.
+    if (options?.skipListNotify) return;
 
     // Create new array reference to ensure React detects the change
     const newRowsArray = [...this._rows];
@@ -3357,7 +3365,12 @@ export default class TableController<
   /**
    * Applies local edits to rows already loaded, marked pending, without writing anything. For
    * callers that save through an RPC rather than `update()` and want the screen to move first.
-   * Returns a function that puts the rows back as they were; call it if the save fails.
+   * Rows whose patched fields already hold the patched values are left alone (not marked
+   * pending). List listeners hear about the whole batch once.
+   *
+   * Returns a function that undoes the patch; call it if the save fails. It restores only the
+   * patched fields, and only where the row still holds the patched value, so an edit that
+   * arrived in between (say over realtime) is kept.
    */
   applyLocalPatches(patches: { id: IDType; values: Partial<ResultOne> }[]): () => void {
     if (this._closed) {
@@ -3365,19 +3378,47 @@ export default class TableController<
         `TableController for table '${this._table}' is closed. Cannot apply local patches. This indicates a stale reference is being used.`
       );
     }
-    const originals: (ResultOne & { id: IDType })[] = [];
+    const applied: { id: IDType; before: Record<string, unknown>; after: Record<string, unknown> }[] = [];
     for (const { id, values } of patches) {
-      const oldRow = this._rowsById.get(id);
+      const oldRow = this._rowsById.get(id) as unknown as Record<string, unknown> | undefined;
       if (!oldRow) continue;
-      originals.push(oldRow as ResultOne & { id: IDType });
-      this._updateRow(id, { ...oldRow, ...values, id } as ResultOne & { id: IDType }, true);
+      const before: Record<string, unknown> = {};
+      const after: Record<string, unknown> = {};
+      for (const [field, value] of Object.entries(values as Record<string, unknown>)) {
+        if (field === "id" || oldRow[field] === value) continue;
+        before[field] = oldRow[field];
+        after[field] = value;
+      }
+      if (Object.keys(after).length === 0) continue;
+      applied.push({ id, before, after });
+      this._updateRow(id, { ...oldRow, ...after, id } as unknown as ResultOne & { id: IDType }, true, {
+        skipListNotify: true
+      });
     }
+    if (applied.length > 0) this._notifyListListeners();
     return () => {
       if (this._closed) return;
-      for (const original of originals) {
-        if (this._rowsById.has(original.id)) this._updateRow(original.id, original, false);
+      let restored = false;
+      for (const { id, before, after } of applied) {
+        const current = this._rowsById.get(id) as unknown as Record<string, unknown> | undefined;
+        if (!current) continue;
+        const revert: Record<string, unknown> = {};
+        for (const field of Object.keys(after)) {
+          if (current[field] === after[field]) revert[field] = before[field];
+        }
+        this._updateRow(id, { ...current, ...revert, id } as unknown as ResultOne & { id: IDType }, false, {
+          skipListNotify: true
+        });
+        restored = true;
       }
+      if (restored) this._notifyListListeners();
     };
+  }
+
+  /** Publish the current rows to list listeners as one change. */
+  private _notifyListListeners() {
+    const newRowsArray = [...this._rows];
+    this._listDataListeners.forEach((listener) => listener(newRowsArray, { entered: [], left: [] }));
   }
 
   async update(id: IDType, row: Partial<ResultOne>): Promise<ResultOne> {

@@ -1,4 +1,4 @@
-import { buildGroupedColumns, sortColumnsForDisplay } from "@/lib/gradebookColumnGroups";
+import { buildGroupedColumns, groupKey, ORPHAN_GROUP_KEY, sortColumnsForDisplay } from "@/lib/gradebookColumnGroups";
 import Markdown from "@/components/ui/markdown";
 import { Tooltip } from "@/components/ui/tooltip";
 import { useClassProfiles } from "@/hooks/useClassProfiles";
@@ -475,7 +475,7 @@ function GroupHeader({
               {groupName}
             </Text>
             <Text as="span" fontSize="xs" color="fg.subtle">
-              {columnCount}
+              ({columnCount})
             </Text>
           </HStack>
         </HStack>
@@ -486,6 +486,7 @@ function GroupHeader({
 
 export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_id: string; whatIfEnabled: boolean }) {
   const columns = useGradebookColumns();
+  const gradebookController = useGradebookController();
 
   // State for collapsible groups - use base group name as key for stability
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
@@ -496,16 +497,26 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
 
   const groupedColumns = useMemo(() => buildGroupedColumns(sortedColumns, columnGroups), [sortedColumns, columnGroups]);
 
-  // Groups start expanded. Forget collapse state for groups that no longer have two or more columns.
+  // Groups start expanded. Forget collapse state only for groups that are gone once the groups have
+  // loaded; a group that briefly has fewer than two columns, or a reload, keeps it.
+  const groupsReady = gradebookController.gradebook_column_groups.ready;
   useEffect(() => {
-    const collapsibleKeys = new Set(
-      Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1)
-    );
+    if (!groupsReady) return;
+    const existingKeys = new Set(columnGroups.map((g) => groupKey(g)));
     setCollapsedGroups((prev) => {
-      const kept = [...prev].filter((key) => collapsibleKeys.has(key));
+      const kept = [...prev].filter((key) => existingKeys.has(key));
       return kept.length === prev.size ? prev : new Set(kept);
     });
-  }, [groupedColumns]);
+  }, [columnGroups, groupsReady]);
+
+  // Headed groups with two or more columns; the orphan bucket has no header to collapse.
+  const collapsibleKeys = useMemo(
+    () =>
+      Object.keys(groupedColumns).filter(
+        (key) => !groupedColumns[key].isFallback && groupedColumns[key].columns.length > 1
+      ),
+    [groupedColumns]
+  );
 
   const toggleGroup = useCallback((key: string) => {
     setCollapsedGroups((prev) => {
@@ -526,36 +537,37 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
 
   // Collapse all groups
   const collapseAll = useCallback(() => {
-    setCollapsedGroups(new Set(Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1)));
-  }, [groupedColumns]);
+    setCollapsedGroups((prev) => new Set([...prev, ...collapsibleKeys]));
+  }, [collapsibleKeys]);
 
   // Build the rendered items
   const renderedItems = useMemo(() => {
     const items: JSX.Element[] = [];
 
-    Object.entries(groupedColumns).forEach(([groupKey, group]) => {
-      if (group.columns.length === 1) {
-        // Single column - no need for group header
-        const column = group.columns[0];
-        items.push(
-          <GradebookCard
-            key={column.id}
-            column={column}
-            private_profile_id={private_profile_id}
-            whatIfEnabled={whatIfEnabled}
-          />
-        );
+    Object.entries(groupedColumns).forEach(([key, group]) => {
+      if (key === ORPHAN_GROUP_KEY || group.isFallback || group.columns.length === 1) {
+        // A single column, or columns whose group has not loaded: no group header
+        group.columns.forEach((column) => {
+          items.push(
+            <GradebookCard
+              key={column.id}
+              column={column}
+              private_profile_id={private_profile_id}
+              whatIfEnabled={whatIfEnabled}
+            />
+          );
+        });
       } else {
-        const isCollapsed = collapsedGroups.has(groupKey);
+        const isCollapsed = collapsedGroups.has(key);
 
         // Add group header
         items.push(
           <GroupHeader
-            key={`header-${groupKey}`}
+            key={`header-${key}`}
             groupName={group.groupName}
             columnCount={group.columns.length}
             isCollapsed={isCollapsed}
-            onToggle={() => toggleGroup(groupKey)}
+            onToggle={() => toggleGroup(key)}
           />
         );
 
@@ -586,7 +598,7 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
         </Text>
       )}
       {/* Expand/Collapse All Buttons */}
-      {Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1).length > 0 && (
+      {collapsibleKeys.length > 0 && (
         <HStack gap={2} justifyContent="flex-end" w="100%" px={2} py={2}>
           <Button variant="ghost" size="sm" onClick={expandAll} colorPalette="blue">
             <Icon as={LuChevronDown} mr={2} /> Expand All

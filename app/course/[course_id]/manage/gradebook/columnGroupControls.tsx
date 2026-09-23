@@ -70,15 +70,14 @@ function ColumnGroupOptionsMenu({
   actions,
   canMoveLeft,
   canMoveRight,
-  isCollapsed,
-  canCollapse
+  isLayoutSaving = false
 }: {
   group: GradebookColumnGroup;
   actions: ColumnGroupActions;
   canMoveLeft: boolean;
   canMoveRight: boolean;
-  isCollapsed: boolean;
-  canCollapse: boolean;
+  /** A layout save is in flight; moving the group now would race it. */
+  isLayoutSaving?: boolean;
 }) {
   return (
     <MenuRoot>
@@ -102,18 +101,16 @@ function ColumnGroupOptionsMenu({
           <Icon as={LuPlus} boxSize={3} mr={2} />
           Add column to group
         </MenuItem>
-        {(canCollapse || isCollapsed) && (
-          <MenuItem value="toggle-collapse" onClick={() => actions.onToggleCollapse(group)}>
-            <Icon as={isCollapsed ? LuChevronsLeftRight : LuChevronsRightLeft} boxSize={3} mr={2} />
-            {isCollapsed ? "Expand group" : "Collapse group"}
-          </MenuItem>
-        )}
         <MenuSeparator />
-        <MenuItem value="move-left" disabled={!canMoveLeft} onClick={() => actions.onMove(group, -1)}>
+        <MenuItem value="move-left" disabled={!canMoveLeft || isLayoutSaving} onClick={() => actions.onMove(group, -1)}>
           <Icon as={LuArrowLeft} boxSize={3} mr={2} />
           Move group left
         </MenuItem>
-        <MenuItem value="move-right" disabled={!canMoveRight} onClick={() => actions.onMove(group, 1)}>
+        <MenuItem
+          value="move-right"
+          disabled={!canMoveRight || isLayoutSaving}
+          onClick={() => actions.onMove(group, 1)}
+        >
           <Icon as={LuArrowRight} boxSize={3} mr={2} />
           Move group right
         </MenuItem>
@@ -127,7 +124,10 @@ function ColumnGroupOptionsMenu({
   );
 }
 
-/** The band over a group's columns: name, column count, collapse toggle, drag handle and options. */
+/**
+ * The band over a group's columns: name, column count, collapse toggle, drag handle and options.
+ * Anyone can collapse a group; only instructors get the drag handle and the options menu.
+ */
 export function ColumnGroupHeader({
   group,
   palette,
@@ -141,7 +141,8 @@ export function ColumnGroupHeader({
   canMoveRight,
   isDragging,
   dragDisabled,
-  anyDragging
+  anyDragging,
+  isLayoutSaving = false
 }: {
   group: GradebookColumnGroup;
   palette: string;
@@ -156,6 +157,8 @@ export function ColumnGroupHeader({
   isDragging: boolean;
   dragDisabled: boolean;
   anyDragging: boolean;
+  /** A layout save is in flight: Move group left/right are disabled until it settles. */
+  isLayoutSaving?: boolean;
 }) {
   const movable = isInstructor && !group.is_default;
   const { attributes, listeners, setNodeRef } = useDraggable({
@@ -165,6 +168,9 @@ export function ColumnGroupHeader({
   const narrow = width < 170;
   // A collapsed group's strip is too thin for a name; the strip below shows it running down.
   const compact = width < 60;
+  const countLabel = columnCount === 0 ? "empty" : String(columnCount);
+  // A collapsed strip is too narrow for the chevron; the strip under it expands the group instead.
+  const showCollapseToggle = (columnCount > 1 || isCollapsed) && !(compact && isCollapsed);
 
   return (
     <Box
@@ -191,7 +197,7 @@ export function ColumnGroupHeader({
       opacity={isDragging ? 0.4 : 1}
       pointerEvents={anyDragging ? "none" : "auto"}
       role="group"
-      aria-label={`Column group ${group.name}`}
+      aria-label={`Column group ${group.name} (${countLabel})`}
       data-group-id={group.id}
     >
       {movable && (
@@ -207,6 +213,20 @@ export function ColumnGroupHeader({
           <Icon as={LuGripVertical} boxSize={3} color="fg.muted" />
         </Box>
       )}
+      {showCollapseToggle && (
+        <WrappedTooltip content={isCollapsed ? "Expand group" : "Collapse group"}>
+          <IconButton
+            size="2xs"
+            variant="ghost"
+            aria-label={`${isCollapsed ? "Expand" : "Collapse"} group ${group.name}`}
+            aria-expanded={!isCollapsed}
+            flexShrink={0}
+            onClick={() => actions.onToggleCollapse(group)}
+          >
+            <Icon as={isCollapsed ? LuChevronsLeftRight : LuChevronsRightLeft} />
+          </IconButton>
+        </WrappedTooltip>
+      )}
       {!compact && (
         <WrappedTooltip content={`${group.name} · ${group.slug}`}>
           <Text fontWeight="semibold" fontSize="sm" color={group.is_default ? "fg.muted" : "fg"} truncate minW={0}>
@@ -216,7 +236,7 @@ export function ColumnGroupHeader({
       )}
       {!narrow && (
         <Text fontSize="xs" color="fg.subtle" flexShrink={0}>
-          {columnCount === 0 ? "empty" : columnCount}
+          ({countLabel})
         </Text>
       )}
       <Box flex="1" />
@@ -227,21 +247,12 @@ export function ColumnGroupHeader({
             actions={actions}
             canMoveLeft={canMoveLeft}
             canMoveRight={canMoveRight}
-            isCollapsed={isCollapsed}
-            canCollapse={columnCount > 1}
+            isLayoutSaving={isLayoutSaving}
           />
         </Box>
       )}
     </Box>
   );
-}
-
-async function refreshLayout(gradebookController: ReturnType<typeof useGradebookController>) {
-  await Promise.all([
-    gradebookController.gradebook_column_groups.refetchAll(),
-    gradebookController.gradebook_columns.refetchAll(),
-    gradebookController.gradebook_row.refetchAll()
-  ]);
 }
 
 function errorMessage(e: unknown): string {
@@ -305,6 +316,7 @@ export function ColumnGroupDialog({
     setBusy(true);
     try {
       if (mode === "create") {
+        // The server assigns sort_order on insert; the type still wants one, so send our best guess.
         const nextSortOrder =
           groups.filter((g) => !g.is_default).reduce((max, g) => Math.max(max, g.sort_order), -1) + 1;
         const { data: created, error } = await supabase
@@ -320,14 +332,35 @@ export function ColumnGroupDialog({
           .select("id")
           .single();
         if (error) throw error;
-        for (const column of orderedColumns.filter((c) => selected.has(c.id))) {
-          const { error: moveError } = await supabase.rpc("gradebook_column_assign_group", {
+        // From here the group exists, so the dialog closes whatever happens: leaving it open
+        // invites a second Create and a duplicate group.
+        const toMove = orderedColumns.filter((c) => selected.has(c.id));
+        let moved = 0;
+        let moveError: unknown = null;
+        for (const column of toMove) {
+          const { error: assignError } = await supabase.rpc("gradebook_column_assign_group", {
             p_column_id: column.id,
             p_group_id: created.id
           });
-          if (moveError) throw moveError;
+          if (assignError) {
+            moveError = assignError;
+            break;
+          }
+          moved++;
         }
-      } else if (group) {
+        void gradebookController.reconcileLayout();
+        if (moveError) {
+          toaster.error({
+            title: `Group ${trimmed} created, but only ${moved} of ${toMove.length} columns moved into it`,
+            description: errorMessage(moveError)
+          });
+        } else {
+          toaster.create({ title: "Group created", type: "success" });
+        }
+        onClose();
+        return;
+      }
+      if (group) {
         const values: { name?: string; slug?: string } = {};
         if (trimmed !== group.name) values.name = trimmed;
         if (slug !== group.slug) values.slug = slug;
@@ -335,13 +368,11 @@ export function ColumnGroupDialog({
           const { error } = await supabase.from("gradebook_column_groups").update(values).eq("id", group.id);
           if (error) throw error;
         }
+        void gradebookController.reconcileLayout();
+        toaster.create({ title: "Group saved", type: "success" });
+        onClose();
       }
-      await refreshLayout(gradebookController);
-      toaster.create({ title: mode === "create" ? "Group created" : "Group saved", type: "success" });
-      onClose();
     } catch (e) {
-      // Failures after the group row exists (a refused move) still leave a usable group behind.
-      await refreshLayout(gradebookController);
       toaster.error({
         title: mode === "create" ? "Could not create the group" : "Could not save the group",
         description: errorMessage(e)
@@ -486,14 +517,16 @@ export function DeleteColumnGroupDialog({ group, onClose }: { group: GradebookCo
     try {
       const { error } = await supabase.rpc("gradebook_column_group_delete", { p_group_id: group.id });
       if (error) throw error;
-      await refreshLayout(gradebookController);
-      toaster.create({ title: "Group deleted", type: "success" });
-      onClose();
     } catch (e) {
       toaster.error({ title: "Could not delete the group", description: errorMessage(e) });
-    } finally {
       setBusy(false);
+      return;
     }
+    // Deleted: close and report success; reloading the layout is best-effort and never fails here.
+    void gradebookController.reconcileLayout();
+    toaster.create({ title: "Group deleted", type: "success" });
+    setBusy(false);
+    onClose();
   }, [supabase, group.id, gradebookController, onClose]);
 
   return (
