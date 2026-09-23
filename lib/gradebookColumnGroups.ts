@@ -71,9 +71,14 @@ export function visibleGroupsInOrder<T extends GroupableColumn>(
 
 export function formatGroupWeight(weight: number | null): string | null {
   if (weight === null || Number.isNaN(weight)) return null;
-  const pct = weight * 100;
-  const rounded = Math.round(pct * 10) / 10;
-  return `${rounded}%`;
+  return `${formatWeightPercent(weight, 1)}%`;
+}
+
+/** A weight fraction as a plain percentage number, without float noise: 0.07 becomes "7", not "7.000000000000001". */
+export function formatWeightPercent(weight: number, decimals = 4): string {
+  const factor = 10 ** decimals;
+  const rounded = Math.round(weight * 100 * factor) / factor;
+  return String(Object.is(rounded, -0) ? 0 : rounded);
 }
 
 export async function resolveGroupForSlug(
@@ -103,10 +108,12 @@ export type ColumnDragPlan =
 export function planColumnDrag(args: {
   orderedColumnIds: readonly number[];
   groupIdByColumnId: ReadonlyMap<number, number>;
+  /** Every non-default group of the gradebook in its current order, including groups with no columns. */
   currentGroupOrder: readonly number[];
+  defaultGroupId: number | null;
   draggedColumnId: number;
 }): ColumnDragPlan {
-  const { orderedColumnIds, groupIdByColumnId, currentGroupOrder, draggedColumnId } = args;
+  const { orderedColumnIds, groupIdByColumnId, currentGroupOrder, defaultGroupId, draggedColumnId } = args;
 
   const groupSequence = orderedColumnIds
     .map((id) => groupIdByColumnId.get(id))
@@ -134,18 +141,23 @@ export function planColumnDrag(args: {
     return { kind: "move-column", columnId: draggedColumnId, groupId: neighbour, position };
   }
 
-  const groupOrderChanged =
-    impliedGroupOrder.length !== currentGroupOrder.length ||
-    impliedGroupOrder.some((g, i) => g !== currentGroupOrder[i]);
+  // The default group is pinned last, so only the order of the other groups that have columns can change.
+  const known = new Set(currentGroupOrder);
+  const impliedMovable = impliedGroupOrder.filter((g) => g !== defaultGroupId && known.has(g));
+  const shown = new Set(impliedMovable);
+  const slots = currentGroupOrder.flatMap((g, i) => (shown.has(g) ? [i] : []));
+  const groupOrderChanged = impliedMovable.some((g, k) => g !== currentGroupOrder[slots[k]]);
   if (groupOrderChanged) {
-    return { kind: "reorder-groups", orderedGroupIds: impliedGroupOrder };
+    const orderedGroupIds = [...currentGroupOrder];
+    slots.forEach((slot, k) => {
+      orderedGroupIds[slot] = impliedMovable[k];
+    });
+    return { kind: "reorder-groups", orderedGroupIds };
   }
 
   const groupId = groupIdByColumnId.get(draggedColumnId);
   if (groupId === undefined) return { kind: "noop" };
-  return {
-    kind: "reorder-in-group",
-    groupId,
-    orderedColumnIds: orderedColumnIds.filter((id) => groupIdByColumnId.get(id) === groupId)
-  };
+  const inGroup = orderedColumnIds.filter((id) => groupIdByColumnId.get(id) === groupId);
+  if (inGroup.length < 2) return { kind: "noop" };
+  return { kind: "reorder-in-group", groupId, orderedColumnIds: inGroup };
 }

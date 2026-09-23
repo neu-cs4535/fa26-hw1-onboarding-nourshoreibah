@@ -42,13 +42,17 @@ CREATE TABLE IF NOT EXISTS public.gradebook_column_groups (
   CONSTRAINT gradebook_column_groups_order_key
     UNIQUE (gradebook_id, sort_order) DEFERRABLE INITIALLY DEFERRED,
   CONSTRAINT gradebook_column_groups_weight_chk
-    CHECK (weight IS NULL OR weight >= 0)
+    CHECK (weight IS NULL OR weight >= 0),
+  -- The default group is pinned last. Pinning it at a sentinel rather than at count(groups)
+  -- keeps MAX(sort_order) + 1 over the other groups from ever landing on it.
+  CONSTRAINT gradebook_column_groups_default_last_chk
+    CHECK (is_default = (sort_order = 2147483647))
 );
 
 COMMENT ON TABLE public.gradebook_column_groups IS
   'A gradebook column group. Replaces the slug-prefix heuristic that used to compute groups in the browser on every render.';
 COMMENT ON COLUMN public.gradebook_column_groups.sort_order IS
-  'Position among this gradebook''s groups. Columns are ordered within a group by gradebook_columns.position_in_group.';
+  'Position among this gradebook''s groups. Columns are ordered within a group by gradebook_columns.position_in_group. The default group is always 2147483647.';
 COMMENT ON COLUMN public.gradebook_column_groups.auto_assign_slug_base IS
   'Legacy slug base that routes new columns here. NULL means the group does not auto-receive columns.';
 COMMENT ON COLUMN public.gradebook_column_groups.weight IS
@@ -67,12 +71,6 @@ ALTER TABLE public.gradebook_column_groups ENABLE ROW LEVEL SECURITY;
 GRANT SELECT ON TABLE public.gradebook_column_groups TO authenticated;
 GRANT ALL    ON TABLE public.gradebook_column_groups TO service_role;
 
-DROP POLICY IF EXISTS "everyone in class can view column groups" ON public.gradebook_column_groups;
-CREATE POLICY "everyone in class can view column groups"
-  ON public.gradebook_column_groups
-  AS PERMISSIVE FOR SELECT TO authenticated
-  USING (public.authorizeforclass(class_id));
-
 DROP POLICY IF EXISTS "instructors manage column groups" ON public.gradebook_column_groups;
 CREATE POLICY "instructors manage column groups"
   ON public.gradebook_column_groups
@@ -85,68 +83,109 @@ CREATE TRIGGER set_updated_at_on_gradebook_column_groups
   BEFORE UPDATE ON public.gradebook_column_groups
   FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
 
+-- Statement-level: a renumber touches every group in a gradebook, and a row-level trigger
+-- would repeat the per-student loop once per group.
+CREATE OR REPLACE FUNCTION public._broadcast_gradebook_column_group_rows(
+  p_operation text, p_rows jsonb, p_students_only boolean DEFAULT false)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  r jsonb;
+  v_class_id bigint;
+  v_students_class_id bigint;
+  v_students uuid[];
+  v_profile_id uuid;
+  v_payload jsonb;
+  v_student_data jsonb;
+BEGIN
+  FOR r IN SELECT value FROM jsonb_array_elements(COALESCE(p_rows, '[]'::jsonb))
+  LOOP
+    v_class_id := (r->>'class_id')::bigint;
+    CONTINUE WHEN v_class_id IS NULL;
+
+    v_payload := jsonb_build_object(
+      'type', 'table_change',
+      'operation', p_operation,
+      'table', 'gradebook_column_groups',
+      'row_id', (r->>'id')::bigint,
+      'data', r,
+      'class_id', v_class_id,
+      'target_audience', 'staff',
+      'timestamp', NOW()
+    );
+
+    IF NOT p_students_only THEN
+      PERFORM public.safe_broadcast(v_payload, 'broadcast', 'class:' || v_class_id || ':staff', true);
+    END IF;
+
+    -- Students get a group only once it holds a column they can see, matching the SELECT policy.
+    IF p_operation = 'DELETE' THEN
+      v_student_data := jsonb_build_object('id', r->'id', 'class_id', r->'class_id', 'gradebook_id', r->'gradebook_id');
+    ELSIF EXISTS (
+      SELECT 1 FROM public.gradebook_columns c
+       WHERE c.gradebook_column_group_id = (r->>'id')::bigint
+         AND (NOT COALESCE(c.instructor_only, false) OR c.released)
+    ) THEN
+      v_student_data := r;
+    ELSE
+      CONTINUE;
+    END IF;
+
+    IF v_students_class_id IS DISTINCT FROM v_class_id THEN
+      SELECT ARRAY(
+        SELECT ur.private_profile_id FROM public.user_roles ur
+         WHERE ur.class_id = v_class_id AND ur.role = 'student'
+      ) INTO v_students;
+      v_students_class_id := v_class_id;
+    END IF;
+
+    v_payload := v_payload || jsonb_build_object('target_audience', 'user', 'data', v_student_data);
+    FOREACH v_profile_id IN ARRAY v_students
+    LOOP
+      PERFORM public.safe_broadcast(
+        v_payload, 'broadcast', 'class:' || v_class_id || ':user:' || v_profile_id, true);
+    END LOOP;
+  END LOOP;
+END $$;
+
+REVOKE ALL ON FUNCTION public._broadcast_gradebook_column_group_rows(text, jsonb, boolean) FROM PUBLIC, anon, authenticated;
+
 CREATE OR REPLACE FUNCTION public.broadcast_gradebook_column_groups_change()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
-DECLARE
-    target_class_id BIGINT;
-    staff_payload JSONB;
-    user_payload JSONB;
-    affected_profile_ids UUID[];
-    profile_id UUID;
 BEGIN
-    IF TG_OP = 'INSERT' THEN
-        target_class_id := NEW.class_id;
-    ELSIF TG_OP = 'UPDATE' THEN
-        target_class_id := COALESCE(NEW.class_id, OLD.class_id);
-    ELSE
-        target_class_id := OLD.class_id;
-    END IF;
-
-    IF target_class_id IS NULL THEN
-        IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
-    END IF;
-
-    staff_payload := jsonb_build_object(
-        'type', 'table_change',
-        'operation', TG_OP,
-        'table', TG_TABLE_NAME,
-        'row_id', CASE WHEN TG_OP = 'DELETE' THEN OLD.id ELSE NEW.id END,
-        'data',   CASE WHEN TG_OP = 'DELETE' THEN to_jsonb(OLD) ELSE to_jsonb(NEW) END,
-        'class_id', target_class_id,
-        'target_audience', 'staff',
-        'timestamp', NOW()
-    );
-
-    PERFORM public.safe_broadcast(
-        staff_payload, 'broadcast', 'class:' || target_class_id || ':staff', true);
-
-    SELECT ARRAY(
-        SELECT ur.private_profile_id
-          FROM public.user_roles ur
-         WHERE ur.class_id = target_class_id AND ur.role = 'student'
-    ) INTO affected_profile_ids;
-
-    user_payload := staff_payload || jsonb_build_object('target_audience', 'user');
-
-    FOREACH profile_id IN ARRAY affected_profile_ids
-    LOOP
-        PERFORM public.safe_broadcast(
-            user_payload, 'broadcast',
-            'class:' || target_class_id || ':user:' || profile_id, true);
-    END LOOP;
-
-    IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
-END;
-$$;
+  IF TG_OP = 'DELETE' THEN
+    PERFORM public._broadcast_gradebook_column_group_rows(
+      TG_OP, (SELECT jsonb_agg(to_jsonb(o) ORDER BY o.class_id) FROM old_table o));
+  ELSE
+    PERFORM public._broadcast_gradebook_column_group_rows(
+      TG_OP, (SELECT jsonb_agg(to_jsonb(n) ORDER BY n.class_id) FROM new_table n));
+  END IF;
+  RETURN NULL;
+END $$;
 
 DROP TRIGGER IF EXISTS broadcast_gradebook_column_groups_unified ON public.gradebook_column_groups;
-CREATE TRIGGER broadcast_gradebook_column_groups_unified
-  AFTER INSERT OR UPDATE OR DELETE ON public.gradebook_column_groups
-  FOR EACH ROW EXECUTE FUNCTION public.broadcast_gradebook_column_groups_change();
+DROP TRIGGER IF EXISTS broadcast_gradebook_column_groups_insert ON public.gradebook_column_groups;
+CREATE TRIGGER broadcast_gradebook_column_groups_insert
+  AFTER INSERT ON public.gradebook_column_groups
+  REFERENCING NEW TABLE AS new_table
+  FOR EACH STATEMENT EXECUTE FUNCTION public.broadcast_gradebook_column_groups_change();
+DROP TRIGGER IF EXISTS broadcast_gradebook_column_groups_update ON public.gradebook_column_groups;
+CREATE TRIGGER broadcast_gradebook_column_groups_update
+  AFTER UPDATE ON public.gradebook_column_groups
+  REFERENCING NEW TABLE AS new_table
+  FOR EACH STATEMENT EXECUTE FUNCTION public.broadcast_gradebook_column_groups_change();
+DROP TRIGGER IF EXISTS broadcast_gradebook_column_groups_delete ON public.gradebook_column_groups;
+CREATE TRIGGER broadcast_gradebook_column_groups_delete
+  AFTER DELETE ON public.gradebook_column_groups
+  REFERENCING OLD TABLE AS old_table
+  FOR EACH STATEMENT EXECUTE FUNCTION public.broadcast_gradebook_column_groups_change();
 
 CREATE TRIGGER audit_gradebook_column_groups_insert
   AFTER INSERT ON public.gradebook_column_groups
@@ -210,6 +249,24 @@ ALTER TABLE public.gradebook_columns
   ADD COLUMN IF NOT EXISTS position_in_group integer,
   ADD COLUMN IF NOT EXISTS weight numeric;
 
+DROP POLICY IF EXISTS "everyone in class can view column groups" ON public.gradebook_column_groups;
+CREATE POLICY "everyone in class can view column groups"
+  ON public.gradebook_column_groups
+  AS PERMISSIVE FOR SELECT TO authenticated
+  USING (
+    public.authorizeforclassgrader(class_id)
+    OR (
+      public.authorizeforclass(class_id)
+      -- A group's name and weight can be derived from a single column, so students see a
+      -- group only once it holds a column they could read under gradebook_columns RLS.
+      AND EXISTS (
+        SELECT 1 FROM public.gradebook_columns c
+         WHERE c.gradebook_column_group_id = gradebook_column_groups.id
+           AND (NOT COALESCE(c.instructor_only, false) OR c.released)
+      )
+    )
+  );
+
 COMMENT ON COLUMN public.gradebook_columns.position_in_group IS
   'Position within gradebook_column_group_id. Replaces the former global sort_order; display order is (group.sort_order, position_in_group, id).';
 COMMENT ON COLUMN public.gradebook_columns.weight IS
@@ -252,12 +309,17 @@ SELECT m.*,
 COMMENT ON VIEW public.gradebook_column_legacy_groups IS
   'Scaffolding for the 20260920120000 backfill. Dropped at the end of that migration.';
 
+-- The backfill renumbers nearly every column and group. Both broadcasts fan out per student,
+-- so they stay off until the last renumber below.
+ALTER TABLE public.gradebook_columns DISABLE TRIGGER broadcast_gradebook_columns_unified;
+ALTER TABLE public.gradebook_column_groups DISABLE TRIGGER broadcast_gradebook_column_groups_insert;
+ALTER TABLE public.gradebook_column_groups DISABLE TRIGGER broadcast_gradebook_column_groups_update;
+ALTER TABLE public.gradebook_column_groups DISABLE TRIGGER broadcast_gradebook_column_groups_delete;
+
 INSERT INTO public.gradebook_column_groups (class_id, gradebook_id, name, slug, sort_order, is_default)
 SELECT g.class_id, g.id, 'Ungrouped', 'ungrouped', 2147483647, true
   FROM public.gradebooks g
 ON CONFLICT (gradebook_id, slug) DO NOTHING;
-
-ALTER TABLE public.gradebook_columns DISABLE TRIGGER broadcast_gradebook_columns_unified;
 
 WITH ins AS (
   INSERT INTO public.gradebook_column_groups
@@ -290,8 +352,6 @@ UPDATE public.gradebook_columns gc
      WHERE gradebook_column_group_id IS NOT NULL
   ) sub
  WHERE gc.id = sub.id;
-
-ALTER TABLE public.gradebook_columns ENABLE TRIGGER broadcast_gradebook_columns_unified;
 
 DO $$
 DECLARE
@@ -581,53 +641,49 @@ UPDATE public.gradebook_columns gc
   FROM _cg_c3_targets t
  WHERE gc.id = t.column_id;
 
+CREATE TEMP TABLE _cg_c4_renames AS
 WITH prefixes AS (
   SELECT g.id AS group_id,
+         g.gradebook_id,
+         g.sort_order,
          g.name AS current_name,
          public._cg_common_name_prefix(array_agg(gc.name)) AS common_name
     FROM public.gradebook_column_groups g
     JOIN public.gradebook_columns gc ON gc.gradebook_column_group_id = g.id
    WHERE NOT g.is_default
      AND g.slug NOT IN ('assignment-lab', 'assignment-individual', 'assignment-group')
-   GROUP BY g.id, g.name
+   GROUP BY g.id, g.gradebook_id, g.sort_order, g.name
+),
+candidates AS (
+  SELECT p.*,
+         lower(regexp_replace(btrim(p.common_name), 's$', '')) AS norm,
+         ROW_NUMBER() OVER (
+           PARTITION BY p.gradebook_id, lower(regexp_replace(btrim(p.common_name), 's$', ''))
+           ORDER BY p.sort_order, p.group_id) AS claim_rank
+    FROM prefixes p
+   WHERE p.common_name IS NOT NULL
+     AND p.common_name IS DISTINCT FROM p.current_name
 )
-INSERT INTO public._cg_correction_ledger (column_id, correction)
-SELECT gc.id, 'C4 header renamed from the column names instead of the slug'
-  FROM prefixes p
-  JOIN public.gradebook_columns gc ON gc.gradebook_column_group_id = p.group_id
- WHERE p.common_name IS NOT NULL
-   AND p.common_name IS DISTINCT FROM p.current_name
+SELECT c.group_id, c.common_name
+  FROM candidates c
+ WHERE c.claim_rank = 1
    AND NOT EXISTS (
      SELECT 1 FROM public.gradebook_column_groups o
-      WHERE o.gradebook_id = (SELECT gradebook_id FROM public.gradebook_column_groups WHERE id = p.group_id)
-        AND o.id <> p.group_id
-        AND lower(regexp_replace(btrim(o.name), 's$', ''))
-            = lower(regexp_replace(btrim(p.common_name), 's$', ''))
-   )
+      WHERE o.gradebook_id = c.gradebook_id
+        AND o.id <> c.group_id
+        AND lower(regexp_replace(btrim(o.name), 's$', '')) = c.norm
+   );
+
+INSERT INTO public._cg_correction_ledger (column_id, correction)
+SELECT gc.id, 'C4 header renamed from the column names instead of the slug'
+  FROM _cg_c4_renames r
+  JOIN public.gradebook_columns gc ON gc.gradebook_column_group_id = r.group_id
 ON CONFLICT (column_id) DO NOTHING;
 
 UPDATE public.gradebook_column_groups g
-   SET name = p.common_name
-  FROM (
-    SELECT g2.id AS group_id,
-           g2.name AS current_name,
-           public._cg_common_name_prefix(array_agg(gc.name)) AS common_name
-      FROM public.gradebook_column_groups g2
-      JOIN public.gradebook_columns gc ON gc.gradebook_column_group_id = g2.id
-     WHERE NOT g2.is_default
-       AND g2.slug NOT IN ('assignment-lab', 'assignment-individual', 'assignment-group')
-     GROUP BY g2.id, g2.name
-  ) p
- WHERE g.id = p.group_id
-   AND p.common_name IS NOT NULL
-   AND p.common_name IS DISTINCT FROM p.current_name
-   AND NOT EXISTS (
-     SELECT 1 FROM public.gradebook_column_groups o
-      WHERE o.gradebook_id = (SELECT gradebook_id FROM public.gradebook_column_groups WHERE id = p.group_id)
-        AND o.id <> p.group_id
-        AND lower(regexp_replace(btrim(o.name), 's$', ''))
-            = lower(regexp_replace(btrim(p.common_name), 's$', ''))
-   );
+   SET name = r.common_name
+  FROM _cg_c4_renames r
+ WHERE g.id = r.group_id;
 
 DELETE FROM public.gradebook_column_groups g
  WHERE NOT g.is_default
@@ -652,16 +708,21 @@ UPDATE public.gradebook_column_groups g
     SELECT gg.id,
            ROW_NUMBER() OVER (
              PARTITION BY gg.gradebook_id
-             ORDER BY gg.is_default,
-                      COALESCE((SELECT min(c.sort_order)
+             ORDER BY COALESCE((SELECT min(c.sort_order)
                                   FROM public.gradebook_columns c
                                  WHERE c.gradebook_column_group_id = gg.id),
                                2147483647),
                       gg.sort_order, gg.id) - 1 AS pos
       FROM public.gradebook_column_groups gg
+     WHERE NOT gg.is_default
   ) sub
  WHERE g.id = sub.id
    AND g.sort_order IS DISTINCT FROM sub.pos;
+
+ALTER TABLE public.gradebook_columns ENABLE TRIGGER broadcast_gradebook_columns_unified;
+ALTER TABLE public.gradebook_column_groups ENABLE TRIGGER broadcast_gradebook_column_groups_insert;
+ALTER TABLE public.gradebook_column_groups ENABLE TRIGGER broadcast_gradebook_column_groups_update;
+ALTER TABLE public.gradebook_column_groups ENABLE TRIGGER broadcast_gradebook_column_groups_delete;
 
 DO $$
 DECLARE
@@ -742,28 +803,54 @@ DROP FUNCTION IF EXISTS public._cg_ensure_group(bigint, bigint, text, text, text
 DROP FUNCTION IF EXISTS public._cg_common_name_prefix(text[]);
 DROP TABLE IF EXISTS public._cg_correction_ledger;
 
--- security_invoker is required: without it the view runs as owner and bypasses RLS.
-
-CREATE OR REPLACE VIEW public.gradebook_columns_ordered
-WITH (security_invoker = 'true') AS
-SELECT c.*,
-       g.sort_order AS group_sort_order,
-       g.name       AS group_name,
-       g.slug       AS group_slug,
-       g.weight     AS group_weight,
-       ROW_NUMBER() OVER (PARTITION BY c.gradebook_id
-                          ORDER BY g.sort_order, c.position_in_group, c.id) - 1 AS display_order
-  FROM public.gradebook_columns c
-  JOIN public.gradebook_column_groups g ON g.id = c.gradebook_column_group_id;
-
-COMMENT ON VIEW public.gradebook_columns_ordered IS
-  'gradebook_columns with its group joined and the two ordering levels flattened into display_order.';
-
-GRANT SELECT ON public.gradebook_columns_ordered TO authenticated;
-GRANT SELECT ON public.gradebook_columns_ordered TO service_role;
-
 DROP INDEX IF EXISTS public.idx_gradebook_columns_id_covering;
 CREATE INDEX IF NOT EXISTS idx_gradebook_columns_group_position
   ON public.gradebook_columns (gradebook_column_group_id, position_in_group) INCLUDE (id);
 CREATE INDEX IF NOT EXISTS idx_gradebook_columns_gradebook_group
   ON public.gradebook_columns (gradebook_id, gradebook_column_group_id);
+
+-- Students are not sent a group until it holds a column they can see, so when a column
+-- becomes visible (inserted, released, un-hidden or moved) its group is sent to them then.
+CREATE OR REPLACE FUNCTION public.broadcast_gradebook_column_groups_on_column_visibility()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_rows jsonb;
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    SELECT jsonb_agg(to_jsonb(g) ORDER BY g.class_id) INTO v_rows
+      FROM public.gradebook_column_groups g
+     WHERE g.id IN (SELECT n.gradebook_column_group_id FROM new_table n
+                     WHERE NOT COALESCE(n.instructor_only, false) OR n.released);
+  ELSE
+    SELECT jsonb_agg(to_jsonb(g) ORDER BY g.class_id) INTO v_rows
+      FROM public.gradebook_column_groups g
+     WHERE g.id IN (
+       SELECT n.gradebook_column_group_id
+         FROM new_table n
+         JOIN old_table o ON o.id = n.id
+        WHERE (NOT COALESCE(n.instructor_only, false) OR n.released)
+          AND (o.gradebook_column_group_id IS DISTINCT FROM n.gradebook_column_group_id
+               OR NOT (NOT COALESCE(o.instructor_only, false) OR o.released)));
+  END IF;
+
+  IF v_rows IS NOT NULL THEN
+    PERFORM public._broadcast_gradebook_column_group_rows('UPDATE', v_rows, true);
+  END IF;
+  RETURN NULL;
+END $$;
+
+DROP TRIGGER IF EXISTS gradebook_columns_broadcast_group_visibility_insert ON public.gradebook_columns;
+CREATE TRIGGER gradebook_columns_broadcast_group_visibility_insert
+  AFTER INSERT ON public.gradebook_columns
+  REFERENCING NEW TABLE AS new_table
+  FOR EACH STATEMENT EXECUTE FUNCTION public.broadcast_gradebook_column_groups_on_column_visibility();
+
+DROP TRIGGER IF EXISTS gradebook_columns_broadcast_group_visibility_update ON public.gradebook_columns;
+CREATE TRIGGER gradebook_columns_broadcast_group_visibility_update
+  AFTER UPDATE ON public.gradebook_columns
+  REFERENCING OLD TABLE AS old_table NEW TABLE AS new_table
+  FOR EACH STATEMENT EXECUTE FUNCTION public.broadcast_gradebook_column_groups_on_column_visibility();

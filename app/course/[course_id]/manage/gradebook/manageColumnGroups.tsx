@@ -2,7 +2,7 @@
 
 import { toaster } from "@/components/ui/toaster";
 import { useGradebookColumnGroups, useGradebookColumns, useGradebookController } from "@/hooks/useGradebook";
-import { formatGroupWeight } from "@/lib/gradebookColumnGroups";
+import { formatGroupWeight, formatWeightPercent } from "@/lib/gradebookColumnGroups";
 import { createClient } from "@/utils/supabase/client";
 import { Box, Button, Dialog, HStack, Icon, IconButton, Input, Portal, Table, Text, VStack } from "@chakra-ui/react";
 import { useCallback, useMemo, useState } from "react";
@@ -31,6 +31,10 @@ export default function ManageColumnGroupsDialog() {
     [groups]
   );
   const reorderable = useMemo(() => ordered.filter((g) => !g.is_default), [ordered]);
+  const nextSortOrder = useMemo(
+    () => reorderable.reduce((max, g) => Math.max(max, g.sort_order), -1) + 1,
+    [reorderable]
+  );
 
   const refresh = useCallback(async () => {
     await Promise.all([
@@ -68,13 +72,13 @@ export default function ManageColumnGroupsDialog() {
         gradebook_id: gradebookController.gradebook_id,
         name,
         slug: `group-${Date.now()}`,
-        sort_order: reorderable.length,
+        sort_order: nextSortOrder,
         name_is_auto: false
       });
       if (error) throw error;
       setNewGroupName("");
     });
-  }, [newGroupName, run, supabase, gradebookController, reorderable.length]);
+  }, [newGroupName, run, supabase, gradebookController, nextSortOrder]);
 
   const rename = useCallback(
     async (id: number, name: string) => {
@@ -90,7 +94,7 @@ export default function ManageColumnGroupsDialog() {
     async (id: number, raw: string) => {
       const trimmed = raw.trim();
       const weight = trimmed === "" ? null : Number(trimmed) / 100;
-      if (weight !== null && (Number.isNaN(weight) || weight < 0)) {
+      if (weight !== null && (!Number.isFinite(weight) || weight < 0)) {
         toaster.error({ title: "Weight must be a number of percent, or blank" });
         return;
       }
@@ -193,7 +197,7 @@ export default function ManageColumnGroupsDialog() {
                             size="sm"
                             width="5rem"
                             inputMode="decimal"
-                            defaultValue={group.weight === null ? "" : String(group.weight * 100)}
+                            defaultValue={group.weight === null ? "" : formatWeightPercent(group.weight)}
                             aria-label={`Weight of group ${group.name}, in percent`}
                             disabled={busy || group.is_default}
                             onBlur={(e) => setWeight(group.id, e.target.value)}

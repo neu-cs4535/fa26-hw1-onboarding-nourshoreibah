@@ -50,14 +50,14 @@ export type WhatIfGradeValue = {
 export type GradebookWhatIfGradeMap = Record<number, WhatIfGradeValue | undefined>;
 export type GradebookWhatIfIncompleteValuesMap = Record<number, IncompleteValuesAdvice | null>;
 export type GradebookColumnStudentWithMaxScore = Omit<GradebookColumnStudent, "score"> & {
-  score: number;
+  score: number | null;
   max_score: number;
   column_slug: string;
 };
 
 type AssignmentForStudentDashboard =
   Database["public"]["Functions"]["get_assignments_for_student_dashboard"]["Returns"][number];
-class GradebookWhatIfController {
+export class GradebookWhatIfController {
   private _grades: GradebookWhatIfGradeMap = {};
   public debugID: string = crypto.randomUUID();
   private _incompleteValues: GradebookWhatIfIncompleteValuesMap = {};
@@ -381,9 +381,9 @@ class GradebookWhatIfController {
 
             const ret: GradebookColumnStudentWithMaxScore = {
               is_missing: is_missing,
-              is_excused: false,
+              is_excused: columnStudent?.is_excused ?? false,
               is_droppable: true,
-              score: score ?? 0,
+              score: score ?? null,
               score_override: null,
               class_id: column.class_id,
               created_at: column.created_at,
@@ -433,8 +433,7 @@ class GradebookWhatIfController {
               }
             }
 
-            // Track not-released values: use pre-coercion `score` (can be undefined)
-            // since ret.score is coerced via `?? 0` and would never be null/undefined.
+            // Track not-released values: use pre-coercion `score` (can be undefined).
             if (!ret.released && !ret.is_private && (score === null || score === undefined)) {
               if (!context.incomplete_values) {
                 context.incomplete_values = {};

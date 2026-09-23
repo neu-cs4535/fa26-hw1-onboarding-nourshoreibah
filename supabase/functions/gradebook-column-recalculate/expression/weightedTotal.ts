@@ -3,6 +3,7 @@ export type WeightedTotalColumnInput = {
   slug: string;
   gradebook_column_group_id: number;
   weight: number | string | null;
+  score_expression?: string | null;
 };
 
 export type WeightedTotalGroupInput = {
@@ -40,6 +41,19 @@ function toFiniteNumber(value: number | string | null | undefined): number | und
   return Number.isFinite(n) ? n : undefined;
 }
 
+const WEIGHTED_TOTAL_CALL = /\bweighted_total\s*\(/;
+
+export function callsWeightedTotal(expression: string | null | undefined): boolean {
+  return !!expression && WEIGHTED_TOTAL_CALL.test(expression);
+}
+
+// NULL means "no explicit weight" (1); 0 means the column counts for nothing.
+function resolveColumnWeight(value: number | string | null | undefined): number {
+  const weight = toFiniteNumber(value);
+  if (weight === undefined || weight < 0) return 1;
+  return weight;
+}
+
 export function buildWeightedTotalSpecs({
   columns,
   groups,
@@ -59,15 +73,15 @@ export function buildWeightedTotalSpecs({
   const specs: WeightedTotalSpec[] = [];
   for (const column of columns) {
     if (excludeColumnId !== null && excludeColumnId !== undefined && column.id === excludeColumnId) continue;
+    if (callsWeightedTotal(column.score_expression)) continue;
     const groupWeight = groupWeightById.get(column.gradebook_column_group_id);
     if (groupWeight === undefined) continue;
-    const columnWeight = toFiniteNumber(column.weight);
     specs.push({
       column_id: column.id,
       column_slug: column.slug,
       group_id: column.gradebook_column_group_id,
       group_weight: groupWeight,
-      column_weight: columnWeight === undefined || columnWeight <= 0 ? 1 : columnWeight
+      column_weight: resolveColumnWeight(column.weight)
     });
   }
   return specs;

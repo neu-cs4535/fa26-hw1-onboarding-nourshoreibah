@@ -48,7 +48,8 @@ BEGIN
     RETURN;
   END IF;
 
-  IF v_group.slug IN ('assignment-lab', 'assignment-individual', 'assignment-group') THEN
+  IF v_group.slug IN ('assignment-lab', 'assignment-individual', 'assignment-group')
+     OR v_group.auto_assign_slug_base IN ('assignment-lab', 'assignment-individual', 'assignment-group') THEN
     RETURN;
   END IF;
 
@@ -65,11 +66,16 @@ BEGIN
   END IF;
 
   IF v_derived IS NOT NULL AND v_derived IS DISTINCT FROM v_group.name THEN
+    -- Tells mark_manual_name this rename is the derivation, whatever the trigger depth.
+    PERFORM set_config('pawtograder.gradebook_group_auto_rename', 'on', true);
     UPDATE public.gradebook_column_groups
        SET name = v_derived
      WHERE id = p_group_id AND name_is_auto;
+    PERFORM set_config('pawtograder.gradebook_group_auto_rename', 'off', true);
   END IF;
 END $$;
+
+REVOKE ALL ON FUNCTION public.gradebook_column_group_refresh_name(bigint) FROM PUBLIC, anon, authenticated;
 
 CREATE OR REPLACE FUNCTION public.gradebook_columns_refresh_group_name()
 RETURNS trigger
@@ -99,7 +105,8 @@ LANGUAGE plpgsql
 SET search_path = public, pg_temp
 AS $$
 BEGIN
-  IF NEW.name IS DISTINCT FROM OLD.name AND pg_trigger_depth() <= 1 THEN
+  IF NEW.name IS DISTINCT FROM OLD.name
+     AND COALESCE(current_setting('pawtograder.gradebook_group_auto_rename', true), '') <> 'on' THEN
     NEW.name_is_auto := false;
   END IF;
   RETURN NEW;
@@ -110,7 +117,7 @@ CREATE TRIGGER gradebook_column_groups_mark_manual_name_tr
   BEFORE UPDATE OF name ON public.gradebook_column_groups
   FOR EACH ROW EXECUTE FUNCTION public.gradebook_column_groups_mark_manual_name();
 
-CREATE OR REPLACE FUNCTION public.gradebook_column_group_for_slug(
+CREATE OR REPLACE FUNCTION public._gradebook_column_group_for_slug(
   p_gradebook_id bigint, p_class_id bigint, p_slug text)
 RETURNS bigint
 LANGUAGE plpgsql
@@ -120,9 +127,17 @@ AS $$
 DECLARE
   v_base text;
   v_name text;
+  v_slug text;
+  v_suffix integer := 1;
   v_id   bigint;
   v_assignment public.assignments;
 BEGIN
+  IF NOT EXISTS (SELECT 1 FROM public.gradebooks WHERE id = p_gradebook_id AND class_id = p_class_id) THEN
+    RAISE EXCEPTION 'gradebook % does not belong to class %', p_gradebook_id, p_class_id;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(p_gradebook_id);
+
   IF p_slug LIKE 'assignment-%' THEN
     SELECT a.* INTO v_assignment
       FROM public.assignments a
@@ -165,18 +180,29 @@ BEGIN
     RETURN v_id;
   END IF;
 
+  -- A group already holding this slug has opted out of auto-routing, so make a new one beside it.
+  v_slug := v_base;
+  WHILE EXISTS (SELECT 1 FROM public.gradebook_column_groups
+                 WHERE gradebook_id = p_gradebook_id AND slug = v_slug) LOOP
+    v_suffix := v_suffix + 1;
+    v_slug := v_base || '-' || v_suffix;
+  END LOOP;
+
   INSERT INTO public.gradebook_column_groups
          (class_id, gradebook_id, name, slug, sort_order, auto_assign_slug_base)
-  VALUES (p_class_id, p_gradebook_id, v_name, v_base,
+  VALUES (p_class_id, p_gradebook_id, v_name, v_slug,
           COALESCE((SELECT MAX(sort_order) + 1
                       FROM public.gradebook_column_groups
                      WHERE gradebook_id = p_gradebook_id AND NOT is_default), 0),
           v_base)
-  ON CONFLICT (gradebook_id, slug) DO UPDATE SET slug = EXCLUDED.slug
   RETURNING id INTO v_id;
 
   RETURN v_id;
 END $$;
+
+REVOKE ALL ON FUNCTION public._gradebook_column_group_for_slug(bigint, bigint, text) FROM PUBLIC, anon, authenticated;
+
+ALTER TABLE public.gradebook_column_groups DISABLE TRIGGER broadcast_gradebook_column_groups_update;
 
 DO $$
 DECLARE
@@ -187,5 +213,7 @@ BEGIN
     PERFORM public.gradebook_column_group_refresh_name(g.id);
   END LOOP;
 END $$;
+
+ALTER TABLE public.gradebook_column_groups ENABLE TRIGGER broadcast_gradebook_column_groups_update;
 
 NOTIFY pgrst, 'reload schema';

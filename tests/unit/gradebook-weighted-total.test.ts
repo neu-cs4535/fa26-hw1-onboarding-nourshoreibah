@@ -15,7 +15,15 @@ import {
   type WeightedTotalValue
 } from "@/supabase/functions/gradebook-column-recalculate/expression/weightedTotal";
 import { evaluateForStudent } from "@/lib/gradebookExpressionTester";
+import { GradebookWhatIfController } from "@/hooks/useGradebookWhatIf";
 import type { GradebookColumnStudent } from "@/utils/supabase/DatabaseTypes";
+
+jest.mock("@/utils/supabase/client", () => ({
+  createClient: () => ({ rpc: () => new Promise(() => {}) })
+}));
+jest.mock("@/hooks/useGradebook", () => ({ useGradebookController: jest.fn() }));
+jest.mock("@/hooks/useCourseController", () => ({ useCourseController: jest.fn() }));
+jest.mock("@/components/ui/toaster", () => ({ toaster: { create: jest.fn() } }));
 
 const HOMEWORK_GROUP = 10;
 const EXAM_GROUP = 20;
@@ -138,6 +146,21 @@ describe("computeWeightedTotal", () => {
     fixture.columns[1].max_score = 0;
     expect(totalFor(fixture, 5)).toBeCloseTo(86, 10);
   });
+
+  test("a column weighted 0 counts for nothing, whatever its score", () => {
+    const fixture = baseFixture();
+    fixture.columns.push({ id: 6, slug: "hw-3", gradebook_column_group_id: HOMEWORK_GROUP, weight: 0, max_score: 100 });
+    fixture.values["hw-3"] = { score: 0 };
+    expect(totalFor(fixture, 5)).toBeCloseTo(82, 10);
+    fixture.values["hw-3"] = { score: null, is_missing: true };
+    expect(totalFor(fixture, 5)).toBeCloseTo(82, 10);
+  });
+
+  test("a group whose every column is weighted 0 drops out and the rest renormalise", () => {
+    const fixture = baseFixture();
+    fixture.columns[2].weight = 0;
+    expect(totalFor(fixture, 5)).toBeCloseTo(70, 10);
+  });
 });
 
 describe("buildWeightedTotalSpecs", () => {
@@ -147,6 +170,50 @@ describe("buildWeightedTotalSpecs", () => {
     expect(specs.map((s) => s.column_slug)).toEqual(["hw-1", "hw-2", "exam-1"]);
     expect(specs.every((s) => s.column_weight === 1)).toBe(true);
     expect(specs.map((s) => s.group_weight)).toEqual([0.4, 0.4, 0.6]);
+  });
+
+  test("a column weight of 0 is kept as 0, and a negative one falls back to 1", () => {
+    const specs = buildWeightedTotalSpecs({
+      columns: [
+        { id: 1, slug: "hw-1", gradebook_column_group_id: HOMEWORK_GROUP, weight: 0 },
+        { id: 2, slug: "hw-2", gradebook_column_group_id: HOMEWORK_GROUP, weight: "0" },
+        { id: 3, slug: "hw-3", gradebook_column_group_id: HOMEWORK_GROUP, weight: -2 }
+      ],
+      groups: [{ id: HOMEWORK_GROUP, weight: 0.4 }]
+    });
+    expect(specs.map((s) => s.column_weight)).toEqual([0, 0, 1]);
+  });
+
+  test("columns that call weighted_total() never feed another weighted_total()", () => {
+    const fixture = baseFixture();
+    const columns = [
+      ...fixture.columns.map((c) => ({ ...c, score_expression: null })),
+      {
+        id: 6,
+        slug: "running-total",
+        gradebook_column_group_id: HOMEWORK_GROUP,
+        weight: null,
+        score_expression: "weighted_total ( ) * 0.5"
+      },
+      {
+        id: 7,
+        slug: "final-grade",
+        gradebook_column_group_id: EXAM_GROUP,
+        weight: null,
+        score_expression: "max(weighted_total(), 50)"
+      },
+      {
+        id: 8,
+        slug: "not-a-call",
+        gradebook_column_group_id: EXAM_GROUP,
+        weight: null,
+        score_expression: 'gradebook_columns("my_weighted_total")'
+      }
+    ];
+    for (const excludeColumnId of [6, 7]) {
+      const specs = buildWeightedTotalSpecs({ columns, groups: fixture.groups, excludeColumnId });
+      expect(specs.map((s) => s.column_slug)).toEqual(["hw-1", "hw-2", "exam-1", "not-a-call"]);
+    }
   });
 
   test("numeric weights arriving as strings are still read as numbers", () => {
@@ -317,5 +384,57 @@ describe("weighted_total() agrees across evaluators", () => {
     expect(() => run.weighted_total({ student_id: "alice", class_id: 1, is_private_calculation: false })).toThrow(
       "weighted_total() is not available"
     );
+  });
+});
+
+describe("what-if weighted_total() matches the stored gradebook value", () => {
+  function whatIfTotal(fixture: Fixture): number | undefined {
+    const columns = [
+      ...fixture.columns
+        .filter((c) => c.id !== 5)
+        .map((c) => ({ ...c, name: c.slug, class_id: 1, gradebook_id: 1, score_expression: null, dependencies: null })),
+      {
+        ...fixture.columns.find((c) => c.id === 5)!,
+        name: "course-total",
+        class_id: 1,
+        gradebook_id: 1,
+        score_expression: "weighted_total()",
+        dependencies: {
+          gradebook_columns: buildWeightedTotalSpecs({
+            columns: fixture.columns,
+            groups: fixture.groups,
+            excludeColumnId: 5
+          }).map((s) => s.column_id)
+        }
+      }
+    ];
+    const fake = createFakeController(fixture);
+    const gradebookController = {
+      class_id: 1,
+      columns,
+      assignments: [],
+      gradebook_column_groups: fake.gradebook_column_groups,
+      getGradebookColumn: (id: number) => columns.find((c) => c.id === id),
+      getGradebookColumnStudent: fake.getGradebookColumnStudent,
+      subscribeColumnsForStudent: () => () => {}
+    };
+    const controller = new GradebookWhatIfController(
+      gradebookController as unknown as ConstructorParameters<typeof GradebookWhatIfController>[0],
+      "alice",
+      {} as unknown as ConstructorParameters<typeof GradebookWhatIfController>[2]
+    );
+    return controller.getGrade(5)?.report_only;
+  }
+
+  test("a released column nobody has graded yet does not drag the what-if total down", () => {
+    const fixture = baseFixture();
+    fixture.values["hw-2"] = { score: null };
+    expect(totalFor(fixture, 5)).toBeCloseTo(86, 10);
+    expect(whatIfTotal(fixture)).toBeCloseTo(86, 10);
+  });
+
+  test("with every column graded the what-if total equals the stored one", () => {
+    const fixture = baseFixture();
+    expect(whatIfTotal(fixture)).toBeCloseTo(totalFor(fixture, 5)!, 10);
   });
 });

@@ -218,6 +218,38 @@ Deno.test("weighted_total: an excused column leaves its group instead of scoring
   }
 });
 
+Deno.test("weighted_total: a column weighted 0 counts for nothing", () => {
+  const specs = buildWeightedTotalSpecs({
+    columns: [...weightedFixture.columns, { id: 5, slug: "hw-3", gradebook_column_group_id: 10, weight: 0 }],
+    groups: weightedFixture.groups,
+    excludeColumnId: 4
+  });
+  const values: Record<string, { score: number | null; max_score: number }> = {
+    ...weightedValues,
+    "hw-3": { score: 0, max_score: 100 }
+  };
+  const r = fns()["weighted_total"]({
+    ...ctx,
+    weighted_total_source: makeWeightedTotalSource(specs, (slug: string) => values[slug])
+  }) as number;
+  assertEquals(Math.round(r * 1e9) / 1e9, 82);
+});
+
+Deno.test("weighted_total: columns that call weighted_total() are left out of each other", () => {
+  const specs = buildWeightedTotalSpecs({
+    columns: [
+      ...weightedFixture.columns,
+      { id: 5, slug: "other-total", gradebook_column_group_id: 20, weight: null, score_expression: "weighted_total()" }
+    ],
+    groups: weightedFixture.groups,
+    excludeColumnId: 4
+  });
+  assertEquals(
+    specs.map((s) => s.column_slug),
+    ["hw-1", "hw-2", "exam-1"]
+  );
+});
+
 Deno.test("weighted_total: refuses when the evaluator supplied no group weights", () => {
   assertThrows(() => fns()["weighted_total"](ctx), Error, "weighted_total() is not available");
 });

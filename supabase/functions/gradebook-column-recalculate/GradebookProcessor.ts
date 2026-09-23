@@ -368,21 +368,37 @@ function topoSortColumns(columns: ColumnWithPrefix[]): number[] {
   return order;
 }
 
-async function loadWeightedTotalSpecs(
+async function loadColumnsAndWeightedTotalSpecs(
   adminSupabase: SupabaseClient<Database>,
   scope: Sentry.Scope,
-  gradebook_id: number,
-  columns: readonly { id: number; slug: string; gradebook_column_group_id: number; weight: number | null }[]
-): Promise<WeightedTotalSpec[]> {
-  const { data: groups, error } = await adminSupabase
-    .from("gradebook_column_groups")
-    .select("id, weight")
-    .eq("gradebook_id", gradebook_id);
-  if (error || !groups) {
-    Sentry.captureException(error ?? new Error("Missing gradebook column groups"), scope);
-    return [];
+  gradebook_id: number
+): Promise<{ columns: ColumnWithPrefix[]; weightedTotalSpecs: WeightedTotalSpec[] } | null> {
+  const [{ data: columns, error: colsError }, { data: groups, error: groupsError }] = await Promise.all([
+    adminSupabase
+      .from("gradebook_columns")
+      .select("*, gradebooks!gradebook_columns_gradebook_id_fkey(expression_prefix)")
+      .eq("gradebook_id", gradebook_id),
+    adminSupabase.from("gradebook_column_groups").select("id, weight, sort_order").eq("gradebook_id", gradebook_id)
+  ]);
+  if (colsError || !columns) {
+    Sentry.captureException(colsError || new Error("Missing columns"), scope);
+    return null;
   }
-  return buildWeightedTotalSpecs({ columns, groups });
+  if (groupsError || !groups) {
+    Sentry.captureException(groupsError ?? new Error("Missing gradebook column groups"), scope);
+    return null;
+  }
+  const groupSortOrder = new Map(groups.map((g) => [g.id, g.sort_order]));
+  const sortedColumns = [...(columns as unknown as ColumnWithPrefix[])].sort((a, b) => {
+    const groupOrderA = groupSortOrder.get(a.gradebook_column_group_id) ?? Number.MAX_SAFE_INTEGER;
+    const groupOrderB = groupSortOrder.get(b.gradebook_column_group_id) ?? Number.MAX_SAFE_INTEGER;
+    if (groupOrderA !== groupOrderB) return groupOrderA - groupOrderB;
+    if (a.gradebook_column_group_id !== b.gradebook_column_group_id)
+      return a.gradebook_column_group_id - b.gradebook_column_group_id;
+    if (a.position_in_group !== b.position_in_group) return a.position_in_group - b.position_in_group;
+    return a.id - b.id;
+  });
+  return { columns: sortedColumns, weightedTotalSpecs: buildWeightedTotalSpecs({ columns: sortedColumns, groups }) };
 }
 
 function createWeightedTotalAttacher({
@@ -439,17 +455,9 @@ export async function processGradebookRowCalculation(
     >[];
   }
 ): Promise<RowUpdate[]> {
-  // Fetch all columns for this gradebook
-  const { data: columns, error: colsError } = await adminSupabase
-    .from("gradebook_columns")
-    .select("*, gradebooks!gradebook_columns_gradebook_id_fkey(expression_prefix)")
-    .eq("gradebook_id", gradebook_id)
-    .order("gradebook_column_group_id", { ascending: true })
-    .order("position_in_group", { ascending: true });
-  if (colsError || !columns) {
-    Sentry.captureException(colsError || new Error("Missing columns"), scope);
-    return [];
-  }
+  const loaded = await loadColumnsAndWeightedTotalSpecs(adminSupabase, scope, gradebook_id);
+  if (!loaded) return [];
+  const { columns, weightedTotalSpecs } = loaded;
 
   const columnById = new Map<number, ColumnWithPrefix>();
   const columnBySlug = new Map<string, ColumnWithPrefix>();
@@ -457,7 +465,6 @@ export async function processGradebookRowCalculation(
     columnById.set(c.id, c);
     columnBySlug.set(c.slug, c);
   }
-  const weightedTotalSpecs = await loadWeightedTotalSpecs(adminSupabase, scope, gradebook_id, columns);
 
   // Prepare math and dependency sources
   const math = create(all, {});
@@ -764,18 +771,9 @@ export async function processGradebookRowsCalculation(
     }[];
   }
 ): Promise<Map<string, RowUpdate[]>> {
-  const { data: columns, error: colsError } = await adminSupabase
-    .from("gradebook_columns")
-    .select("*, gradebooks!gradebook_columns_gradebook_id_fkey(expression_prefix)")
-    .eq("gradebook_id", gradebook_id)
-    .order("gradebook_column_group_id", { ascending: true })
-    .order("position_in_group", { ascending: true });
-  if (colsError || !columns) {
-    Sentry.captureException(colsError || new Error("Missing columns"), scope);
-    return new Map();
-  }
-
-  const weightedTotalSpecs = await loadWeightedTotalSpecs(adminSupabase, scope, gradebook_id, columns);
+  const loaded = await loadColumnsAndWeightedTotalSpecs(adminSupabase, scope, gradebook_id);
+  if (!loaded) return new Map();
+  const { columns, weightedTotalSpecs } = loaded;
 
   const math = create(all, {});
   // Build keys for all students in this batch

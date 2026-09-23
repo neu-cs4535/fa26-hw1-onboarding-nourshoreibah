@@ -3050,6 +3050,7 @@ export default function GradebookTable() {
         orderedColumnIds: merged,
         groupIdByColumnId: new Map(gradebookColumns.map((c) => [c.id, c.gradebook_column_group_id])),
         currentGroupOrder: columnGroups.filter((g) => !g.is_default).map((g) => g.id),
+        defaultGroupId: columnGroups.find((g) => g.is_default)?.id ?? null,
         draggedColumnId
       });
       if (plan.kind === "noop") return;

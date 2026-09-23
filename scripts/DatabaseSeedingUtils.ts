@@ -5287,11 +5287,6 @@ final;`,
         throw new Error(`Failed to set sort_order ${position} on group ${group.name}: ${setError.message}`);
       }
     }
-
-    const defaultGroup = groups.find((g) => g.is_default);
-    if (defaultGroup) {
-      await supabase.from("gradebook_column_groups").update({ sort_order: ordered.length }).eq("id", defaultGroup.id);
-    }
   }
 
   /**

@@ -2,6 +2,7 @@ import {
   buildColumnGroupKeyMap,
   buildGroupedColumns,
   formatGroupWeight,
+  formatWeightPercent,
   groupKey,
   planColumnDrag,
   sortColumnsForDisplay,
@@ -97,7 +98,6 @@ describe("grouping", () => {
 });
 
 describe("what a drag turned out to mean", () => {
-  const groups = [group(1, "Labs", 0), group(2, "Exams", 1)];
   const groupIdByColumnId = new Map([
     [11, 1],
     [12, 1],
@@ -111,6 +111,7 @@ describe("what a drag turned out to mean", () => {
       orderedColumnIds: [12, 11, 21, 22],
       groupIdByColumnId,
       currentGroupOrder,
+      defaultGroupId: null,
       draggedColumnId: 12
     });
     expect(plan).toEqual({ kind: "reorder-in-group", groupId: 1, orderedColumnIds: [12, 11] });
@@ -121,6 +122,7 @@ describe("what a drag turned out to mean", () => {
       orderedColumnIds: [21, 22, 11, 12],
       groupIdByColumnId,
       currentGroupOrder,
+      defaultGroupId: null,
       draggedColumnId: 21
     });
     expect(plan).toEqual({ kind: "reorder-groups", orderedGroupIds: [2, 1] });
@@ -131,6 +133,7 @@ describe("what a drag turned out to mean", () => {
       orderedColumnIds: [11, 21, 12, 22],
       groupIdByColumnId,
       currentGroupOrder,
+      defaultGroupId: null,
       draggedColumnId: 21
     });
     expect(plan).toEqual({ kind: "move-column", columnId: 21, groupId: 1, position: 1 });
@@ -141,13 +144,125 @@ describe("what a drag turned out to mean", () => {
       orderedColumnIds: [11, 12, 21, 22],
       groupIdByColumnId,
       currentGroupOrder,
+      defaultGroupId: null,
       draggedColumnId: 11
     });
     expect(plan).toEqual({ kind: "reorder-in-group", groupId: 1, orderedColumnIds: [11, 12] });
   });
 });
 
+describe("dragging with an empty group and a populated default group", () => {
+  const DEFAULT = 99;
+  const groupIdByColumnId = new Map([
+    [11, 1],
+    [12, 1],
+    [21, 2],
+    [22, 2],
+    [31, 3],
+    [91, DEFAULT],
+    [92, DEFAULT]
+  ]);
+  // Group 5 has no columns and sits between 1 and 2.
+  const currentGroupOrder = [1, 5, 2, 3];
+  const base = { groupIdByColumnId, currentGroupOrder, defaultGroupId: DEFAULT };
+
+  it("reads a swap inside one group as an in-group reorder even when an empty group exists", () => {
+    const plan = planColumnDrag({
+      ...base,
+      orderedColumnIds: [12, 11, 21, 22, 31, 91, 92],
+      draggedColumnId: 12
+    });
+    expect(plan).toEqual({ kind: "reorder-in-group", groupId: 1, orderedColumnIds: [12, 11] });
+  });
+
+  it("reads a swap inside the default group as an in-group reorder", () => {
+    const plan = planColumnDrag({
+      ...base,
+      orderedColumnIds: [11, 12, 21, 22, 31, 92, 91],
+      draggedColumnId: 92
+    });
+    expect(plan).toEqual({ kind: "reorder-in-group", groupId: DEFAULT, orderedColumnIds: [92, 91] });
+  });
+
+  it("reads a swap inside a group as an in-group reorder while the default group holds columns", () => {
+    const plan = planColumnDrag({
+      ...base,
+      orderedColumnIds: [11, 12, 22, 21, 31, 91, 92],
+      draggedColumnId: 22
+    });
+    expect(plan).toEqual({ kind: "reorder-in-group", groupId: 2, orderedColumnIds: [22, 21] });
+  });
+
+  it("sends every non-default group, empty ones included, and never the default group", () => {
+    const plan = planColumnDrag({
+      ...base,
+      orderedColumnIds: [21, 22, 11, 12, 31, 91, 92],
+      draggedColumnId: 21
+    });
+    expect(plan).toEqual({ kind: "reorder-groups", orderedGroupIds: [2, 5, 1, 3] });
+  });
+
+  it("moves a group's only column past another group as a group reorder", () => {
+    const plan = planColumnDrag({
+      ...base,
+      orderedColumnIds: [11, 12, 31, 21, 22, 91, 92],
+      draggedColumnId: 31
+    });
+    expect(plan).toEqual({ kind: "reorder-groups", orderedGroupIds: [1, 5, 3, 2] });
+  });
+
+  it("does nothing when a lone column only moves past the default group, which stays last", () => {
+    const groupIds = new Map([
+      [11, 1],
+      [12, 1],
+      [31, 3],
+      [91, DEFAULT]
+    ]);
+    const plan = planColumnDrag({
+      groupIdByColumnId: groupIds,
+      currentGroupOrder: [1, 3],
+      defaultGroupId: DEFAULT,
+      orderedColumnIds: [11, 12, 91, 31],
+      draggedColumnId: 31
+    });
+    expect(plan).toEqual({ kind: "noop" });
+  });
+
+  it("does nothing when the default group's only column is dragged in front of other groups", () => {
+    const groupIds = new Map([
+      [11, 1],
+      [21, 2],
+      [91, DEFAULT]
+    ]);
+    const plan = planColumnDrag({
+      groupIdByColumnId: groupIds,
+      currentGroupOrder: [1, 2],
+      defaultGroupId: DEFAULT,
+      orderedColumnIds: [91, 11, 21],
+      draggedColumnId: 91
+    });
+    expect(plan).toEqual({ kind: "noop" });
+  });
+});
+
+describe("display order with the default group pinned at the top of int4", () => {
+  it("puts the default group last and an unknown group after it", () => {
+    const groups = [group(1, "Ungrouped", 2147483647, { is_default: true }), group(2, "Labs", 1), group(3, "Quiz", 0)];
+    const columns = [col(11, 1, 0), col(21, 2, 0), col(31, 3, 0), col(41, 999, 0)];
+    expect(sortColumnsForDisplay(columns, groups).map((c) => c.id)).toEqual([31, 21, 11, 41]);
+    expect(visibleGroupsInOrder(columns, groups).map((g) => g.id)).toEqual([3, 2, 1]);
+  });
+});
+
 describe("weights", () => {
+  it("shows a weight as a percentage without float noise", () => {
+    expect(formatWeightPercent(0.07)).toBe("7");
+    expect(formatWeightPercent(0.125)).toBe("12.5");
+    expect(formatWeightPercent(0)).toBe("0");
+    expect(formatGroupWeight(0.07)).toBe("7%");
+    expect(formatGroupWeight(0)).toBe("0%");
+  });
+
   it("reads a share of the course as a percentage", () => {
     expect(formatGroupWeight(0.4)).toBe("40%");
     expect(formatGroupWeight(0.125)).toBe("12.5%");

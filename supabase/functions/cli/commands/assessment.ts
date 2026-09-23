@@ -355,14 +355,33 @@ async function streamGradebookColumns(
   const { data: rows, error } = await supabase
     .from("gradebook_columns")
     .select(
-      "id, slug, name, description, max_score, instructor_only, released, sort_order, score_expression, render_expression, dependencies"
+      "id, slug, name, description, max_score, instructor_only, released, gradebook_column_group_id, position_in_group, score_expression, render_expression, dependencies"
     )
-    .eq("class_id", classId)
-    .order("sort_order", { ascending: true, nullsFirst: false })
-    .order("id", { ascending: true });
+    .eq("class_id", classId);
   if (error) throw new CLICommandError(`Failed to load gradebook columns: ${error.message}`, 500);
 
-  const candidates = (rows ?? []).map((r) => ({ ...r, slug: r.slug }));
+  const { data: groupRows, error: groupsError } = await supabase
+    .from("gradebook_column_groups")
+    .select("id, name, sort_order")
+    .eq("class_id", classId);
+  if (groupsError) throw new CLICommandError(`Failed to load gradebook column groups: ${groupsError.message}`, 500);
+  const groupsById = new Map((groupRows ?? []).map((g) => [g.id, g]));
+
+  const sorted = [...(rows ?? [])].sort((a, b) => {
+    const groupOrderA = groupsById.get(a.gradebook_column_group_id)?.sort_order ?? Number.MAX_SAFE_INTEGER;
+    const groupOrderB = groupsById.get(b.gradebook_column_group_id)?.sort_order ?? Number.MAX_SAFE_INTEGER;
+    if (groupOrderA !== groupOrderB) return groupOrderA - groupOrderB;
+    if (a.gradebook_column_group_id !== b.gradebook_column_group_id)
+      return a.gradebook_column_group_id - b.gradebook_column_group_id;
+    if (a.position_in_group !== b.position_in_group) return a.position_in_group - b.position_in_group;
+    return a.id - b.id;
+  });
+  const candidates = sorted.map((r, index) => ({
+    ...r,
+    slug: r.slug,
+    display_index: index,
+    group_name: groupsById.get(r.gradebook_column_group_id)?.name ?? null
+  }));
   const { resolved, unmatched } = resolveSelectors(selectors, candidates);
 
   if (unmatched.length > 0) {
@@ -384,7 +403,9 @@ async function streamGradebookColumns(
       max_score: c.max_score,
       instructor_only: c.instructor_only,
       released: c.released,
-      sort_order: c.sort_order,
+      sort_order: c.display_index,
+      group_name: c.group_name,
+      position_in_group: c.position_in_group,
       score_expression: c.score_expression,
       render_expression: c.render_expression,
       dependencies: c.dependencies

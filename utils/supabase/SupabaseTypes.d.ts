@@ -3718,13 +3718,6 @@ export type Database = {
             referencedColumns: ["id"];
           },
           {
-            foreignKeyName: "gradebook_column_students_gradebook_column_id_fkey";
-            columns: ["gradebook_column_id"];
-            isOneToOne: false;
-            referencedRelation: "gradebook_columns_ordered";
-            referencedColumns: ["id"];
-          },
-          {
             foreignKeyName: "gradebook_column_students_student_id_fkey";
             columns: ["student_id"];
             isOneToOne: false;
@@ -3929,13 +3922,6 @@ export type Database = {
             columns: ["final_grade_column"];
             isOneToOne: false;
             referencedRelation: "gradebook_columns";
-            referencedColumns: ["id"];
-          },
-          {
-            foreignKeyName: "gradebooks_final_grade_column_fkey";
-            columns: ["final_grade_column"];
-            isOneToOne: false;
-            referencedRelation: "gradebook_columns_ordered";
             referencedColumns: ["id"];
           }
         ];
@@ -6403,13 +6389,6 @@ export type Database = {
             columns: ["gradebook_column_id"];
             isOneToOne: false;
             referencedRelation: "gradebook_columns";
-            referencedColumns: ["id"];
-          },
-          {
-            foreignKeyName: "lti_line_items_gradebook_column_id_fkey";
-            columns: ["gradebook_column_id"];
-            isOneToOne: false;
-            referencedRelation: "gradebook_columns_ordered";
             referencedColumns: ["id"];
           }
         ];
@@ -11431,58 +11410,6 @@ export type Database = {
         };
         Relationships: [];
       };
-      gradebook_columns_ordered: {
-        Row: {
-          class_id: number | null;
-          created_at: string | null;
-          dependencies: Json | null;
-          description: string | null;
-          display_order: number | null;
-          external_data: Json | null;
-          gradebook_column_group_id: number | null;
-          gradebook_id: number | null;
-          group_name: string | null;
-          group_slug: string | null;
-          group_sort_order: number | null;
-          group_weight: number | null;
-          id: number | null;
-          instructor_only: boolean | null;
-          max_score: number | null;
-          name: string | null;
-          position_in_group: number | null;
-          released: boolean | null;
-          render_expression: string | null;
-          score_expression: string | null;
-          show_calculated_ranges: boolean | null;
-          show_max_score: boolean | null;
-          slug: string | null;
-          updated_at: string | null;
-          weight: number | null;
-        };
-        Relationships: [
-          {
-            foreignKeyName: "gradebook_columns_class_id_fkey";
-            columns: ["class_id"];
-            isOneToOne: false;
-            referencedRelation: "classes";
-            referencedColumns: ["id"];
-          },
-          {
-            foreignKeyName: "gradebook_columns_gradebook_id_fkey";
-            columns: ["gradebook_id"];
-            isOneToOne: false;
-            referencedRelation: "gradebooks";
-            referencedColumns: ["id"];
-          },
-          {
-            foreignKeyName: "gradebook_columns_group_fk";
-            columns: ["gradebook_column_group_id", "gradebook_id"];
-            isOneToOne: false;
-            referencedRelation: "gradebook_column_groups";
-            referencedColumns: ["id", "gradebook_id"];
-          }
-        ];
-      };
       pg_buffercache: {
         Row: {
           bufferid: number | null;
@@ -11911,6 +11838,10 @@ export type Database = {
       };
     };
     Functions: {
+      _broadcast_gradebook_column_group_rows: {
+        Args: { p_operation: string; p_rows: Json; p_students_only?: boolean };
+        Returns: undefined;
+      };
       _cli_resolve_submission_file_id: {
         Args: { p_file_name: string; p_submission_id: number };
         Returns: number;
@@ -11929,6 +11860,10 @@ export type Database = {
       _grade_targets_for_submission: {
         Args: { p_submission_id: number };
         Returns: string[];
+      };
+      _gradebook_column_group_for_slug: {
+        Args: { p_class_id: number; p_gradebook_id: number; p_slug: string };
+        Returns: number;
       };
       _gradebook_columns_apply_positions: {
         Args: {
