@@ -3578,6 +3578,12 @@ export default function GradebookTable() {
   );
 
   const isDraggingGroup = Boolean(activeDragColumnId?.startsWith(GROUP_DRAG_PREFIX));
+  /** The Ungrouped zone only matters for a column that is in some group now. */
+  const showUngroupDropZone = useMemo(() => {
+    if (!activeDragColumnId?.startsWith("grade_")) return false;
+    const column = gradebookColumns.find((c) => c.id === Number(activeDragColumnId.slice(6)));
+    return !!column && !columnGroupById.get(column.gradebook_column_group_id)?.is_default;
+  }, [activeDragColumnId, gradebookColumns, columnGroupById]);
   /** Gaps a dragged group may land in: the ones between two groups, and the two ends. */
   const groupBoundaryGaps = useMemo(() => {
     const gaps = new Set<number>([0, visibleReorderUnits.length]);
@@ -4299,7 +4305,7 @@ export default function GradebookTable() {
                                 />
                               );
                             })}
-                            {activeDragColumnId?.startsWith("grade_") && (
+                            {showUngroupDropZone && (
                               <UngroupDropZone left={scrollableWidth} height={leafHeaderHeight} />
                             )}
                             {columnVirtualizer.getVirtualItems().map((vc) => {
