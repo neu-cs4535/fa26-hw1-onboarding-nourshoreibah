@@ -186,8 +186,7 @@ export function ColumnGroupHeader({
       display="flex"
       alignItems="center"
       gap={1}
-      px={compact ? 0 : 2}
-      justifyContent={compact ? "center" : undefined}
+      px={compact ? 1 : 2}
       overflow="hidden"
       opacity={isDragging ? 0.4 : 1}
       pointerEvents={anyDragging ? "none" : "auto"}
@@ -195,7 +194,7 @@ export function ColumnGroupHeader({
       aria-label={`Column group ${group.name}`}
       data-group-id={group.id}
     >
-      {movable && !compact && (
+      {movable && (
         <Box
           {...attributes}
           {...listeners}

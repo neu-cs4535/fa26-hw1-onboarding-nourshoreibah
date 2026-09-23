@@ -144,7 +144,7 @@ import ImportGradebookColumn from "./importGradebookColumn";
 
 const GRADE_COL_WIDTH = 120;
 /** Width a collapsed group shrinks to. */
-const COLLAPSED_GROUP_COL_WIDTH = 32;
+const COLLAPSED_GROUP_COL_WIDTH = 48;
 /** Width of the placeholder an empty group shows, wide enough for its call to action. */
 const EMPTY_GROUP_COL_WIDTH = 200;
 /** Leaf ids of the placeholder column an empty group renders, alongside `grade_<id>`. */
@@ -2422,6 +2422,9 @@ function CollapsedGroupStrip({
         overflow="hidden"
       >
         <Icon as={LuChevronsLeftRight} boxSize={3} color="fg.muted" flexShrink={0} />
+        <Text fontSize="xs" color="fg.subtle" flexShrink={0}>
+          {meta.hiddenCount}
+        </Text>
         <Text
           fontSize="xs"
           fontWeight="semibold"
