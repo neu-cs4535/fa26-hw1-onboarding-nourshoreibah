@@ -3578,12 +3578,17 @@ export default function GradebookTable() {
   );
 
   const isDraggingGroup = Boolean(activeDragColumnId?.startsWith(GROUP_DRAG_PREFIX));
-  /** The Ungrouped zone only matters for a column that is in some group now. */
+  /**
+   * Ungrouped has no band to drop on while it is empty, so a zone stands in for it during a column
+   * drag. Once it holds a column, its own band and drop lines are the target.
+   */
   const showUngroupDropZone = useMemo(() => {
     if (!activeDragColumnId?.startsWith("grade_")) return false;
-    const column = gradebookColumns.find((c) => c.id === Number(activeDragColumnId.slice(6)));
-    return !!column && !columnGroupById.get(column.gradebook_column_group_id)?.is_default;
-  }, [activeDragColumnId, gradebookColumns, columnGroupById]);
+    const defaultGroupId = columnGroups.find((g) => g.is_default)?.id;
+    return (
+      defaultGroupId !== undefined && !gradebookColumns.some((c) => c.gradebook_column_group_id === defaultGroupId)
+    );
+  }, [activeDragColumnId, gradebookColumns, columnGroups]);
   /** Gaps a dragged group may land in: the ones between two groups, and the two ends. */
   const groupBoundaryGaps = useMemo(() => {
     const gaps = new Set<number>([0, visibleReorderUnits.length]);
