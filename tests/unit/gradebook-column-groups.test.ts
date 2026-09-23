@@ -1,8 +1,12 @@
 import {
   buildColumnGroupKeyMap,
   buildGroupedColumns,
+  columnLayoutPatches,
   groupKey,
+  groupOrderPatches,
+  groupSlugProblem,
   planColumnDrop,
+  slugForGroupName,
   sortColumnsForDisplay,
   visibleGroupsInOrder,
   type GradebookColumnGroup
@@ -150,5 +154,93 @@ describe("display order with the default group pinned at the top of int4", () =>
     const columns = [col(11, 1, 0), col(21, 2, 0), col(31, 3, 0), col(41, 999, 0)];
     expect(sortColumnsForDisplay(columns, groups).map((c) => c.id)).toEqual([31, 21, 11, 41]);
     expect(visibleGroupsInOrder(columns, groups).map((g) => g.id)).toEqual([3, 2, 1]);
+  });
+});
+
+describe("the rows a drop changes before the save returns", () => {
+  const groupIdByColumnId = new Map([
+    [11, 1],
+    [12, 1],
+    [13, 1],
+    [21, 2],
+    [22, 2]
+  ]);
+  const orderedColumnIds = [11, 12, 13, 21, 22];
+  const patches = (plan: Parameters<typeof columnLayoutPatches>[0]["plan"]) =>
+    columnLayoutPatches({ plan, orderedColumnIds, groupIdByColumnId });
+
+  it("renumbers a reordered group from zero, in its new order", () => {
+    expect(patches({ kind: "reorder-in-group", groupId: 1, orderedColumnIds: [13, 11, 12] })).toEqual([
+      { id: 13, values: { position_in_group: 0 } },
+      { id: 11, values: { position_in_group: 1 } },
+      { id: 12, values: { position_in_group: 2 } }
+    ]);
+  });
+
+  it("closes the gap in the old group and opens one in the new, moving only the dragged column's group", () => {
+    expect(patches({ kind: "move-column", columnId: 12, groupId: 2, position: 1 })).toEqual([
+      { id: 11, values: { position_in_group: 0 } },
+      { id: 13, values: { position_in_group: 1 } },
+      { id: 21, values: { position_in_group: 0 } },
+      { id: 12, values: { gradebook_column_group_id: 2, position_in_group: 1 } },
+      { id: 22, values: { position_in_group: 2 } }
+    ]);
+  });
+
+  it("puts a column moved into an empty group at position 0", () => {
+    expect(patches({ kind: "move-column", columnId: 22, groupId: 7, position: 0 })).toEqual([
+      { id: 21, values: { position_in_group: 0 } },
+      { id: 22, values: { gradebook_column_group_id: 7, position_in_group: 0 } }
+    ]);
+  });
+
+  it("clamps a position past the end of the group to the end", () => {
+    const moved = patches({ kind: "move-column", columnId: 11, groupId: 2, position: 99 });
+    expect(moved.find((p) => p.id === 11)).toEqual({
+      id: 11,
+      values: { gradebook_column_group_id: 2, position_in_group: 2 }
+    });
+  });
+
+  it("changes nothing for a noop", () => {
+    expect(patches({ kind: "noop" })).toEqual([]);
+  });
+
+  it("numbers groups by their new order", () => {
+    expect(groupOrderPatches([5, 3, 9])).toEqual([
+      { id: 5, values: { sort_order: 0 } },
+      { id: 3, values: { sort_order: 1 } },
+      { id: 9, values: { sort_order: 2 } }
+    ]);
+  });
+});
+
+describe("group slugs", () => {
+  it("derives a slug from the name, lowercase with single hyphens", () => {
+    expect(slugForGroupName("Homework", [])).toBe("homework");
+    expect(slugForGroupName("  Lab Reports (Fall '26)! ", [])).toBe("lab-reports-fall-26");
+  });
+
+  it("adds -2, -3 until the slug is unused", () => {
+    expect(slugForGroupName("Homework", ["homework"])).toBe("homework-2");
+    expect(slugForGroupName("Homework", ["homework", "homework-2"])).toBe("homework-3");
+  });
+
+  it("falls back to group for a name with no letters or digits", () => {
+    expect(slugForGroupName("!!!", [])).toBe("group");
+  });
+
+  it("accepts a well-formed unused slug", () => {
+    expect(groupSlugProblem("lab-reports", ["homework"])).toBeNull();
+  });
+
+  it("rejects capitals, spaces, underscores and stray hyphens", () => {
+    for (const bad of ["Homework", "lab reports", "lab_reports", "-lab", "lab-", "lab--reports", ""]) {
+      expect(groupSlugProblem(bad, [])).toMatch(/lowercase letters/);
+    }
+  });
+
+  it("rejects a slug another group already uses", () => {
+    expect(groupSlugProblem("homework", ["homework"])).toMatch(/already uses/);
   });
 });
