@@ -1,5 +1,13 @@
 import { createAdminClient } from "@/utils/supabase/client";
 import {
+  COLUMN_GROUP_FUNCTION,
+  columnGroupSlugArgument,
+  expandColumnGroup,
+  unknownColumnGroupError,
+  type ColumnGroupMember,
+  type ColumnGroupRef
+} from "@/supabase/functions/gradebook-column-recalculate/expression/columnGroups";
+import {
   fetchDefaultGradeTargetStudentProfileId,
   fetchRubricCheckIdsRequiringTargetStudentProfileId,
   resolveTargetStudentProfileIdForRubricComment
@@ -2760,8 +2768,9 @@ export async function createAssignmentsAndGradebookColumns({
   function extractDependenciesFromExpression(
     expr: string,
     availableAssignments: Array<{ id: number; slug: string }>,
-    availableColumns: Array<{ id: number; slug: string }>
-  ): { assignments?: number[]; gradebook_columns?: number[] } | null {
+    availableColumns: Array<{ id: number; slug: string }>,
+    membership: { groups: ColumnGroupRef[]; columns: ColumnGroupMember[] }
+  ): { assignments?: number[]; gradebook_columns?: number[]; gradebook_column_groups?: number[] } | null {
     if (!expr) return null;
 
     const math = create(all);
@@ -2779,6 +2788,17 @@ export async function createAssignmentsAndGradebookColumns({
         if (node.type === "FunctionNode") {
           const functionNode = node as FunctionNode;
           const functionName = functionNode.fn.name;
+          if (functionName === COLUMN_GROUP_FUNCTION) {
+            const groupSlug = columnGroupSlugArgument(functionNode);
+            const expanded = expandColumnGroup({ groupSlug, ...membership });
+            if (!expanded) {
+              errors.push(unknownColumnGroupError(groupSlug));
+              return;
+            }
+            (dependencies["gradebook_column_groups"] ??= new Set()).add(expanded.groupId);
+            for (const id of expanded.columnIds) (dependencies["gradebook_columns"] ??= new Set()).add(id);
+            return;
+          }
           if (functionName in availableDependencies) {
             const args = functionNode.args;
             const firstArg = args[0];
@@ -2846,7 +2866,7 @@ export async function createAssignmentsAndGradebookColumns({
     slug: string;
     max_score?: number;
     score_expression?: string;
-    dependencies?: { assignments?: number[]; gradebook_columns?: number[] };
+    dependencies?: { assignments?: number[]; gradebook_columns?: number[]; gradebook_column_groups?: number[] };
     released?: boolean;
     instructor_only?: boolean;
     position_in_group?: number;
@@ -2879,7 +2899,15 @@ export async function createAssignmentsAndGradebookColumns({
 
     const { data: existingColumns } = await (rateLimitManager ?? DEFAULT_RATE_LIMIT_MANAGER).trackAndLimit(
       "gradebook_columns",
-      () => supabase.from("gradebook_columns").select("id, slug").eq("class_id", class_id)
+      () =>
+        supabase
+          .from("gradebook_columns")
+          .select("id, slug, gradebook_column_group_id, position_in_group")
+          .eq("class_id", class_id)
+    );
+    const { data: existingGroups } = await (rateLimitManager ?? DEFAULT_RATE_LIMIT_MANAGER).trackAndLimit(
+      "gradebook_column_groups",
+      () => supabase.from("gradebook_column_groups").select("id, slug").eq("gradebook_id", gradebook.id)
     );
 
     // Filter out items with null slugs and cast to proper types
@@ -2895,7 +2923,10 @@ export async function createAssignmentsAndGradebookColumns({
     // Extract dependencies from score expression if not provided
     let finalDependencies = dependencies;
     if (score_expression && !dependencies) {
-      const extractedDeps = extractDependenciesFromExpression(score_expression, validAssignments, validColumns);
+      const extractedDeps = extractDependenciesFromExpression(score_expression, validAssignments, validColumns, {
+        groups: existingGroups ?? [],
+        columns: existingColumns ?? []
+      });
       if (extractedDeps) {
         finalDependencies = extractedDeps;
       }

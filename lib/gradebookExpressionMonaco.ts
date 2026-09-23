@@ -2,7 +2,8 @@
 
 /**
  * Monaco integration for the gradebook Expression Builder: custom language,
- * completion (built-ins + slug-aware `gradebook_columns("…")`), and hover from
+ * completion (built-ins + slug-aware `gradebook_columns("…")` and
+ * `gradebook_column_group("…")`), and hover from
  * {@link IntermediateValue} spans.
  */
 import type { IntermediateValue } from "@/lib/gradebookExpressionTester";
@@ -26,6 +27,13 @@ export const GRADEBOOK_BUILTIN_FUNCTIONS: GradebookBuiltinFunction[] = [
     description:
       "Looks up one or more gradebook columns by slug (glob patterns allowed). Returns a value object (use `.score`, etc.) or an array when multiple columns match.",
     insertText: 'gradebook_columns("${1:slug}")'
+  },
+  {
+    name: "gradebook_column_group",
+    signature: 'gradebook_column_group("group-slug")',
+    description:
+      "The columns in a group, in display order; excludes the column being defined. Returns an array for mean, sum, drop_lowest and countif, and follows the group as columns are added or moved.",
+    insertText: 'gradebook_column_group("${1:group-slug}")'
   },
   {
     name: "assignments",
@@ -190,6 +198,7 @@ export type GradebookSlugColumn = { slug: string; detail?: string };
 
 export type GradebookMonacoProviderOpts = {
   getColumnSlugs: () => GradebookSlugColumn[];
+  getGroupSlugs: () => GradebookSlugColumn[];
   getIntermediates: () => IntermediateValue[];
 };
 
@@ -301,14 +310,20 @@ export function isOffsetInsideStringLiteral(text: string, offset: number): boole
 }
 
 /**
- * If `offset` is inside the first string argument of `gradebook_columns(`, returns
- * replacement range (0-based offsets) and filter text for column slug completion.
+ * If `offset` is inside the first string argument of `gradebook_columns(` or
+ * `gradebook_column_group(`, returns which one, the replacement range (0-based offsets)
+ * and the filter text for slug completion.
  */
 export function getGradebookColumnsSlugStringContext(
   text: string,
   offset: number
-): { replaceStart: number; replaceEnd: number; filter: string } | null {
-  const callRe = /\bgradebook_columns\s*\(/g;
+): {
+  kind: "gradebook_columns" | "gradebook_column_group";
+  replaceStart: number;
+  replaceEnd: number;
+  filter: string;
+} | null {
+  const callRe = /\b(gradebook_columns|gradebook_column_group)\s*\(/g;
   let m: RegExpExecArray | null;
   while ((m = callRe.exec(text)) !== null) {
     const openParen = m.index + m[0].length - 1;
@@ -319,6 +334,7 @@ export function getGradebookColumnsSlugStringContext(
       offset >= contentStart && (contentEndClosed === null ? offset <= text.length : offset < contentEndClosed);
     if (inside) {
       return {
+        kind: m[1] as "gradebook_columns" | "gradebook_column_group",
         replaceStart: contentStart,
         replaceEnd: offset,
         filter: text.slice(contentStart, offset)
@@ -336,7 +352,7 @@ export function getSlugStringCompletionContext(
   offset: number
 ): { kind: "gradebook_columns" | "assignments"; replaceStart: number; replaceEnd: number; filter: string } | null {
   const gc = getGradebookColumnsSlugStringContext(text, offset);
-  if (gc) return { kind: "gradebook_columns", ...gc };
+  if (gc?.kind === "gradebook_columns") return { ...gc, kind: "gradebook_columns" };
   return null;
 }
 
@@ -390,12 +406,13 @@ export function registerGradebookExpressionCompletionProvider(
       const gcSlug = getGradebookColumnsSlugStringContext(text, offset);
 
       if (gcSlug) {
-        const { replaceStart, replaceEnd, filter } = gcSlug;
+        const { kind, replaceStart, replaceEnd, filter } = gcSlug;
         const startPos = modelPositionAt(model, replaceStart);
         const endPos = modelPositionAt(model, replaceEnd);
         const range = new monaco.Range(startPos.lineNumber, startPos.column, endPos.lineNumber, endPos.column);
         const fl = filter.toLowerCase();
-        const list = opts.getColumnSlugs().filter((c) => !fl || c.slug.toLowerCase().includes(fl));
+        const slugs = kind === "gradebook_column_group" ? opts.getGroupSlugs() : opts.getColumnSlugs();
+        const list = slugs.filter((c) => !fl || c.slug.toLowerCase().includes(fl));
 
         return {
           suggestions: list.map((item) => ({

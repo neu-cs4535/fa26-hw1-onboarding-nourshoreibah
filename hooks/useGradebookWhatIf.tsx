@@ -18,6 +18,11 @@ import {
   COMMON_CONTEXT_FUNCTIONS
 } from "@/supabase/functions/gradebook-column-recalculate/expression/commonMathFunctions";
 import type { IncompleteValuesAdvice } from "@/supabase/functions/gradebook-column-recalculate/expression/shared";
+import {
+  columnGroupCallSlugs,
+  slugListArgument,
+  UnknownColumnGroupError
+} from "@/supabase/functions/gradebook-column-recalculate/expression/columnGroups";
 
 const TRACE_WHAT_IF_CALCULATIONS = false;
 
@@ -449,12 +454,13 @@ export class GradebookWhatIfController {
             return matchingColumns.map((col) => scoreForColumnID(col.id));
           }
         };
-        if (Array.isArray(columnSlug)) {
-          const ret = columnSlug.map(findOne);
+        const slugList = slugListArgument(columnSlug);
+        if (slugList) {
+          const ret = slugList.map(findOne);
           return ret;
         } else {
-          const ret = findOne(columnSlug);
-          if (ret && !columnSlug.includes("*")) {
+          const ret = findOne(columnSlug as string);
+          if (ret && !(columnSlug as string).includes("*")) {
             return ret;
           }
           if (Array.isArray(ret)) {
@@ -497,7 +503,25 @@ export class GradebookWhatIfController {
 
       math.import(imports, { override: true });
       if (column.score_expression) {
-        const expr = math.parse(column.score_expression);
+        const membership = {
+          groups: this.gradebookController.gradebook_column_groups.rows ?? [],
+          columns: allColumns
+        };
+        const expr = math.parse(column.score_expression).transform((node: MathNode) => {
+          let slugs: string[] | null;
+          try {
+            slugs = columnGroupCallSlugs(node, membership, columnId);
+          } catch (e) {
+            // RLS hides a group from students until it holds a column they can see, so an
+            // unknown group here is one with no visible members. A malformed call still fails.
+            if (!(e instanceof UnknownColumnGroupError)) throw e;
+            slugs = [];
+          }
+          if (!slugs) return node;
+          return new math.FunctionNode("gradebook_columns", [
+            new math.ArrayNode(slugs.map((slug) => new math.ConstantNode(slug)))
+          ]);
+        });
         //instrument the functions that are called with a context object as the first argument
         const instrumented = expr.transform((node: MathNode) => {
           if (node.type === "FunctionNode") {

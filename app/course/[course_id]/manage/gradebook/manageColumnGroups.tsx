@@ -2,8 +2,9 @@
 
 import { toaster } from "@/components/ui/toaster";
 import { useGradebookColumnGroups, useGradebookColumns, useGradebookController } from "@/hooks/useGradebook";
+import { groupSlugProblem, slugForGroupName } from "@/lib/gradebookColumnGroups";
 import { createClient } from "@/utils/supabase/client";
-import { Button, Dialog, HStack, Icon, IconButton, Input, Portal, Table, Text, VStack } from "@chakra-ui/react";
+import { Button, Code, Dialog, HStack, Icon, IconButton, Input, Portal, Table, Text, VStack } from "@chakra-ui/react";
 import { useCallback, useMemo, useState } from "react";
 import { LuChevronDown, LuChevronUp, LuPlus, LuTrash2 } from "react-icons/lu";
 
@@ -70,14 +71,17 @@ export default function ManageColumnGroupsDialog() {
         class_id: gradebookController.class_id,
         gradebook_id: gradebookController.gradebook_id,
         name,
-        slug: `group-${Date.now()}`,
+        slug: slugForGroupName(
+          name,
+          groups.map((g) => g.slug)
+        ),
         sort_order: nextSortOrder,
         name_is_auto: false
       });
       if (error) throw error;
       setNewGroupName("");
     });
-  }, [newGroupName, run, supabase, gradebookController, nextSortOrder]);
+  }, [newGroupName, run, supabase, gradebookController, nextSortOrder, groups]);
 
   const rename = useCallback(
     async (id: number, name: string) => {
@@ -87,6 +91,27 @@ export default function ManageColumnGroupsDialog() {
       });
     },
     [run, supabase]
+  );
+
+  const changeSlug = useCallback(
+    async (id: number, slug: string): Promise<boolean> => {
+      const problem = groupSlugProblem(
+        slug,
+        groups.filter((g) => g.id !== id).map((g) => g.slug)
+      );
+      if (problem) {
+        toaster.error({ title: "Could not change the slug", description: problem });
+        return false;
+      }
+      let saved = false;
+      await run("Slug changed", async () => {
+        const { error } = await supabase.from("gradebook_column_groups").update({ slug }).eq("id", id);
+        if (error) throw error;
+        saved = true;
+      });
+      return saved;
+    },
+    [groups, run, supabase]
   );
 
   const move = useCallback(
@@ -150,6 +175,7 @@ export default function ManageColumnGroupsDialog() {
                   <Table.Header>
                     <Table.Row>
                       <Table.ColumnHeader>Group</Table.ColumnHeader>
+                      <Table.ColumnHeader>Slug</Table.ColumnHeader>
                       <Table.ColumnHeader>Columns</Table.ColumnHeader>
                       <Table.ColumnHeader>Order</Table.ColumnHeader>
                       <Table.ColumnHeader />
@@ -167,6 +193,23 @@ export default function ManageColumnGroupsDialog() {
                             onBlur={(e) => {
                               const next = e.target.value.trim();
                               if (next && next !== group.name) rename(group.id, next);
+                            }}
+                          />
+                        </Table.Cell>
+                        <Table.Cell>
+                          <Input
+                            key={group.slug}
+                            size="sm"
+                            fontFamily="mono"
+                            spellCheck={false}
+                            defaultValue={group.slug}
+                            aria-label={`Slug of group ${group.name}`}
+                            disabled={busy}
+                            onBlur={async (e) => {
+                              const input = e.currentTarget;
+                              const next = input.value.trim();
+                              if (next === group.slug) return;
+                              if (!(await changeSlug(group.id, next))) input.value = group.slug;
                             }}
                           />
                         </Table.Cell>
@@ -219,7 +262,9 @@ export default function ManageColumnGroupsDialog() {
                 </Table.Root>
 
                 <Text fontSize="xs" color="fg.muted">
-                  Deleting a group moves its columns to Ungrouped; it never deletes a column.
+                  Deleting a group moves its columns to Ungrouped; it never deletes a column. A score expression names a
+                  group by its slug, e.g. <Code>mean(gradebook_column_group(&quot;homework&quot;))</Code>, so a slug
+                  that an expression uses cannot be changed, and its group cannot be deleted.
                 </Text>
               </VStack>
             </Dialog.Body>

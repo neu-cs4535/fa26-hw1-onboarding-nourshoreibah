@@ -11,6 +11,7 @@ import {
   setRowOverrideValues,
   clearRowOverrideValues
 } from "./expression/DependencySource.ts";
+import { columnGroupCallSlugs } from "./expression/columnGroups.ts";
 import * as Sentry from "npm:@sentry/deno@10.10.0";
 
 const DEBUG_LOG = Boolean(Deno.env.get("DEBUG_GRADEBOOK_CALCULATION")) || false;
@@ -742,7 +743,7 @@ export async function processGradebookRowsCalculation(
 ): Promise<Map<string, RowUpdate[]>> {
   const loaded = await loadOrderedColumns(adminSupabase, scope, gradebook_id);
   if (!loaded) return new Map();
-  const { columns } = loaded;
+  const { columns, groups } = loaded;
 
   const math = create(all, {});
   // Build keys for all students in this batch
@@ -768,7 +769,26 @@ export async function processGradebookRowsCalculation(
   for (const c of columns as unknown as ColumnWithPrefix[]) {
     if (!c.score_expression) continue;
     const theScoreExpression = (c.gradebooks.expression_prefix ?? "") + "\n" + c.score_expression;
-    const expr = math.parse(theScoreExpression);
+    let expr: MathNode;
+    try {
+      expr = math.parse(theScoreExpression).transform((node: MathNode) => {
+        const slugs = columnGroupCallSlugs(node, { groups, columns }, c.id);
+        if (!slugs) return node;
+        return new math.FunctionNode("gradebook_columns", [
+          new math.ArrayNode(slugs.map((slug) => new math.ConstantNode(slug)))
+        ]);
+      });
+    } catch (e) {
+      // Surface the error on this column's cells instead of failing the whole batch.
+      const error = e instanceof Error ? e : new Error(String(e));
+      Sentry.captureException(error, scope);
+      compiledById.set(c.id, {
+        evaluate: () => {
+          throw error;
+        }
+      } as unknown as EvalFunction);
+      continue;
+    }
     const instrumented = expr.transform((node: MathNode) => {
       if (node.type === "FunctionNode") {
         const fn = node as FunctionNode;

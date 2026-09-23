@@ -11855,6 +11855,10 @@ export type Database = {
         Args: { p_submission_id: number };
         Returns: string[];
       };
+      _gradebook_column_group_assert_unreferenced: {
+        Args: { p_action: string; p_group_id: number };
+        Returns: undefined;
+      };
       _gradebook_column_group_for_slug: {
         Args: { p_class_id: number; p_gradebook_id: number; p_slug: string };
         Returns: number;

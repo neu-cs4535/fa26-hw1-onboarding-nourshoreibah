@@ -3,7 +3,12 @@
 import { Label } from "@/components/ui/label";
 import { useColorMode } from "@/components/ui/color-mode";
 import { useAllStudentRoles } from "@/hooks/useCourseController";
-import { useGradebookColumns, useGradebookController, useGradebookExpressionPrefix } from "@/hooks/useGradebook";
+import {
+  useGradebookColumnGroups,
+  useGradebookColumns,
+  useGradebookController,
+  useGradebookExpressionPrefix
+} from "@/hooks/useGradebook";
 import {
   evaluateForStudent,
   evaluateRenderExpression,
@@ -25,6 +30,7 @@ import type * as MathJSType from "mathjs";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LuArrowLeftRight, LuCheck, LuCircleAlert, LuMaximize2, LuMinimize2, LuUser } from "react-icons/lu";
 import type { GradebookColumn } from "@/utils/supabase/DatabaseTypes";
+import type { GradebookColumnGroup } from "@/lib/gradebookColumnGroups";
 
 const ExpressionMonacoEditor = dynamic(() => import("@monaco-editor/react").then((mod) => mod.default), {
   ssr: false,
@@ -104,6 +110,7 @@ export function ExpressionBuilder(props: Props) {
   } = props;
   const gradebookController = useGradebookController();
   const gradebookColumns = useGradebookColumns();
+  const columnGroups = useGradebookColumnGroups();
   const { math: fallbackMath, loadError: mathLoadError } = useLoadedMathJS();
   const math = props.math ?? fallbackMath;
   const students = useAllStudentRoles();
@@ -133,11 +140,14 @@ export function ExpressionBuilder(props: Props) {
     }
   }, [isExpanded, sortedStudents, selectedStudentId]);
 
-  // Recompute when the set of column slugs changes so dependency validation
-  // stays current if another instructor adds/removes a column in the background.
+  // Recompute when the set of column slugs or group memberships changes so dependency
+  // validation stays current if another instructor edits the gradebook in the background.
   const gradebookColumnsKey = useMemo(
-    () => gradebookColumns.map((c) => `${c.id}:${c.slug ?? ""}`).join("|"),
-    [gradebookColumns]
+    () =>
+      gradebookColumns.map((c) => `${c.id}:${c.slug ?? ""}:${c.gradebook_column_group_id}`).join("|") +
+      "#" +
+      columnGroups.map((g) => `${g.id}:${g.slug}`).join("|"),
+    [gradebookColumns, columnGroups]
   );
 
   /**
@@ -389,6 +399,7 @@ export function ExpressionBuilder(props: Props) {
             validation={validation}
             hasStudent={Boolean(selectedStudentId)}
             gradebookColumns={gradebookColumns}
+            columnGroups={columnGroups}
           />
 
           <ValidationStatus validation={validation} expression={expression} />
@@ -480,13 +491,15 @@ function InlineLineAnnotatedEditor({
   onExpressionChange,
   validation,
   hasStudent,
-  gradebookColumns
+  gradebookColumns,
+  columnGroups
 }: {
   expression: string;
   onExpressionChange: (value: string) => void;
   validation: ValidationResult;
   hasStudent: boolean;
   gradebookColumns: GradebookColumn[];
+  columnGroups: GradebookColumnGroup[];
 }) {
   const { colorMode } = useColorMode();
   const monacoTheme = colorMode === "dark" ? "vs-dark" : "vs";
@@ -506,12 +519,16 @@ function InlineLineAnnotatedEditor({
     [gradebookColumns]
   );
 
+  const groupItems = useMemo(() => columnGroups.map((g) => ({ slug: g.slug, detail: g.name })), [columnGroups]);
+
   const providerDataRef = useRef({
     columns: columnItems,
+    groups: groupItems,
     intermediates: [] as IntermediateValue[]
   });
   providerDataRef.current = {
     columns: columnItems,
+    groups: groupItems,
     intermediates: evaluation?.intermediates ?? []
   };
 
@@ -564,6 +581,7 @@ function InlineLineAnnotatedEditor({
     providersDisposableRef.current?.dispose();
     providersDisposableRef.current = registerGradebookExpressionEditorFeatures(monaco, {
       getColumnSlugs: () => providerDataRef.current.columns,
+      getGroupSlugs: () => providerDataRef.current.groups,
       getIntermediates: () => providerDataRef.current.intermediates
     });
   }, []);

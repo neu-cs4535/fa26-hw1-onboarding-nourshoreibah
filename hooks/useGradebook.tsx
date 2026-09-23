@@ -1,6 +1,12 @@
 "use client";
 import { ClassRealTimeController } from "@/lib/ClassRealTimeController";
 import { sortColumnsForDisplay, type GradebookColumnGroup } from "@/lib/gradebookColumnGroups";
+import {
+  COLUMN_GROUP_FUNCTION,
+  columnGroupSlugArgument,
+  expandColumnGroup,
+  unknownColumnGroupError
+} from "@/supabase/functions/gradebook-column-recalculate/expression/columnGroups";
 import TableController, {
   fetchPostgrestAllPages,
   type BroadcastMessage,
@@ -1849,9 +1855,37 @@ export class GradebookController {
       assignments: this._assignments || [],
       gradebook_columns: this.gradebook_columns.rows
     };
+    const addDependency = (key: string, id: number) => {
+      if (!(key in dependencies)) {
+        dependencies[key] = new Set();
+      }
+      dependencies[key].add(id);
+    };
     exprNode.traverse((node: MathNode) => {
       if (node.type === "FunctionNode") {
         const functionName = (node as FunctionNode).fn.name;
+        if (functionName === COLUMN_GROUP_FUNCTION) {
+          let groupSlug: string;
+          try {
+            groupSlug = columnGroupSlugArgument(node as FunctionNode);
+          } catch (e) {
+            errors.push(e instanceof Error ? e.message : String(e));
+            return;
+          }
+          const expanded = expandColumnGroup({
+            groupSlug,
+            groups: this.gradebook_column_groups.rows ?? [],
+            columns: this.gradebook_columns.rows,
+            excludeColumnId: column_id
+          });
+          if (!expanded) {
+            errors.push(unknownColumnGroupError(groupSlug));
+            return;
+          }
+          addDependency("gradebook_column_groups", expanded.groupId);
+          expanded.columnIds.forEach((id) => addDependency("gradebook_columns", id));
+          return;
+        }
         if (functionName in availableDependencies) {
           const args = (node as FunctionNode).args;
           const argType = args[0].type;
@@ -1862,10 +1896,7 @@ export class GradebookController {
                 minimatch(d.slug!, argName)
               );
               if (matching.length > 0) {
-                if (!(functionName in dependencies)) {
-                  dependencies[functionName] = new Set();
-                }
-                matching.forEach((d) => dependencies[functionName].add(d.id));
+                matching.forEach((d) => addDependency(functionName, d.id));
               } else {
                 errors.push(`Invalid dependency: ${argName} for function ${functionName}`);
               }

@@ -22,6 +22,10 @@ import {
   pushMissingDependenciesToContext,
   type IncompleteValuesAdvice
 } from "@/supabase/functions/gradebook-column-recalculate/expression/shared";
+import {
+  columnGroupCallSlugs,
+  slugListArgument
+} from "@/supabase/functions/gradebook-column-recalculate/expression/columnGroups";
 import type { AssignmentNode, FunctionNode, MathNode } from "mathjs";
 import { minimatch } from "minimatch";
 import type { GradebookController } from "@/hooks/useGradebook";
@@ -428,11 +432,12 @@ function buildImports(math: MathJSInstance, gradebookController: GradebookContro
       return matchingColumns.map((c) => scoreForColumn(c.id));
     };
 
-    if (Array.isArray(slugInput)) {
-      return slugInput.map(findOne);
+    const slugList = slugListArgument(slugInput);
+    if (slugList) {
+      return slugList.map(findOne);
     }
-    const ret = findOne(slugInput);
-    if (ret && !slugInput.includes("*")) return ret;
+    const ret = findOne(slugInput as string);
+    if (ret && !(slugInput as string).includes("*")) return ret;
     if (Array.isArray(ret)) return ret;
     return [ret];
   }) as ImportFunction;
@@ -632,7 +637,22 @@ export function evaluateForStudent(params: {
   const localMath: MathJSInstance = math.create(math.all, {});
   buildImports(localMath, gradebookController, studentId);
 
-  const parsed = localMath.parse(trimmed);
+  // gradebook_column_group("x") becomes gradebook_columns([...member slugs]). The
+  // rewritten text is mapped back to the original call so hover spans still line up.
+  const groupCallRewrites: { rewritten: string; original: string }[] = [];
+  const membership = {
+    groups: gradebookController.gradebook_column_groups.rows ?? [],
+    columns: gradebookController.columns as ColumnWithEntries[]
+  };
+  const parsed = localMath.parse(trimmed).transform((node: MathNode) => {
+    const slugs = columnGroupCallSlugs(node, membership, editingColumnId);
+    if (!slugs) return node;
+    const rewritten = new localMath.FunctionNode("gradebook_columns", [
+      new localMath.ArrayNode(slugs.map((slug) => new localMath.ConstantNode(slug)))
+    ]);
+    groupCallRewrites.push({ rewritten: rewritten.toString(), original: node.toString() });
+    return rewritten;
+  });
   // For every context-aware function call, prepend the `context` symbol to
   // the argument list.
   //
@@ -824,7 +844,10 @@ export function evaluateForStudent(params: {
       // `sum(gradebook_columns("hw-*"))` stringify to
       // `sum(context, gradebook_columns(context, "hw-*"))` and we need to
       // clean both levels.
-      const pretty = source.replace(contextArgStrip, "$1(");
+      let pretty = source.replace(contextArgStrip, "$1(");
+      for (const { rewritten, original } of groupCallRewrites) {
+        pretty = pretty.split(rewritten).join(original);
+      }
 
       const searchFrom = nextSearchFromBySource.get(pretty) ?? 0;
       const span = findRawSpan(pretty, searchFrom);

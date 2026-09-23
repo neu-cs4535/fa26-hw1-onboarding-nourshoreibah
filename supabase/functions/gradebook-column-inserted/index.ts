@@ -4,13 +4,24 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 import type { Database } from "../_shared/SupabaseTypes.d.ts";
 import { all, create } from "npm:mathjs";
 import { minimatch } from "npm:minimatch";
+import {
+  COLUMN_GROUP_FUNCTION,
+  columnGroupSlugArgument,
+  expandColumnGroup,
+  type ColumnGroupMember,
+  type ColumnGroupRef
+} from "../gradebook-column-recalculate/expression/columnGroups.ts";
+
+type Dependencies = { assignments?: number[]; gradebook_columns?: number[]; gradebook_column_groups?: number[] };
 
 type ColumnRow = {
   id: number;
   slug: string | null;
   score_expression: string | null;
-  dependencies: { assignments?: number[]; gradebook_columns?: number[] } | null;
+  dependencies: Dependencies | null;
   max_score?: number | null;
+  gradebook_column_group_id: number;
+  position_in_group: number;
 };
 
 type AssignmentRow = { id: number; slug: string | null };
@@ -18,8 +29,9 @@ type AssignmentRow = { id: number; slug: string | null };
 function extractDependenciesFromExpression(
   expr: string,
   availableAssignments: Array<{ id: number; slug: string }>,
-  availableColumns: Array<{ id: number; slug: string }>
-): { assignments?: number[]; gradebook_columns?: number[] } | null {
+  availableColumns: Array<{ id: number; slug: string }>,
+  membership: { groups: ColumnGroupRef[]; columns: ColumnGroupMember[]; columnId: number }
+): Dependencies | null {
   if (!expr) return null;
 
   const math = create(all);
@@ -30,6 +42,26 @@ function extractDependenciesFromExpression(
     (node: { type: string; fn?: { name: string }; args?: Array<{ type: string; value?: unknown }> }) => {
       if (node.type === "FunctionNode" && node.fn) {
         const functionName = node.fn.name;
+        if (functionName === COLUMN_GROUP_FUNCTION) {
+          let groupSlug: string;
+          try {
+            groupSlug = columnGroupSlugArgument(node);
+          } catch {
+            return;
+          }
+          const expanded = expandColumnGroup({
+            groupSlug,
+            groups: membership.groups,
+            columns: membership.columns,
+            excludeColumnId: membership.columnId
+          });
+          if (!expanded) return;
+          (dependencies["gradebook_column_groups"] ??= new Set<number>()).add(expanded.groupId);
+          for (const id of expanded.columnIds) {
+            (dependencies["gradebook_columns"] ??= new Set<number>()).add(id);
+          }
+          return;
+        }
         if (functionName === "assignments" || functionName === "gradebook_columns") {
           const args = node.args ?? [];
           if (args[0]?.type === "ConstantNode") {
@@ -52,16 +84,17 @@ function extractDependenciesFromExpression(
   for (const [fn, ids] of Object.entries(dependencies)) {
     flattened[fn] = Array.from(ids);
   }
-  return Object.keys(flattened).length === 0
-    ? null
-    : (flattened as { assignments?: number[]; gradebook_columns?: number[] });
+  return Object.keys(flattened).length === 0 ? null : (flattened as Dependencies);
 }
 
-function normalized(dep: { assignments?: number[]; gradebook_columns?: number[] } | null) {
+function normalized(dep: Dependencies | null) {
   if (!dep) return null;
-  const copy: { assignments?: number[]; gradebook_columns?: number[] } = {};
+  const copy: Dependencies = {};
   if (dep.assignments) copy.assignments = [...new Set(dep.assignments)].sort((a, b) => a - b);
   if (dep.gradebook_columns) copy.gradebook_columns = [...new Set(dep.gradebook_columns)].sort((a, b) => a - b);
+  if (dep.gradebook_column_groups) {
+    copy.gradebook_column_groups = [...new Set(dep.gradebook_column_groups)].sort((a, b) => a - b);
+  }
   return copy;
 }
 
@@ -121,10 +154,14 @@ Deno.serve(async (req) => {
 
   const { data: allColumns, error: columnsError } = await admin
     .from("gradebook_columns")
-    .select("id, slug, score_expression, dependencies, max_score")
+    .select("id, slug, score_expression, dependencies, max_score, gradebook_column_group_id, position_in_group")
+    .eq("gradebook_id", gradebookId);
+  const { data: groups, error: groupsError } = await admin
+    .from("gradebook_column_groups")
+    .select("id, slug")
     .eq("gradebook_id", gradebookId);
 
-  if (columnsError || !allColumns) {
+  if (columnsError || !allColumns || groupsError || !groups) {
     return new Response(JSON.stringify({ error: "Failed to load gradebook columns" }), {
       headers: { "Content-Type": "application/json" },
       status: 500
@@ -154,7 +191,11 @@ Deno.serve(async (req) => {
   let updated = 0;
   for (const col of targetColumns) {
     const expr = col.score_expression as string;
-    const deps = extractDependenciesFromExpression(expr, validAssignments, validColumns);
+    const deps = extractDependenciesFromExpression(expr, validAssignments, validColumns, {
+      groups,
+      columns: allColumns as ColumnRow[],
+      columnId: col.id
+    });
     const current = normalized(col.dependencies);
     const next = normalized(deps);
     const changed = JSON.stringify(current) !== JSON.stringify(next);

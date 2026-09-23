@@ -21,6 +21,12 @@ import * as mathjs from "mathjs";
 import { minimatch } from "minimatch";
 
 import { evaluateForStudent, formatValueForOverlay, type IntermediateValue } from "@/lib/gradebookExpressionTester";
+import {
+  COLUMN_GROUP_FUNCTION,
+  columnGroupSlugArgument,
+  expandColumnGroup,
+  unknownColumnGroupError
+} from "@/supabase/functions/gradebook-column-recalculate/expression/columnGroups";
 import type { GradebookColumnStudent } from "@/utils/supabase/DatabaseTypes";
 
 type ColumnSpec = {
@@ -72,11 +78,16 @@ function createFakeController(params: {
   const { class_id = 1, columns, assignments = [], groups = [], entries } = params;
   const columnById = new Map(columns.map((c) => [c.id, c]));
   const columnBySlug = new Map(columns.map((c) => [c.slug, c]));
+  const groupMembers = columns.map((c) => ({
+    ...c,
+    gradebook_column_group_id: c.gradebook_column_group_id ?? 0,
+    position_in_group: c.position_in_group ?? 0
+  }));
 
   return {
     class_id,
     get columns() {
-      return columns;
+      return groupMembers;
     },
     get assignments() {
       return assignments;
@@ -114,8 +125,8 @@ function createFakeController(params: {
     },
     /**
      * Minimal port of the real `extractAndValidateDependencies`: parse the
-     * expression, walk any `gradebook_columns(...)` / `assignments(...)`
-     * calls with string-literal args, and error out if the slug doesn't
+     * expression, walk any `gradebook_columns(...)` / `assignments(...)` /
+     * `gradebook_column_group(...)` calls with string-literal args, and error out if the slug doesn't
      * match anything in the fixture. Keeps the test self-contained (no need
      * to import the full GradebookController).
      */
@@ -129,6 +140,13 @@ function createFakeController(params: {
       node.traverse((n) => {
         if (n.type !== "FunctionNode") return;
         const fn = n as mathjs.FunctionNode;
+        if (fn.fn.name === COLUMN_GROUP_FUNCTION) {
+          const groupSlug = columnGroupSlugArgument(fn);
+          const expanded = expandColumnGroup({ groupSlug, groups, columns: groupMembers, excludeColumnId: column_id });
+          if (!expanded) errors.push(unknownColumnGroupError(groupSlug));
+          else expanded.columnIds.forEach((id) => deps.gradebook_columns.add(id));
+          return;
+        }
         if (fn.fn.name !== "gradebook_columns" && fn.fn.name !== "assignments") return;
         const arg = fn.args[0];
         if (!arg || arg.type !== "ConstantNode") return;

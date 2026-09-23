@@ -69,6 +69,34 @@ export function visibleGroupsInOrder<T extends GroupableColumn>(
   return groups.filter((g) => populated.has(g.id)).sort((a, b) => a.sort_order - b.sort_order || a.id - b.id);
 }
 
+/** Group slugs are what score expressions name, e.g. gradebook_column_group("homework"). */
+export const GROUP_SLUG_PATTERN = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+
+/** A slug for a new group: the name lowercased to [a-z0-9-], suffixed -2, -3... until unused. */
+export function slugForGroupName(name: string, existingSlugs: Iterable<string>): string {
+  const taken = new Set(existingSlugs);
+  const base =
+    name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "group";
+  if (!taken.has(base)) return base;
+  let n = 2;
+  while (taken.has(`${base}-${n}`)) n++;
+  return `${base}-${n}`;
+}
+
+/** Why `slug` cannot be a group's slug, or null when it can. */
+export function groupSlugProblem(slug: string, otherSlugs: Iterable<string>): string | null {
+  if (!GROUP_SLUG_PATTERN.test(slug)) {
+    return "Use lowercase letters, digits and single hyphens, e.g. homework or lab-reports";
+  }
+  for (const other of otherSlugs) {
+    if (other === slug) return `Another group already uses the slug ${slug}`;
+  }
+  return null;
+}
+
 export async function resolveGroupForSlug(
   client: SupabaseClient<Database>,
   gradebookId: number,
