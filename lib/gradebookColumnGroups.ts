@@ -115,65 +115,81 @@ export async function resolveGroupForSlug(
   return data;
 }
 
-export type ColumnDragPlan =
+export type ColumnDropPlan =
   | { kind: "noop" }
-  | { kind: "reorder-groups"; orderedGroupIds: number[] }
   | { kind: "reorder-in-group"; groupId: number; orderedColumnIds: number[] }
   | { kind: "move-column"; columnId: number; groupId: number; position: number };
 
-export function planColumnDrag(args: {
+/**
+ * What dropping a column does. The drop target is explicit, a group and the column to land before
+ * (null for the end of the group), so a drop at the boundary between two groups is never read as
+ * reordering the groups: that has its own handle on the group header.
+ */
+export function planColumnDrop(args: {
   orderedColumnIds: readonly number[];
   groupIdByColumnId: ReadonlyMap<number, number>;
-  /** Every non-default group of the gradebook in its current order, including groups with no columns. */
-  currentGroupOrder: readonly number[];
-  defaultGroupId: number | null;
   draggedColumnId: number;
-}): ColumnDragPlan {
-  const { orderedColumnIds, groupIdByColumnId, currentGroupOrder, defaultGroupId, draggedColumnId } = args;
+  target: { groupId: number; beforeColumnId: number | null };
+}): ColumnDropPlan {
+  const { orderedColumnIds, groupIdByColumnId, draggedColumnId, target } = args;
+  const sourceGroupId = groupIdByColumnId.get(draggedColumnId);
+  if (sourceGroupId === undefined) return { kind: "noop" };
 
-  const groupSequence = orderedColumnIds
-    .map((id) => groupIdByColumnId.get(id))
-    .filter((g): g is number => g !== undefined);
+  const members = orderedColumnIds.filter(
+    (id) => id !== draggedColumnId && groupIdByColumnId.get(id) === target.groupId
+  );
+  const beforeIndex = target.beforeColumnId === null ? -1 : members.indexOf(target.beforeColumnId);
+  const position = beforeIndex === -1 ? members.length : beforeIndex;
 
-  const impliedGroupOrder: number[] = [];
-  for (const g of groupSequence) {
-    if (!impliedGroupOrder.includes(g)) impliedGroupOrder.push(g);
+  if (sourceGroupId !== target.groupId) {
+    return { kind: "move-column", columnId: draggedColumnId, groupId: target.groupId, position };
   }
 
-  const broken = impliedGroupOrder.filter((g) => {
-    const first = groupSequence.indexOf(g);
-    const last = groupSequence.lastIndexOf(g);
-    for (let i = first; i <= last; i++) {
-      if (groupSequence[i] !== g) return true;
-    }
-    return false;
-  });
+  const current = orderedColumnIds.filter((id) => groupIdByColumnId.get(id) === target.groupId);
+  const next = [...members.slice(0, position), draggedColumnId, ...members.slice(position)];
+  if (next.every((id, i) => id === current[i])) return { kind: "noop" };
+  return { kind: "reorder-in-group", groupId: target.groupId, orderedColumnIds: next };
+}
 
-  if (broken.length > 0) {
-    const index = orderedColumnIds.indexOf(draggedColumnId);
-    const neighbour = groupSequence[index - 1] ?? groupSequence[index + 1] ?? groupIdByColumnId.get(draggedColumnId);
-    if (neighbour === undefined) return { kind: "noop" };
-    const position = orderedColumnIds.slice(0, index).filter((id) => groupIdByColumnId.get(id) === neighbour).length;
-    return { kind: "move-column", columnId: draggedColumnId, groupId: neighbour, position };
+export type ColumnLayoutPatch = {
+  id: number;
+  values: { gradebook_column_group_id?: number; position_in_group: number };
+};
+
+/**
+ * The column rows a drop plan changes, renumbered the way the database leaves them: every column
+ * of each affected group gets a dense position in its new order. Used to move the table before the
+ * save returns.
+ */
+export function columnLayoutPatches(args: {
+  plan: ColumnDropPlan;
+  orderedColumnIds: readonly number[];
+  groupIdByColumnId: ReadonlyMap<number, number>;
+}): ColumnLayoutPatch[] {
+  const { plan, orderedColumnIds, groupIdByColumnId } = args;
+  if (plan.kind === "noop") return [];
+  if (plan.kind === "reorder-in-group") {
+    return plan.orderedColumnIds.map((id, position) => ({ id, values: { position_in_group: position } }));
   }
+  const sourceGroupId = groupIdByColumnId.get(plan.columnId);
+  const source = orderedColumnIds.filter((id) => id !== plan.columnId && groupIdByColumnId.get(id) === sourceGroupId);
+  const target = orderedColumnIds.filter((id) => id !== plan.columnId && groupIdByColumnId.get(id) === plan.groupId);
+  target.splice(Math.min(plan.position, target.length), 0, plan.columnId);
+  return [
+    ...source.map((id, position) => ({ id, values: { position_in_group: position } })),
+    ...target.map((id, position) => ({
+      id,
+      values:
+        id === plan.columnId
+          ? { gradebook_column_group_id: plan.groupId, position_in_group: position }
+          : { position_in_group: position }
+    }))
+  ];
+}
 
-  // The default group is pinned last, so only the order of the other groups that have columns can change.
-  const known = new Set(currentGroupOrder);
-  const impliedMovable = impliedGroupOrder.filter((g) => g !== defaultGroupId && known.has(g));
-  const shown = new Set(impliedMovable);
-  const slots = currentGroupOrder.flatMap((g, i) => (shown.has(g) ? [i] : []));
-  const groupOrderChanged = impliedMovable.some((g, k) => g !== currentGroupOrder[slots[k]]);
-  if (groupOrderChanged) {
-    const orderedGroupIds = [...currentGroupOrder];
-    slots.forEach((slot, k) => {
-      orderedGroupIds[slot] = impliedMovable[k];
-    });
-    return { kind: "reorder-groups", orderedGroupIds };
-  }
-
-  const groupId = groupIdByColumnId.get(draggedColumnId);
-  if (groupId === undefined) return { kind: "noop" };
-  const inGroup = orderedColumnIds.filter((id) => groupIdByColumnId.get(id) === groupId);
-  if (inGroup.length < 2) return { kind: "noop" };
-  return { kind: "reorder-in-group", groupId, orderedColumnIds: inGroup };
+/** Group rows a reorder changes: sort_order follows the new order; the default group keeps its pin. */
+export function groupOrderPatches(
+  orderedGroupIds: readonly number[]
+): { id: number; values: { sort_order: number } }[] {
+  return orderedGroupIds.map((id, sort_order) => ({ id, values: { sort_order } }));
 }

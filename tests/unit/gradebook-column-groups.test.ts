@@ -2,7 +2,7 @@ import {
   buildColumnGroupKeyMap,
   buildGroupedColumns,
   groupKey,
-  planColumnDrag,
+  planColumnDrop,
   sortColumnsForDisplay,
   visibleGroupsInOrder,
   type GradebookColumnGroup
@@ -94,61 +94,7 @@ describe("grouping", () => {
   });
 });
 
-describe("what a drag turned out to mean", () => {
-  const groupIdByColumnId = new Map([
-    [11, 1],
-    [12, 1],
-    [21, 2],
-    [22, 2]
-  ]);
-  const currentGroupOrder = [1, 2];
-
-  it("reads a swap inside one group as an in-group reorder", () => {
-    const plan = planColumnDrag({
-      orderedColumnIds: [12, 11, 21, 22],
-      groupIdByColumnId,
-      currentGroupOrder,
-      defaultGroupId: null,
-      draggedColumnId: 12
-    });
-    expect(plan).toEqual({ kind: "reorder-in-group", groupId: 1, orderedColumnIds: [12, 11] });
-  });
-
-  it("reads a whole group moving past another as a group reorder", () => {
-    const plan = planColumnDrag({
-      orderedColumnIds: [21, 22, 11, 12],
-      groupIdByColumnId,
-      currentGroupOrder,
-      defaultGroupId: null,
-      draggedColumnId: 21
-    });
-    expect(plan).toEqual({ kind: "reorder-groups", orderedGroupIds: [2, 1] });
-  });
-
-  it("reads a column landing among another group's columns as a move, never a reorder", () => {
-    const plan = planColumnDrag({
-      orderedColumnIds: [11, 21, 12, 22],
-      groupIdByColumnId,
-      currentGroupOrder,
-      defaultGroupId: null,
-      draggedColumnId: 21
-    });
-    expect(plan).toEqual({ kind: "move-column", columnId: 21, groupId: 1, position: 1 });
-  });
-
-  it("leaves an unchanged order alone", () => {
-    const plan = planColumnDrag({
-      orderedColumnIds: [11, 12, 21, 22],
-      groupIdByColumnId,
-      currentGroupOrder,
-      defaultGroupId: null,
-      draggedColumnId: 11
-    });
-    expect(plan).toEqual({ kind: "reorder-in-group", groupId: 1, orderedColumnIds: [11, 12] });
-  });
-});
-
-describe("dragging with an empty group and a populated default group", () => {
+describe("what dropping a column does", () => {
   const DEFAULT = 99;
   const groupIdByColumnId = new Map([
     [11, 1],
@@ -156,89 +102,45 @@ describe("dragging with an empty group and a populated default group", () => {
     [21, 2],
     [22, 2],
     [31, 3],
-    [91, DEFAULT],
-    [92, DEFAULT]
+    [41, 4],
+    [91, DEFAULT]
   ]);
-  // Group 5 has no columns and sits between 1 and 2.
-  const currentGroupOrder = [1, 5, 2, 3];
-  const base = { groupIdByColumnId, currentGroupOrder, defaultGroupId: DEFAULT };
+  const orderedColumnIds = [11, 12, 21, 22, 31, 41, 91];
+  const drop = (draggedColumnId: number, groupId: number, beforeColumnId: number | null) =>
+    planColumnDrop({ orderedColumnIds, groupIdByColumnId, draggedColumnId, target: { groupId, beforeColumnId } });
 
-  it("reads a swap inside one group as an in-group reorder even when an empty group exists", () => {
-    const plan = planColumnDrag({
-      ...base,
-      orderedColumnIds: [12, 11, 21, 22, 31, 91, 92],
-      draggedColumnId: 12
-    });
-    expect(plan).toEqual({ kind: "reorder-in-group", groupId: 1, orderedColumnIds: [12, 11] });
+  it("reorders within a group", () => {
+    expect(drop(12, 1, 11)).toEqual({ kind: "reorder-in-group", groupId: 1, orderedColumnIds: [12, 11] });
   });
 
-  it("reads a swap inside the default group as an in-group reorder", () => {
-    const plan = planColumnDrag({
-      ...base,
-      orderedColumnIds: [11, 12, 21, 22, 31, 92, 91],
-      draggedColumnId: 92
-    });
-    expect(plan).toEqual({ kind: "reorder-in-group", groupId: DEFAULT, orderedColumnIds: [92, 91] });
+  it("moves a group's only column into another single-column group, rather than swapping the groups", () => {
+    expect(drop(31, 4, null)).toEqual({ kind: "move-column", columnId: 31, groupId: 4, position: 1 });
+    expect(drop(31, 4, 41)).toEqual({ kind: "move-column", columnId: 31, groupId: 4, position: 0 });
   });
 
-  it("reads a swap inside a group as an in-group reorder while the default group holds columns", () => {
-    const plan = planColumnDrag({
-      ...base,
-      orderedColumnIds: [11, 12, 22, 21, 31, 91, 92],
-      draggedColumnId: 22
-    });
-    expect(plan).toEqual({ kind: "reorder-in-group", groupId: 2, orderedColumnIds: [22, 21] });
+  it("lands before the named column of another group", () => {
+    expect(drop(21, 1, 12)).toEqual({ kind: "move-column", columnId: 21, groupId: 1, position: 1 });
   });
 
-  it("sends every non-default group, empty ones included, and never the default group", () => {
-    const plan = planColumnDrag({
-      ...base,
-      orderedColumnIds: [21, 22, 11, 12, 31, 91, 92],
-      draggedColumnId: 21
-    });
-    expect(plan).toEqual({ kind: "reorder-groups", orderedGroupIds: [2, 5, 1, 3] });
+  it("puts a column at the end of a group when no column is named", () => {
+    expect(drop(11, 2, null)).toEqual({ kind: "move-column", columnId: 11, groupId: 2, position: 2 });
   });
 
-  it("moves a group's only column past another group as a group reorder", () => {
-    const plan = planColumnDrag({
-      ...base,
-      orderedColumnIds: [11, 12, 31, 21, 22, 91, 92],
-      draggedColumnId: 31
-    });
-    expect(plan).toEqual({ kind: "reorder-groups", orderedGroupIds: [1, 5, 3, 2] });
+  it("moves into the default group like any other", () => {
+    expect(drop(41, DEFAULT, 91)).toEqual({ kind: "move-column", columnId: 41, groupId: DEFAULT, position: 0 });
   });
 
-  it("does nothing when a lone column only moves past the default group, which stays last", () => {
-    const groupIds = new Map([
-      [11, 1],
-      [12, 1],
-      [31, 3],
-      [91, DEFAULT]
-    ]);
-    const plan = planColumnDrag({
-      groupIdByColumnId: groupIds,
-      currentGroupOrder: [1, 3],
-      defaultGroupId: DEFAULT,
-      orderedColumnIds: [11, 12, 91, 31],
-      draggedColumnId: 31
-    });
-    expect(plan).toEqual({ kind: "noop" });
+  it("moves into an empty group at position 0", () => {
+    expect(drop(11, 5, null)).toEqual({ kind: "move-column", columnId: 11, groupId: 5, position: 0 });
   });
 
-  it("does nothing when the default group's only column is dragged in front of other groups", () => {
-    const groupIds = new Map([
-      [11, 1],
-      [21, 2],
-      [91, DEFAULT]
-    ]);
-    const plan = planColumnDrag({
-      groupIdByColumnId: groupIds,
-      currentGroupOrder: [1, 2],
-      defaultGroupId: DEFAULT,
-      orderedColumnIds: [91, 11, 21],
-      draggedColumnId: 91
-    });
-    expect(plan).toEqual({ kind: "noop" });
+  it("does nothing when the column lands where it already is", () => {
+    expect(drop(11, 1, 12)).toEqual({ kind: "noop" });
+    expect(drop(12, 1, null)).toEqual({ kind: "noop" });
+  });
+
+  it("does nothing for a column it does not know", () => {
+    expect(drop(777, 1, null)).toEqual({ kind: "noop" });
   });
 });
 

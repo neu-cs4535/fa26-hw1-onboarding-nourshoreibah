@@ -3354,6 +3354,32 @@ export default class TableController<
     }
     return;
   }
+  /**
+   * Applies local edits to rows already loaded, marked pending, without writing anything. For
+   * callers that save through an RPC rather than `update()` and want the screen to move first.
+   * Returns a function that puts the rows back as they were; call it if the save fails.
+   */
+  applyLocalPatches(patches: { id: IDType; values: Partial<ResultOne> }[]): () => void {
+    if (this._closed) {
+      throw new Error(
+        `TableController for table '${this._table}' is closed. Cannot apply local patches. This indicates a stale reference is being used.`
+      );
+    }
+    const originals: (ResultOne & { id: IDType })[] = [];
+    for (const { id, values } of patches) {
+      const oldRow = this._rowsById.get(id);
+      if (!oldRow) continue;
+      originals.push(oldRow as ResultOne & { id: IDType });
+      this._updateRow(id, { ...oldRow, ...values, id } as ResultOne & { id: IDType }, true);
+    }
+    return () => {
+      if (this._closed) return;
+      for (const original of originals) {
+        if (this._rowsById.has(original.id)) this._updateRow(original.id, original, false);
+      }
+    };
+  }
+
   async update(id: IDType, row: Partial<ResultOne>): Promise<ResultOne> {
     if (this._closed) {
       throw new Error(

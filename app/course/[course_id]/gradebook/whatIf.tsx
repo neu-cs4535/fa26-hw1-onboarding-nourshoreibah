@@ -37,7 +37,6 @@ import {
 } from "@chakra-ui/react";
 
 import { Alert } from "@/components/ui/alert";
-import pluralize from "pluralize";
 import type { CSSProperties, MouseEvent } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -473,58 +472,15 @@ function GroupHeader({
           <HStack as="span" gap={2}>
             <Icon as={isCollapsed ? LuChevronRight : LuChevronDown} boxSize={4} color="fg.muted" aria-hidden="true" />
             <Text as="span" fontWeight="bold" fontSize="sm" color="fg.muted">
-              {columnCount} {pluralize(groupName.charAt(0).toUpperCase() + groupName.slice(1))}...
+              {groupName}
+            </Text>
+            <Text as="span" fontSize="xs" color="fg.subtle">
+              {columnCount}
             </Text>
           </HStack>
         </HStack>
       </button>
     </Card.Root>
-  );
-}
-
-function CollapsedGroupColumn({
-  groupColumns,
-  private_profile_id,
-  whatIfEnabled
-}: {
-  groupColumns: GradebookColumn[];
-  private_profile_id: string;
-  whatIfEnabled: boolean;
-}) {
-  // For now, let's use a simpler approach that checks just the first and last columns
-  // to avoid React hooks rule violations with dynamic loops
-  const firstGrade = useGradebookColumnStudent(groupColumns[0].id, private_profile_id);
-  const lastGrade = useGradebookColumnStudent(
-    groupColumns.length > 1 ? groupColumns[groupColumns.length - 1].id : groupColumns[0].id,
-    private_profile_id
-  );
-
-  // Determine which column to show: first if no grades anywhere, otherwise last
-  const selectedColumn = useMemo(() => {
-    // Check if any of the checked columns have grades
-    const firstScore = firstGrade?.score_override ?? firstGrade?.score;
-    const lastScore = lastGrade?.score_override ?? lastGrade?.score;
-
-    const hasFirstGrade = firstScore !== null && firstScore !== undefined;
-    const hasLastGrade = lastScore !== null && lastScore !== undefined;
-
-    // If either has a grade, show the last column (preferred when grades exist)
-    if (hasFirstGrade || hasLastGrade) {
-      return groupColumns[groupColumns.length - 1];
-    }
-
-    // No grades found in sampled columns, show first column
-    return groupColumns[0];
-  }, [groupColumns, firstGrade, lastGrade]);
-
-  return (
-    <GradebookCard
-      key={selectedColumn.id}
-      column={selectedColumn}
-      private_profile_id={private_profile_id}
-      isCollapsedGroupItem={true}
-      whatIfEnabled={whatIfEnabled}
-    />
   );
 }
 
@@ -540,19 +496,14 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
 
   const groupedColumns = useMemo(() => buildGroupedColumns(sortedColumns, columnGroups), [sortedColumns, columnGroups]);
 
-  // Initialize all groups as collapsed by default, but preserve existing collapsed state
+  // Groups start expanded. Forget collapse state for groups that no longer have two or more columns.
   useEffect(() => {
-    const collapsibleKeys = Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1);
-
+    const collapsibleKeys = new Set(
+      Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1)
+    );
     setCollapsedGroups((prev) => {
-      const newSet = new Set<string>(collapsibleKeys.filter((key) => prev.has(key)));
-
-      // If no groups were previously collapsed, collapse all by default
-      if (newSet.size === 0 && collapsibleKeys.length > 0) {
-        collapsibleKeys.forEach((key) => newSet.add(key));
-      }
-
-      return newSet;
+      const kept = [...prev].filter((key) => collapsibleKeys.has(key));
+      return kept.length === prev.size ? prev : new Set(kept);
     });
   }, [groupedColumns]);
 
@@ -608,8 +559,8 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
           />
         );
 
+        // A collapsed group is just its header; expanding it shows every column.
         if (!isCollapsed) {
-          // Show all columns when expanded
           group.columns.forEach((column) => {
             items.push(
               <GradebookCard
@@ -620,16 +571,6 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
               />
             );
           });
-        } else {
-          // Show the appropriate column when collapsed (first if no grades, last if grades exist)
-          items.push(
-            <CollapsedGroupColumn
-              key={`collapsed-${groupKey}`}
-              groupColumns={group.columns}
-              private_profile_id={private_profile_id}
-              whatIfEnabled={whatIfEnabled}
-            />
-          );
         }
       }
     });

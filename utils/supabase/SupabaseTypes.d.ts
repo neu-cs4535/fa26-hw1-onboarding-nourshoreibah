@@ -11863,6 +11863,10 @@ export type Database = {
         Args: { p_class_id: number; p_gradebook_id: number; p_slug: string };
         Returns: number;
       };
+      _gradebook_column_group_slug_route: {
+        Args: { p_class_id: number; p_slug: string };
+        Returns: Record<string, unknown>;
+      };
       _gradebook_columns_apply_positions: {
         Args: {
           p_gradebook_id: number;
@@ -13548,6 +13552,14 @@ export type Database = {
       gradebook_column_group_for_slug: {
         Args: { p_class_id: number; p_gradebook_id: number; p_slug: string };
         Returns: number;
+      };
+      gradebook_column_group_preview_for_slug: {
+        Args: { p_class_id: number; p_gradebook_id: number; p_slug: string };
+        Returns: {
+          group_id: number;
+          group_name: string;
+          is_new: boolean;
+        }[];
       };
       gradebook_column_group_refresh_name: {
         Args: { p_group_id: number };

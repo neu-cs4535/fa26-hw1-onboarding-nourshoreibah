@@ -875,7 +875,7 @@ test.describe("Gradebook Page - Comprehensive", () => {
     // Check action buttons
     await expect(page.getByRole("button", { name: "Download Gradebook" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Import Columns" })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Add Column" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Add", exact: true })).toBeVisible();
 
     const gradebookRegion = page.getByRole("region", { name: "Instructor Gradebook Table" });
     await gradebookRegion.getByRole("button", { name: "Expand all groups" }).click();
@@ -1015,7 +1015,8 @@ test.describe("Gradebook Page - Comprehensive", () => {
   });
 
   test("Add Column workflow creates a manual column and allows entering a score", async ({ page }) => {
-    await page.getByRole("button", { name: "Add Column" }).click();
+    await page.getByRole("button", { name: "Add", exact: true }).click();
+    await page.getByRole("menuitem", { name: "Column", exact: true }).click();
 
     await page.getByLabel("Name").fill("Extra Credit");
     await page.getByLabel("Max Score").fill("10");
@@ -1047,7 +1048,8 @@ test.describe("Gradebook Page - Comprehensive", () => {
     //   4. Full-screen Expression Builder opens, shows a student picker, and
     //      evaluates the expression against a specific student with live
     //      intermediate values.
-    await page.getByRole("button", { name: "Add Column" }).click();
+    await page.getByRole("button", { name: "Add", exact: true }).click();
+    await page.getByRole("menuitem", { name: "Column", exact: true }).click();
 
     const addDialog = page.getByRole("dialog").filter({ hasText: "Add Column" });
     await expect(addDialog).toBeVisible();
@@ -1759,6 +1761,80 @@ test.describe("Gradebook column reorder (issue #531)", () => {
       expect(colRestored!.position_in_group).toBe(positionBefore);
       expect(colRestored!.gradebook_column_group_id).toBe(groupBefore);
     }).toPass({ timeout: 5000 });
+  });
+
+  test("Column groups can be created, renamed, moved and deleted from the table", async ({ page }) => {
+    const region = page.getByRole("region", { name: "Instructor Gradebook Table" });
+    await region.getByRole("button", { name: "Expand all groups" }).click();
+    await waitForVirtualizerIdle(page);
+
+    const { data: cols } = await supabase
+      .from("gradebook_columns")
+      .select("id, name")
+      .eq("class_id", reorderCourse.id)
+      .order("id")
+      .limit(2);
+    const picked = cols!;
+    expect(picked.length).toBe(2);
+
+    await page.getByRole("button", { name: "Add", exact: true }).click();
+    await page.getByRole("menuitem", { name: "Column group", exact: true }).click();
+    const createDialog = page.getByRole("dialog", { name: "Add Column Group" });
+    await createDialog.getByLabel("Name", { exact: true }).fill("Test group");
+    await expect(createDialog.getByLabel("Slug", { exact: true })).toHaveValue("test-group");
+    const moveInput = createDialog.getByLabel("Move columns into this group");
+    for (const c of picked) {
+      await moveInput.fill(c.name);
+      await page.getByRole("option", { name: c.name, exact: true }).click();
+      await expect(createDialog.getByRole("button", { name: `Remove ${c.name}` })).toBeVisible();
+    }
+    await createDialog.getByRole("button", { name: "Create group" }).click();
+    await expect(createDialog).toBeHidden({ timeout: 15_000 });
+
+    const band = region.getByRole("group", { name: "Column group Test group" });
+    await expect(band).toBeVisible({ timeout: 15_000 });
+    // The header is the group's name as typed, with the count beside it, never "2 Test groups".
+    await expect(band).toContainText("Test group");
+    await expect(band).not.toContainText("groups");
+
+    const { data: created } = await supabase
+      .from("gradebook_column_groups")
+      .select("id, sort_order")
+      .eq("class_id", reorderCourse.id)
+      .eq("slug", "test-group")
+      .single();
+    const { data: members } = await supabase
+      .from("gradebook_columns")
+      .select("id")
+      .eq("gradebook_column_group_id", created!.id);
+    expect(members!.map((m) => m.id).sort()).toEqual(picked.map((c) => c.id).sort());
+
+    await band.getByRole("button", { name: "Options for group Test group" }).click();
+    await page.getByRole("menuitem", { name: "Edit group", exact: true }).click();
+    const editDialog = page.getByRole("dialog", { name: "Edit Column Group" });
+    await editDialog.getByLabel("Name", { exact: true }).fill("Renamed group");
+    await editDialog.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(editDialog).toBeHidden({ timeout: 15_000 });
+    const renamed = region.getByRole("group", { name: "Column group Renamed group" });
+    await expect(renamed).toBeVisible({ timeout: 15_000 });
+
+    await renamed.getByRole("button", { name: "Options for group Renamed group" }).click();
+    await page.getByRole("menuitem", { name: "Move group left", exact: true }).click();
+    await expect(async () => {
+      const { data: after } = await supabase
+        .from("gradebook_column_groups")
+        .select("sort_order")
+        .eq("id", created!.id)
+        .single();
+      expect(after!.sort_order).toBeLessThan(created!.sort_order);
+    }).toPass({ timeout: 10_000 });
+
+    await renamed.getByRole("button", { name: "Options for group Renamed group" }).click();
+    await page.getByRole("menuitem", { name: "Delete group", exact: true }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Delete group" }).click();
+    await expect(renamed).toBeHidden({ timeout: 15_000 });
+    const { data: gone } = await supabase.from("gradebook_column_groups").select("id").eq("id", created!.id);
+    expect(gone).toEqual([]);
   });
 
   test("Edit Column moves a column to another group", async ({ page }) => {
