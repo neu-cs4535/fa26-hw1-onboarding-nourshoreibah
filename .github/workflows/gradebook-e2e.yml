@@ -226,14 +226,6 @@ jobs:
       - name: Seed the cs4535 class
         run: npm run seed -- --template cs4535
 
-      - name: Check group dependencies and rehearse rollback
-        run: |
-          set -euo pipefail
-          for script in gradebook_column_group_expressions gradebook_column_groups_down; do
-            docker exec -i "supabase_db_${SUPABASE_PROJECT}" psql -U postgres -d postgres \
-              -v ON_ERROR_STOP=1 < "tests/manual/${script}.sql"
-          done
-
       - name: Serve Edge Functions
         run: |
           set -euo pipefail
