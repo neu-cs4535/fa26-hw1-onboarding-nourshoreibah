@@ -330,8 +330,10 @@ export function getGradebookColumnsSlugStringContext(
     const arg = parseFirstStringArgSpan(text, openParen);
     if (!arg) continue;
     const { contentStart, contentEndClosed } = arg;
+    // Up to and including the closing quote: with auto-closed quotes the caret sits right before it
+    // while the slug is typed, and an empty "" has its caret on it.
     const inside =
-      offset >= contentStart && (contentEndClosed === null ? offset <= text.length : offset < contentEndClosed);
+      offset >= contentStart && (contentEndClosed === null ? offset <= text.length : offset <= contentEndClosed);
     if (inside) {
       return {
         kind: m[1] as "gradebook_columns" | "gradebook_column_group",

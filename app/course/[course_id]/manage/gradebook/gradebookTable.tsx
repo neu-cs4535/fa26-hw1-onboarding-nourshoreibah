@@ -105,6 +105,7 @@ import {
   useDroppable,
   useSensor,
   useSensors,
+  type CollisionDetection,
   type DragEndEvent,
   type DragStartEvent
 } from "@dnd-kit/core";
@@ -843,8 +844,13 @@ function EditColumnDialog({ columnId, onClose }: { columnId: number; onClose: ()
   const [isExpressionBuilderExpanded, setIsExpressionBuilderExpanded] = useState(false);
   const [validation, setValidation] = useState<ValidationResult | null>(null);
 
+  // Filled once per column the dialog opens on. Refilling on every update to the row would let a
+  // realtime echo of this dialog's own save wipe what the instructor chose and the error that
+  // explains why the save failed.
+  const formFilledForColumnId = useRef<number | null>(null);
   useEffect(() => {
-    if (column) {
+    if (column && formFilledForColumnId.current !== columnId) {
+      formFilledForColumnId.current = columnId;
       const expr = column.score_expression ?? "";
       reset({
         name: column.name ?? "",
@@ -2523,6 +2529,21 @@ type CollapsedGroupMeta = {
   isOrphan?: boolean;
 };
 
+/**
+ * closestCenter measured from the pointer rather than from the middle of the dragged element. A
+ * group band can be hundreds of pixels wide and is grabbed by a handle at its left end, so its
+ * middle is far from where the instructor is pointing. Keyboard drags have no pointer and keep the
+ * element's middle, which the arrow keys move.
+ */
+const closestCenterToPointer: CollisionDetection = (args) => {
+  const pointer = args.pointerCoordinates;
+  if (!pointer) return closestCenter(args);
+  return closestCenter({
+    ...args,
+    collisionRect: { top: pointer.y, bottom: pointer.y, left: pointer.x, right: pointer.x, width: 0, height: 0 }
+  });
+};
+
 /** "4 Labs...": the member count and the pluralized, capitalized group name. */
 function collapsedGroupSummary(groupName: string, count: number): string {
   const name = groupName.charAt(0).toUpperCase() + groupName.slice(1);
@@ -3588,7 +3609,7 @@ export default function GradebookTable() {
 
   const supabaseForGradebook = useMemo(() => createClient(), []);
 
-  // Drops are picked by closestCenter over the gap targets, so the keyboard sensor's default
+  // Drops are picked by closestCenterToPointer over the gap targets, so the keyboard sensor's default
   // coordinates (arrow keys nudge the dragged header sideways) land on gaps the same way a pointer does.
   const dndSensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
@@ -4175,7 +4196,7 @@ export default function GradebookTable() {
       <GradebookPopoverProvider>
         <DndContext
           sensors={dndSensors}
-          collisionDetection={closestCenter}
+          collisionDetection={closestCenterToPointer}
           onDragStart={handleGradebookColumnDragStart}
           onDragEnd={handleGradebookColumnDragEnd}
           onDragCancel={handleGradebookColumnDragCancel}
