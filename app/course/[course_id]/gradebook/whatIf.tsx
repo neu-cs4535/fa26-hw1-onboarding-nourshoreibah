@@ -474,7 +474,7 @@ function GroupHeader({
             <Text as="span" fontWeight="bold" fontSize="sm" color="fg.muted">
               {groupName}
             </Text>
-            <Text as="span" fontSize="xs" color="fg.subtle">
+            <Text as="span" fontSize="xs" color="fg.muted">
               ({columnCount})
             </Text>
           </HStack>
