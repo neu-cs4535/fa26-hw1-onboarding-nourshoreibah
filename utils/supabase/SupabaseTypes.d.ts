@@ -11875,6 +11875,10 @@ export type Database = {
         };
         Returns: undefined;
       };
+      _gradebook_expression_names_slug: {
+        Args: { p_expression: string; p_slug: string };
+        Returns: boolean;
+      };
       _help_request_public_payload: {
         Args: {
           new_row: Database["public"]["Tables"]["help_requests"]["Row"];
