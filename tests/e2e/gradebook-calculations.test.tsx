@@ -2165,14 +2165,16 @@ test.describe("Fixture 6: Column group total", () => {
     expect(total.dependencies?.gradebook_columns).not.toContain(total.id);
 
     await waitForRow(course.id, "grp-hw-c", alice.private_profile_id, true);
+    // setScore writes the cell directly, which enqueues nothing; the gradebook UI saves through
+    // update_gradebook_column_student_with_recalc, which enqueues the row. Enqueue it the same way.
+    // The total is never re-saved, so C can only count through the group's live membership.
     await setScore(course.id, "grp-hw-c", alice.private_profile_id, 100);
     await waitForScore({
       class_id: course.id,
       student_id: alice.private_profile_id,
       column_slug: "grp-hw-total",
       is_private: true,
-      expected: 80,
-      enqueue: false
+      expected: 80
     });
   });
 

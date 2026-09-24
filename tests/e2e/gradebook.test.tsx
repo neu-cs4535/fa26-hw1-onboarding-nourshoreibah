@@ -1020,7 +1020,7 @@ test.describe("Gradebook Page - Comprehensive", () => {
 
     await page.getByLabel("Name").fill("Extra Credit");
     await page.getByLabel("Max Score").fill("10");
-    await page.getByLabel("Slug").fill("extra-credit");
+    await page.getByRole("textbox", { name: /^Slug/ }).fill("extra-credit");
     await page.getByRole("button", { name: /^Save$/ }).click();
 
     // New column header should be visible
@@ -1056,7 +1056,7 @@ test.describe("Gradebook Page - Comprehensive", () => {
 
     await addDialog.getByLabel("Name").fill("Validated Column");
     await addDialog.getByLabel("Max Score").fill("100");
-    await addDialog.getByLabel("Slug").fill("validated-column");
+    await addDialog.getByRole("textbox", { name: /^Slug/ }).fill("validated-column");
 
     const scoreTextarea = addDialog.getByLabel("Score Expression");
     await expect(scoreTextarea).toBeVisible();
@@ -1835,9 +1835,13 @@ test.describe("Gradebook column reorder (issue #531)", () => {
     await renamed.getByRole("button", { name: "Options for group Renamed group" }).click();
     await page.getByRole("menuitem", { name: "Delete group", exact: true }).click();
     await page.getByRole("dialog").getByRole("button", { name: "Delete group" }).click();
+    // The band can leave the DOM (virtualization) before the delete commits; wait for the RPC.
+    await expect(page.getByText("Group deleted")).toBeVisible({ timeout: 15_000 });
     await expect(renamed).toBeHidden({ timeout: 15_000 });
-    const { data: gone } = await supabase.from("gradebook_column_groups").select("id").eq("id", created!.id);
-    expect(gone).toEqual([]);
+    await expect(async () => {
+      const { data: gone } = await supabase.from("gradebook_column_groups").select("id").eq("id", created!.id);
+      expect(gone).toEqual([]);
+    }).toPass({ timeout: 10_000 });
   });
 
   test("Edit Column moves a column to another group", async ({ page }) => {
