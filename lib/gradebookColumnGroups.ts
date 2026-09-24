@@ -78,14 +78,6 @@ export function buildColumnGroupKeyMap<T extends GroupableColumn>(
   return map;
 }
 
-export function visibleGroupsInOrder<T extends GroupableColumn>(
-  columns: readonly T[],
-  groups: readonly GradebookColumnGroup[]
-): GradebookColumnGroup[] {
-  const populated = new Set(columns.map((c) => c.gradebook_column_group_id));
-  return groups.filter((g) => populated.has(g.id)).sort((a, b) => a.sort_order - b.sort_order || a.id - b.id);
-}
-
 /** Group slugs are what score expressions name, e.g. gradebook_column_group("homework"). */
 export const GROUP_SLUG_PATTERN = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 

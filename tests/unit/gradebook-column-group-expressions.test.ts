@@ -1,10 +1,11 @@
 import * as mathjs from "mathjs";
-import { minimatch } from "minimatch";
 
 import {
   COLUMN_GROUP_FUNCTION,
   columnGroupCallSlugs,
-  expandColumnGroup
+  expandColumnGroup,
+  referencedColumnGroupIds,
+  slugListArgument
 } from "@/supabase/functions/gradebook-column-recalculate/expression/columnGroups";
 import {
   EMPTY_GROUP,
@@ -298,8 +299,8 @@ describe("extractAndValidateDependencies with gradebook_column_group()", () => {
 });
 
 describe("gradebook_column_group() agrees across evaluators", () => {
-  // The Deno recalculator test (columnGroups.test.ts) asserts the same PARITY_CASES numbers
-  // against processGradebookRowsCalculation.
+  // GradebookProcessor.columnGroups.test.ts checks the same PARITY_CASES through
+  // processGradebookRowsCalculation in Deno.
   test.each(PARITY_CASES.map((c) => [c.label, c] as const))("%s", (_label, parityCase) => {
     const tester = evaluateInTester(parityCase.expression, parityCase.values, parityCase);
     expectResult(tester.evaluation?.rawResult, parityCase.expected);
@@ -396,8 +397,19 @@ describe("gradebook_column_group() agrees across evaluators", () => {
   });
 });
 
-describe("the fixture itself", () => {
-  test("slugs in the fixture resolve the way the evaluators resolve them", () => {
-    expect(FIXTURE_COLUMNS.filter((c) => minimatch(c.slug, "hw-[123]")).map((c) => c.id)).toEqual([3, 1, 2]);
+describe("stored group dependencies", () => {
+  test("accepts group IDs and ignores other dependency shapes", () => {
+    expect(referencedColumnGroupIds({ gradebook_column_groups: [HOMEWORK_GROUP] })).toEqual([HOMEWORK_GROUP]);
+    expect(referencedColumnGroupIds({ gradebook_columns: [1] })).toEqual([]);
+    expect(referencedColumnGroupIds(null)).toEqual([]);
+    expect(referencedColumnGroupIds("junk")).toEqual([]);
+  });
+});
+
+describe("slugListArgument", () => {
+  test("reads a mathjs Matrix or an array, and leaves a single slug to glob matching", () => {
+    expect(slugListArgument(mathjs.evaluate('["a", "b"]'))).toEqual(["a", "b"]);
+    expect(slugListArgument(["a"])).toEqual(["a"]);
+    expect(slugListArgument("a")).toBeNull();
   });
 });

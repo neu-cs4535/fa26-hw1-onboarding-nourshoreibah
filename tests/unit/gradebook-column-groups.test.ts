@@ -9,7 +9,6 @@ import {
   planColumnDrop,
   slugForGroupName,
   sortColumnsForDisplay,
-  visibleGroupsInOrder,
   type GradebookColumnGroup
 } from "@/lib/gradebookColumnGroups";
 
@@ -76,7 +75,6 @@ describe("grouping", () => {
     const grouped = buildGroupedColumns(visibleToStudent, groups);
 
     expect(Object.keys(grouped)).toEqual([groupKey(groups[0])]);
-    expect(visibleGroupsInOrder(visibleToStudent, groups).map((g) => g.name)).toEqual(["Labs"]);
   });
 
   it("does not split a group when a column is filtered out of the middle of it", () => {
@@ -200,7 +198,6 @@ describe("display order with the default group pinned at the top of int4", () =>
     const groups = [group(1, "Ungrouped", 2147483647, { is_default: true }), group(2, "Labs", 1), group(3, "Quiz", 0)];
     const columns = [col(11, 1, 0), col(21, 2, 0), col(31, 3, 0), col(41, 999, 0)];
     expect(sortColumnsForDisplay(columns, groups).map((c) => c.id)).toEqual([31, 21, 11, 41]);
-    expect(visibleGroupsInOrder(columns, groups).map((g) => g.id)).toEqual([3, 2, 1]);
   });
 });
 
