@@ -1487,7 +1487,10 @@ export class GradebookController {
       client,
       table: "gradebook_column_groups",
       query: client.from("gradebook_column_groups").select("*").eq("gradebook_id", gradebook_id),
-      classRealTimeController
+      classRealTimeController,
+      // Full reload on reconnect, not the updated_at catch-up: releasing a column makes its group
+      // visible to students without touching the group row, so no watermark would find it.
+      enableAutoRefetch: true
     });
     const { unsubscribe: gradebookRowUnsubscribe } = this.gradebook_row.list(() => {
       // Prefix lives on gradebooks.expression_prefix; recompute renderers when the row updates.

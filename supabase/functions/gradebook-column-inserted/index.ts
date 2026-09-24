@@ -200,7 +200,18 @@ Deno.serve(async (req) => {
       columns: snapshotColumns,
       columnId: col.id
     });
-  const referencedGroups = new Map(targetColumns.map((c) => [c.id, computeDependencies(c)?.gradebook_column_groups]));
+  // A stored expression that no longer parses is left as it is, rather than failing every other
+  // column's update in the same request.
+  const unparseable = new Set<number>();
+  const referencedGroups = new Map<number, number[] | undefined>();
+  for (const c of targetColumns) {
+    try {
+      referencedGroups.set(c.id, computeDependencies(c)?.gradebook_column_groups);
+    } catch (e) {
+      unparseable.add(c.id);
+      console.error(`Skipping column ${c.id} (${c.slug}): its score expression does not parse`, e);
+    }
+  }
   for (const c of snapshotColumns) {
     if (!referencedGroups.has(c.id)) continue;
     const groupIds = referencedGroups.get(c.id);
@@ -210,6 +221,7 @@ Deno.serve(async (req) => {
 
   let updated = 0;
   for (const col of targetColumns) {
+    if (unparseable.has(col.id)) continue;
     const current = normalized(col.dependencies);
     const next = normalized(computeDependencies(col));
     // Skip the write when nothing changed, so untouched columns keep their stored row.

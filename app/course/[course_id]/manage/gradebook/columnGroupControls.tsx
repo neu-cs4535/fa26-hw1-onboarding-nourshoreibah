@@ -235,7 +235,7 @@ export function ColumnGroupHeader({
         </WrappedTooltip>
       )}
       {!narrow && (
-        <Text fontSize="xs" color="fg.subtle" flexShrink={0}>
+        <Text fontSize="xs" color="fg.muted" flexShrink={0}>
           ({countLabel})
         </Text>
       )}
@@ -289,7 +289,8 @@ export function ColumnGroupDialog({
     if (!slugEdited) setSlug(name.trim() ? slugForGroupName(name, otherSlugs) : "");
   }, [name, slugEdited, otherSlugs]);
 
-  const slugError = slug ? groupSlugProblem(slug, otherSlugs) : null;
+  // An unchanged slug is never blocked: renaming a group must not depend on its slug being fixable.
+  const slugError = slug && slug !== group?.slug ? groupSlugProblem(slug, otherSlugs) : null;
   const groupNameById = useMemo(() => new Map(groups.map((g) => [g.id, g.name])), [groups]);
   const orderedColumns = useMemo(() => sortColumnsForDisplay(columns, groups), [columns, groups]);
   /** Every column, grouped under the group it is in now, so a long gradebook stays searchable. */
@@ -316,17 +317,14 @@ export function ColumnGroupDialog({
     setBusy(true);
     try {
       if (mode === "create") {
-        // The server assigns sort_order on insert; the type still wants one, so send our best guess.
-        const nextSortOrder =
-          groups.filter((g) => !g.is_default).reduce((max, g) => Math.max(max, g.sort_order), -1) + 1;
+        // The server appends the group, so no sort_order is sent.
         const { data: created, error } = await supabase
           .from("gradebook_column_groups")
           .insert({
             class_id: gradebookController.class_id,
             gradebook_id: gradebookController.gradebook_id,
             name: trimmed,
-            slug,
-            sort_order: nextSortOrder
+            slug
           })
           .select("id")
           .single();

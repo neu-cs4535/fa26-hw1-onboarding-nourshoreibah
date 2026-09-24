@@ -37,6 +37,7 @@ import {
   resolveGroupForSlug,
   buildGroupedColumns,
   ORPHAN_GROUP_KEY,
+  groupKey as columnGroupKey,
   sortColumnsForDisplay,
   type GradebookColumnGroup
 } from "@/lib/gradebookColumnGroups";
@@ -268,7 +269,7 @@ type GradebookGroupedColumnRef = {
   position_in_group: GradebookColumn["position_in_group"];
 };
 
-export function buildVisibleReorderUnits(args: {
+function buildVisibleReorderUnits(args: {
   scrollableLeafColumns: TanStackColumn<UserProfile, unknown>[];
   groupedColumns: Record<string, { groupName: string; columns: GradebookGroupedColumnRef[] }>;
   collapsedGroups: Set<string>;
@@ -422,8 +423,10 @@ function ColumnGroupField({
 }) {
   const gradebookController = useGradebookController();
   const [slugRoute, setSlugRoute] = useState<{ name: string; isNew: boolean } | null>(null);
+  const [slugRouteFailed, setSlugRouteFailed] = useState(false);
   useEffect(() => {
     const trimmed = slug.trim();
+    setSlugRouteFailed(false);
     if (!active || !autoGroup || !trimmed) {
       setSlugRoute(null);
       return;
@@ -438,6 +441,7 @@ function ColumnGroupField({
       if (cancelled) return;
       const row = previewError ? undefined : data?.[0];
       setSlugRoute(row ? { name: row.group_name, isNew: row.is_new } : null);
+      setSlugRouteFailed(!row);
     }, 250);
     return () => {
       cancelled = true;
@@ -475,11 +479,13 @@ function ColumnGroupField({
         <Text fontSize="xs" color="fg.muted" mt={1}>
           {!slug.trim()
             ? (emptySlugHint ?? "")
-            : slugRoute === null
-              ? "Checking…"
-              : slugRoute.isNew
-                ? `Starts a new group, ${slugRoute.name}.`
-                : `Joins ${slugRoute.name}.`}
+            : slugRouteFailed
+              ? "Could not preview the group. The column still joins one when you save."
+              : slugRoute === null
+                ? "Checking…"
+                : slugRoute.isNew
+                  ? `Starts a new group, ${slugRoute.name}.`
+                  : `Joins ${slugRoute.name}.`}
         </Text>
       ) : (
         manualHint && (
@@ -2517,7 +2523,13 @@ type CollapsedGroupMeta = {
   isOrphan?: boolean;
 };
 
-/** The thin strip a collapsed group shrinks to: its name running down, and a click to expand. */
+/** "4 Labs...": the member count and the pluralized, capitalized group name. */
+function collapsedGroupSummary(groupName: string, count: number): string {
+  const name = groupName.charAt(0).toUpperCase() + groupName.slice(1);
+  return `${count} ${pluralize(name)}...`;
+}
+
+/** The thin strip a collapsed group shrinks to: its summary running down, and a click to expand. */
 function CollapsedGroupStrip({
   meta,
   onToggleGroup
@@ -2543,9 +2555,7 @@ function CollapsedGroupStrip({
         overflow="hidden"
       >
         <Icon as={LuChevronsLeftRight} boxSize={3} color="fg.muted" flexShrink={0} />
-        <Text fontSize="xs" color="fg.subtle" flexShrink={0}>
-          {meta.hiddenCount}
-        </Text>
+        {/* The same "4 Labs..." summary the collapsed header showed before groups were rows. */}
         <Text
           fontSize="xs"
           fontWeight="semibold"
@@ -2553,7 +2563,7 @@ function CollapsedGroupStrip({
           whiteSpace="nowrap"
           style={{ writingMode: "vertical-rl" }}
         >
-          {meta.groupName}
+          {collapsedGroupSummary(meta.groupName ?? "", meta.hiddenCount ?? 0)}
         </Text>
       </chakra.button>
     </WrappedTooltip>
@@ -3009,10 +3019,13 @@ export default function GradebookTable() {
         rollbacks.forEach((rollback) => rollback());
         toaster.error({ title: opts.failureTitle, description: describeError(e) });
       } finally {
-        // Not awaited: when throttled it waits ~3s, and the layout version the next save sends is
-        // already current (setLayoutVersion). Overlapping reloads coalesce, so the last one wins.
-        void gradebookController.reconcileLayout();
-        endLayoutSave();
+        // Held until the reload lands: a reload read before a later drag committed would otherwise
+        // replace that drag's optimistic rows and move its column back until its own reload.
+        try {
+          await gradebookController.reconcileLayout();
+        } finally {
+          endLayoutSave();
+        }
       }
     },
     [gradebookController, beginLayoutSave]
@@ -3049,29 +3062,11 @@ export default function GradebookTable() {
     [movableGroupOrder, reorderGroups, isReorderingColumns]
   );
 
-  const columnGroupActions = useMemo<ColumnGroupActions>(
-    () => ({
-      onEdit: (group) => setGroupDialog({ kind: "edit", group }),
-      onDelete: (group) => setGroupDialog({ kind: "delete", group }),
-      onAddColumn: (group) => setAddColumnDialog({ groupId: group.id }),
-      onMove: (group, delta) => void moveGroup(group, delta),
-      onToggleCollapse: (group) =>
-        setCollapsedGroups((prev) => {
-          const next = new Set(prev);
-          const key = `group-${group.id}`;
-          if (next.has(key)) next.delete(key);
-          else next.add(key);
-          return next;
-        })
-    }),
-    [moveGroup]
-  );
-
   // Groups start expanded. Forget collapse state only for groups that are gone, and only once the
   // groups have loaded: a group briefly holding fewer than two columns mid-move, or a reload, keeps it.
   useEffect(() => {
     if (!gradebookController.gradebook_column_groups.ready) return;
-    const existingKeys = new Set(columnGroups.map((g) => `group-${g.id}`));
+    const existingKeys = new Set(columnGroups.map((g) => columnGroupKey(g)));
     setCollapsedGroups((prev) => {
       const kept = [...prev].filter((key) => existingKeys.has(key));
       return kept.length === prev.size ? prev : new Set(kept);
@@ -3128,6 +3123,17 @@ export default function GradebookTable() {
       forceRecalculation();
     },
     [forceRecalculation]
+  );
+
+  const columnGroupActions = useMemo<ColumnGroupActions>(
+    () => ({
+      onEdit: (group) => setGroupDialog({ kind: "edit", group }),
+      onDelete: (group) => setGroupDialog({ kind: "delete", group }),
+      onAddColumn: (group) => setAddColumnDialog({ groupId: group.id }),
+      onMove: (group, delta) => void moveGroup(group, delta),
+      onToggleCollapse: (group) => toggleGroup(columnGroupKey(group))
+    }),
+    [moveGroup, toggleGroup]
   );
 
   const autoLayout = useCallback(async () => {
@@ -3340,7 +3346,7 @@ export default function GradebookTable() {
       ...columnGroups.filter((g) => g.is_default)
     ];
     orderedGroups.forEach((groupRow) => {
-      const groupKey = `group-${groupRow.id}`;
+      const groupKey = columnGroupKey(groupRow);
       const group = groupedColumns[groupKey];
       if (!group) {
         if (!groupRow.is_default) {
@@ -3382,7 +3388,9 @@ export default function GradebookTable() {
         const isCollapsed = collapsedGroups.has(groupKey);
         if (isCollapsed) {
           // A collapsed group shrinks to one thin strip. It borrows a member's id so the layout code
-          // that keys on grade_<id> keeps working, but it shows no grades.
+          // that keys on grade_<id> keeps working, but it shows no grades. Its members' filters stop
+          // applying while it is collapsed, like those of the members that are not rendered at all, so
+          // a filter set on the borrowed column must pass every row rather than match null against it.
           const representative = findBestColumnToShow(group.columns);
           cols.push({
             id: `grade_${representative.id}`,
@@ -3390,6 +3398,7 @@ export default function GradebookTable() {
             accessorFn: () => null,
             cell: () => null,
             enableColumnFilter: false,
+            filterFn: () => true,
             enableSorting: false,
             meta: {
               groupName: group.groupName,
@@ -3627,10 +3636,11 @@ export default function GradebookTable() {
                 : await supabaseForGradebook.rpc("gradebook_column_assign_group", {
                     p_column_id: plan.columnId,
                     p_group_id: plan.groupId,
-                    p_position: plan.position
+                    p_position: plan.position,
+                    p_expected_version: gradebookController.gradebook_row.rows[0]?.column_layout_version ?? 0
                   });
             if (error) throw error;
-            // The reorder RPC returns the new layout version; assigning a group returns the column.
+            // Both RPCs return the gradebook's new layout version.
             return typeof data === "number" ? data : undefined;
           }
         });
@@ -3902,7 +3912,7 @@ export default function GradebookTable() {
           left: pos,
           width: getColWidth(leaf.id),
           key: `grp-empty-${emptyGroupId}`,
-          groupKey: `group-${emptyGroupId}`,
+          groupKey: columnGroupKey({ id: emptyGroupId }),
           groupId: emptyGroupId,
           isCollapsed: false,
           groupColumnsLen: 0
