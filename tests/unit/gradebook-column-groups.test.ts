@@ -277,6 +277,22 @@ describe("group slugs", () => {
     expect(slugForGroupName("!!!", [])).toBe("group");
   });
 
+  // gradebook_column_group_slugify in the migration gives these same slugs for the groups the
+  // backfill and slug routing create, so both sides pass GROUP_SLUG_PATTERN and the DB check.
+  it("slugs the way the database slugs backfilled and routed groups", () => {
+    const sqlSlugify: [string, string][] = [
+      ["Average.hw", "average-hw"],
+      ["Skill Summary", "skill-summary"],
+      ["assignment-final", "assignment-final"],
+      ["  --Weird__Name!! ", "weird-name"],
+      ["...", "group"]
+    ];
+    for (const [input, expected] of sqlSlugify) {
+      expect(slugForGroupName(input, [])).toBe(expected);
+      expect(groupSlugProblem(expected, [])).toBeNull();
+    }
+  });
+
   it("accepts a well-formed unused slug", () => {
     expect(groupSlugProblem("lab-reports", ["homework"])).toBeNull();
   });

@@ -5242,16 +5242,20 @@ final;`,
 
     const families: Array<(base: string) => boolean> = [
       (base) => base === "assignment-lab",
+      // The template's assignments are slugged assignment-N, so their columns share this base.
+      (base) => base === "assignment-assignment",
       (base) => base === "assignment-group",
       (base) => base === "assignment-individual",
       (base) => base === "exam",
       (base) => base === "quiz",
       (base) => base === "skill",
-      (base) => base.startsWith("derived-"),
+      (base) => ["meets", "approaching", "does"].includes(base),
       (base) => ["average.hw", "labs", "total"].includes(base),
       (base) => ["curve", "midterm"].includes(base),
       (base) => base === "attendance",
       (base) => base === "ai",
+      // assignment-final links to no assignment, so it routes to a group of its own.
+      (base) => base === "assignment-final",
       (base) => base === "final"
     ];
     const familyRank = (base: string) => {
