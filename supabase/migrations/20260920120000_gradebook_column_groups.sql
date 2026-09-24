@@ -317,7 +317,7 @@ CREATE POLICY "everyone in class can view column groups"
     public.authorizeforclassgrader(class_id)
     OR (
       public.authorizeforclass(class_id)
-      -- A group's name can be derived from a single column, so students see a
+      -- A group's name can describe work students cannot see yet, so students see a
       -- group only once it holds a column they could read under gradebook_columns RLS.
       AND EXISTS (
         SELECT 1 FROM public.gradebook_columns c
@@ -690,7 +690,8 @@ UPDATE public.gradebook_columns gc
 -- by its full slug, once it shares its header with anything else.
 CREATE TEMP TABLE _cg_c2b_targets AS
 SELECT b.column_id,
-       public._cg_create_group(b.gradebook_id, b.class_id, b.slug, b.name, b.slug) AS new_group_id
+       public._cg_create_group(b.gradebook_id, b.class_id, b.slug,
+                                public.gradebook_column_group_display_name(b.slug), b.slug) AS new_group_id
   FROM _cg_bare_assignment b
   JOIN public.gradebook_columns gc ON gc.id = b.column_id
  WHERE b.kind IS NULL
@@ -745,40 +746,12 @@ SELECT gradebook_id, class_id, dep_set,
  GROUP BY gradebook_id, class_id, dep_set
 HAVING count(*) > 1;
 
-CREATE OR REPLACE FUNCTION public._cg_common_name_prefix(p_names text[])
-RETURNS text
-LANGUAGE sql
-IMMUTABLE
-AS $$
-  WITH b AS (
-    SELECT min(n) AS lo, max(n) AS hi, array_length(p_names, 1) AS cnt
-      FROM unnest(p_names) AS t(n)
-  ),
-  l AS (
-    SELECT b.lo, b.cnt,
-           (SELECT COALESCE(max(i), 0)
-              FROM generate_series(1, least(length(b.lo), length(b.hi))) AS i
-             WHERE left(b.lo, i) = left(b.hi, i)) AS lcp
-      FROM b
-  )
-  SELECT CASE
-           WHEN l.cnt = 1 THEN NULLIF(btrim(l.lo), '')
-           WHEN l.cnt >= 2 AND l.lcp >= 3
-             THEN NULLIF(btrim(regexp_replace(left(l.lo, l.lcp), '[[:space:][:punct:]]*[0-9]*[[:space:][:punct:]]*$', '')), '')
-           ELSE NULL
-         END
-    FROM l;
-$$;
-
 CREATE TEMP TABLE _cg_c3_targets AS
 WITH scattered AS (
   SELECT c.*,
          (SELECT count(DISTINCT gc.gradebook_column_group_id)
             FROM public.gradebook_columns gc
            WHERE gc.id = ANY (c.column_ids)) AS groups_now,
-         (SELECT public._cg_common_name_prefix(array_agg(gc.name))
-            FROM public.gradebook_columns gc
-           WHERE gc.id = ANY (c.column_ids)) AS common_name,
          (SELECT CASE WHEN count(DISTINCT dep.gradebook_column_group_id) = 1
                       THEN max(dg.name) END
             FROM unnest(c.dep_set) AS d(dep_id)
@@ -792,9 +765,7 @@ SELECT unnest(s.column_ids) AS column_id,
        public._cg_ensure_group(
          s.gradebook_id, s.class_id,
          'derived-' || md5(s.dep_set::text),
-         COALESCE(NULLIF(s.dep_group_name, '') || ' Summary',
-                  s.common_name,
-                  'Computed'),
+         COALESCE(NULLIF(s.dep_group_name, '') || ' Summary', 'Computed'),
          NULL) AS new_group_id
   FROM scattered s
  WHERE s.groups_now > 1;
@@ -808,50 +779,6 @@ UPDATE public.gradebook_columns gc
    SET gradebook_column_group_id = t.new_group_id
   FROM _cg_c3_targets t
  WHERE gc.id = t.column_id;
-
-CREATE TEMP TABLE _cg_c4_renames AS
-WITH prefixes AS (
-  SELECT g.id AS group_id,
-         g.gradebook_id,
-         g.sort_order,
-         g.name AS current_name,
-         public._cg_common_name_prefix(array_agg(gc.name)) AS common_name
-    FROM public.gradebook_column_groups g
-    JOIN public.gradebook_columns gc ON gc.gradebook_column_group_id = g.id
-   WHERE NOT g.is_default
-     AND g.slug NOT IN ('assignment-lab', 'assignment-individual', 'assignment-group')
-   GROUP BY g.id, g.gradebook_id, g.sort_order, g.name
-),
-candidates AS (
-  SELECT p.*,
-         lower(regexp_replace(btrim(p.common_name), 's$', '')) AS norm,
-         ROW_NUMBER() OVER (
-           PARTITION BY p.gradebook_id, lower(regexp_replace(btrim(p.common_name), 's$', ''))
-           ORDER BY p.sort_order, p.group_id) AS claim_rank
-    FROM prefixes p
-   WHERE p.common_name IS NOT NULL
-     AND p.common_name IS DISTINCT FROM p.current_name
-)
-SELECT c.group_id, c.common_name
-  FROM candidates c
- WHERE c.claim_rank = 1
-   AND NOT EXISTS (
-     SELECT 1 FROM public.gradebook_column_groups o
-      WHERE o.gradebook_id = c.gradebook_id
-        AND o.id <> c.group_id
-        AND lower(regexp_replace(btrim(o.name), 's$', '')) = c.norm
-   );
-
-INSERT INTO public._cg_correction_ledger (column_id, correction)
-SELECT gc.id, 'C4 header renamed from the column names instead of the slug'
-  FROM _cg_c4_renames r
-  JOIN public.gradebook_columns gc ON gc.gradebook_column_group_id = r.group_id
-ON CONFLICT (column_id) DO NOTHING;
-
-UPDATE public.gradebook_column_groups g
-   SET name = r.common_name
-  FROM _cg_c4_renames r
- WHERE g.id = r.group_id;
 
 DELETE FROM public.gradebook_column_groups g
  WHERE NOT g.is_default
@@ -970,7 +897,6 @@ ALTER TABLE public.gradebook_columns DROP COLUMN sort_order;
 DROP FUNCTION IF EXISTS public._cg_route_group(bigint, bigint, text, text);
 DROP FUNCTION IF EXISTS public._cg_create_group(bigint, bigint, text, text, text);
 DROP FUNCTION IF EXISTS public._cg_ensure_group(bigint, bigint, text, text, text);
-DROP FUNCTION IF EXISTS public._cg_common_name_prefix(text[]);
 DROP TABLE IF EXISTS public._cg_correction_ledger;
 
 -- A new group is always appended, whatever sort_order the caller sent: the browser's
@@ -2136,203 +2062,6 @@ BEGIN
   PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || p_gradebook_id::text, 'false', true);
 END;
 $$;
-
-NOTIFY pgrst, 'reload schema';
-
-
--- ============================================================================
--- gradebook_column_group_naming
--- ============================================================================
-
-ALTER TABLE public.gradebook_column_groups
-  ADD COLUMN IF NOT EXISTS name_is_auto boolean NOT NULL DEFAULT true;
-
-COMMENT ON COLUMN public.gradebook_column_groups.name_is_auto IS
-  'True while the name is derived from the member column names. Set false by any hand edit, after which the derivation leaves it alone.';
-
-UPDATE public.gradebook_column_groups SET name_is_auto = true WHERE name_is_auto IS NULL;
-
--- The header a group's members suggest, or NULL. Only columns students may see count
--- (an instructor_only column's name must not leak through a header), and at least two
--- of them are needed: one member's full name is not a group name. The shared prefix is
--- cut back to a word boundary ("Home" is not a word of "Homework"), then trailing
--- numbering and punctuation are trimmed, and the result must be at least 3 characters.
--- min/max use COLLATE "C" so the shared prefix of the extremes is the shared prefix of all.
-CREATE OR REPLACE FUNCTION public.gradebook_column_group_common_name(p_group_id bigint)
-RETURNS text
-LANGUAGE sql
-STABLE
-SET search_path = public, pg_temp
-AS $$
-  WITH names AS (
-    SELECT name
-      FROM public.gradebook_columns
-     WHERE gradebook_column_group_id = p_group_id
-       AND NOT COALESCE(instructor_only, false)
-       AND name IS NOT NULL
-  ),
-  b AS (
-    SELECT min(name COLLATE "C") AS lo, max(name COLLATE "C") AS hi, count(*) AS cnt FROM names
-  ),
-  l AS (
-    SELECT b.lo,
-           (SELECT COALESCE(max(i), 0)
-              FROM generate_series(1, least(length(b.lo), length(b.hi))) AS i
-             WHERE left(b.lo, i) = left(b.hi, i)) AS lcp
-      FROM b
-     WHERE b.cnt >= 2
-  ),
-  p AS (
-    -- Back to the default collation: under "C", regex classes such as [[:alpha:]] may see only ASCII.
-    SELECT left(l.lo, l.lcp) COLLATE "default" AS prefix, l.lcp FROM l WHERE l.lcp > 0
-  ),
-  w AS (
-    SELECT CASE
-             WHEN EXISTS (
-               SELECT 1 FROM names n
-                WHERE length(n.name) > p.lcp
-                  AND (   (right(p.prefix, 1) ~ '[[:alpha:]]' AND substr(n.name, p.lcp + 1, 1) ~ '[[:alpha:]]')
-                       OR (right(p.prefix, 1) ~ '[0-9]'       AND substr(n.name, p.lcp + 1, 1) ~ '[0-9]')))
-             THEN CASE WHEN right(p.prefix, 1) ~ '[0-9]'
-                       THEN regexp_replace(p.prefix, '[0-9]+$', '')
-                       ELSE regexp_replace(p.prefix, '[[:alpha:]]+$', '')
-                  END
-             ELSE p.prefix
-           END AS prefix
-      FROM p
-  ),
-  t AS (
-    SELECT btrim(regexp_replace(w.prefix, '[[:space:][:punct:]]*[0-9]*[[:space:][:punct:]]*$', '')) AS name
-      FROM w
-  )
-  SELECT CASE WHEN length(t.name) >= 3 THEN t.name END FROM t;
-$$;
-
-REVOKE ALL ON FUNCTION public.gradebook_column_group_common_name(bigint) FROM PUBLIC, anon, authenticated;
-
--- Applies the derived name when it is an improvement. It never replaces a name with a
--- shorter one (dragging "Home Project" into "Homework" keeps "Homework") unless the current
--- name is empty or still the placeholder that slug routing or the backfill gave the group.
--- It also leaves the name alone when the derived one would read the same as another
--- group's header, singular or plural.
-CREATE OR REPLACE FUNCTION public.gradebook_column_group_refresh_name(p_group_id bigint)
-RETURNS void
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = public, pg_temp
-AS $$
-DECLARE
-  v_group public.gradebook_column_groups;
-  v_derived text;
-  v_current text;
-  v_placeholder boolean;
-BEGIN
-  SELECT * INTO v_group FROM public.gradebook_column_groups WHERE id = p_group_id;
-  IF v_group.id IS NULL OR v_group.is_default OR NOT v_group.name_is_auto THEN
-    RETURN;
-  END IF;
-
-  IF v_group.slug IN ('assignment-lab', 'assignment-individual', 'assignment-group')
-     OR v_group.auto_assign_slug_base IN ('assignment-lab', 'assignment-individual', 'assignment-group') THEN
-    RETURN;
-  END IF;
-
-  v_derived := public.gradebook_column_group_common_name(p_group_id);
-  IF v_derived IS NULL OR v_derived IS NOT DISTINCT FROM v_group.name THEN
-    RETURN;
-  END IF;
-
-  IF EXISTS (
-    SELECT 1 FROM public.gradebook_column_groups o
-     WHERE o.gradebook_id = v_group.gradebook_id
-       AND o.id <> p_group_id
-       AND lower(regexp_replace(btrim(o.name), 's$', ''))
-           = lower(regexp_replace(btrim(v_derived), 's$', ''))
-  ) THEN
-    RETURN;
-  END IF;
-
-  v_current := btrim(COALESCE(v_group.name, ''));
-  v_placeholder := COALESCE(
-    v_current = ''
-    OR lower(v_current) IN ('other', 'ungrouped')
-    OR lower(v_current) = lower(public.gradebook_column_group_display_name(v_group.auto_assign_slug_base))
-    OR lower(v_current) = lower(public.gradebook_column_group_display_name(v_group.slug))
-    OR lower(v_current) = lower(public.gradebook_column_group_display_name(
-                                  public.gradebook_column_base_group_name(v_group.slug))),
-    false);
-
-  IF NOT v_placeholder AND length(v_derived) < length(v_current) THEN
-    RETURN;
-  END IF;
-
-  -- Tells mark_manual_name this rename is the derivation, whatever the trigger depth.
-  PERFORM set_config('pawtograder.gradebook_group_auto_rename', 'on', true);
-  UPDATE public.gradebook_column_groups
-     SET name = v_derived
-   WHERE id = p_group_id AND name_is_auto;
-  PERFORM set_config('pawtograder.gradebook_group_auto_rename', 'off', true);
-END $$;
-
-REVOKE ALL ON FUNCTION public.gradebook_column_group_refresh_name(bigint) FROM PUBLIC, anon, authenticated;
-
-CREATE OR REPLACE FUNCTION public.gradebook_columns_refresh_group_name()
-RETURNS trigger
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = public, pg_temp
-AS $$
-BEGIN
-  -- instructor_only is in the trigger's column list because only visible columns name a group.
-  IF TG_OP IN ('INSERT', 'UPDATE') AND NEW.gradebook_column_group_id IS NOT NULL THEN
-    PERFORM public.gradebook_column_group_refresh_name(NEW.gradebook_column_group_id);
-  END IF;
-  IF TG_OP IN ('UPDATE', 'DELETE') AND OLD.gradebook_column_group_id IS NOT NULL
-     AND (TG_OP = 'DELETE' OR OLD.gradebook_column_group_id IS DISTINCT FROM NEW.gradebook_column_group_id) THEN
-    PERFORM public.gradebook_column_group_refresh_name(OLD.gradebook_column_group_id);
-  END IF;
-  RETURN NULL;
-END $$;
-
-DROP TRIGGER IF EXISTS gradebook_columns_refresh_group_name_tr ON public.gradebook_columns;
-CREATE TRIGGER gradebook_columns_refresh_group_name_tr
-  AFTER INSERT OR UPDATE OF name, gradebook_column_group_id, instructor_only OR DELETE ON public.gradebook_columns
-  FOR EACH ROW EXECUTE FUNCTION public.gradebook_columns_refresh_group_name();
-
-CREATE OR REPLACE FUNCTION public.gradebook_column_groups_mark_manual_name()
-RETURNS trigger
-LANGUAGE plpgsql
-SET search_path = public, pg_temp
-AS $$
-BEGIN
-  IF NEW.name IS DISTINCT FROM OLD.name
-     AND COALESCE(current_setting('pawtograder.gradebook_group_auto_rename', true), '') <> 'on' THEN
-    NEW.name_is_auto := false;
-  END IF;
-  RETURN NEW;
-END $$;
-
-DROP TRIGGER IF EXISTS gradebook_column_groups_mark_manual_name_tr ON public.gradebook_column_groups;
-CREATE TRIGGER gradebook_column_groups_mark_manual_name_tr
-  BEFORE UPDATE OF name ON public.gradebook_column_groups
-  FOR EACH ROW EXECUTE FUNCTION public.gradebook_column_groups_mark_manual_name();
-
--- Slug routing (_gradebook_column_group_for_slug) is redefined in 20260920120400, on top of
--- the shared helper _gradebook_column_group_slug_route that the Add Column preview also reads.
-
-ALTER TABLE public.gradebook_column_groups DISABLE TRIGGER broadcast_gradebook_column_groups_update;
-
-DO $$
-DECLARE
-  g record;
-BEGIN
-  FOR g IN SELECT id FROM public.gradebook_column_groups WHERE NOT is_default AND name_is_auto
-  LOOP
-    PERFORM public.gradebook_column_group_refresh_name(g.id);
-  END LOOP;
-END $$;
-
-ALTER TABLE public.gradebook_column_groups ENABLE TRIGGER broadcast_gradebook_column_groups_update;
 
 NOTIFY pgrst, 'reload schema';
 

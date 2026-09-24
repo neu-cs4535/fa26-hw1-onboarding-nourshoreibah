@@ -26,7 +26,6 @@ function group(id: number, name: string, sort_order: number, extra: Partial<Grad
     description: null,
     is_default: false,
     auto_assign_slug_base: null,
-    name_is_auto: true,
     ...extra
   } as GradebookColumnGroup;
 }

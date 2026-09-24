@@ -3591,7 +3591,6 @@ export type Database = {
           id: number;
           is_default: boolean;
           name: string;
-          name_is_auto: boolean;
           slug: string;
           sort_order: number;
           updated_at: string;
@@ -3605,7 +3604,6 @@ export type Database = {
           id?: number;
           is_default?: boolean;
           name: string;
-          name_is_auto?: boolean;
           slug: string;
           sort_order: number;
           updated_at?: string;
@@ -3619,7 +3617,6 @@ export type Database = {
           id?: number;
           is_default?: boolean;
           name?: string;
-          name_is_auto?: boolean;
           slug?: string;
           sort_order?: number;
           updated_at?: string;
@@ -13541,10 +13538,6 @@ export type Database = {
         Args: { p_slug: string };
         Returns: string;
       };
-      gradebook_column_group_common_name: {
-        Args: { p_group_id: number };
-        Returns: string;
-      };
       gradebook_column_group_delete: {
         Args: { p_group_id: number };
         Returns: undefined;
@@ -13564,10 +13557,6 @@ export type Database = {
           group_name: string;
           is_new: boolean;
         }[];
-      };
-      gradebook_column_group_refresh_name: {
-        Args: { p_group_id: number };
-        Returns: undefined;
       };
       gradebook_column_groups_reorder: {
         Args: {

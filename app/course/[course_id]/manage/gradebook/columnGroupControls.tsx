@@ -326,8 +326,7 @@ export function ColumnGroupDialog({
             gradebook_id: gradebookController.gradebook_id,
             name: trimmed,
             slug,
-            sort_order: nextSortOrder,
-            name_is_auto: false
+            sort_order: nextSortOrder
           })
           .select("id")
           .single();
