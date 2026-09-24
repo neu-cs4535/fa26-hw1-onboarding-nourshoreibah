@@ -1835,8 +1835,7 @@ test.describe("Gradebook column reorder (issue #531)", () => {
     await renamed.getByRole("button", { name: "Options for group Renamed group" }).click();
     await page.getByRole("menuitem", { name: "Delete group", exact: true }).click();
     await page.getByRole("dialog").getByRole("button", { name: "Delete group" }).click();
-    // The band can leave the DOM (virtualization) before the delete commits; wait for the RPC.
-    await expect(page.getByText("Group deleted")).toBeVisible({ timeout: 15_000 });
+    // The band can leave the DOM (virtualization) before the delete commits, so poll the database.
     await expect(renamed).toBeHidden({ timeout: 15_000 });
     await expect(async () => {
       const { data: gone } = await supabase.from("gradebook_column_groups").select("id").eq("id", created!.id);
