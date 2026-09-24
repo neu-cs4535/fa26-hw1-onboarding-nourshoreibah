@@ -1,7 +1,7 @@
 -- Down path for 20260920120000_gradebook_column_groups.sql.
 --
 -- Migrations here are forward-only, so this is a script to run by hand, not a migration. By
--- default it is a rehearsal: it adds a column whose expression names a group, runs both steps in
+-- default it is a rehearsal: it adds two totals inside their group, runs both steps in
 -- one transaction, checks each, and ends in ROLLBACK.
 --
 --   psql postgresql://postgres:postgres@127.0.0.1:54322/postgres \
@@ -47,17 +47,29 @@
 BEGIN;
 
 \if :rehearsal
-\echo '=== rehearsal fixture: a total that names a group ==='
-INSERT INTO public.gradebook_columns
-       (class_id, gradebook_id, name, slug, max_score, score_expression, dependencies)
-SELECT g.class_id, g.gradebook_id, 'Down path total', 'down-path-total', 100,
-       'mean(gradebook_column_group("' || g.slug || '"))',
-       jsonb_build_object('gradebook_column_groups', jsonb_build_array(g.id), 'gradebook_columns', '[]'::jsonb)
+\echo '=== rehearsal fixtures: two totals inside their group ==='
+CREATE TEMP TABLE _cg_down_fixture ON COMMIT DROP AS
+SELECT g.id AS group_id, g.gradebook_id, g.class_id,
+       'mean(gradebook_columns([' || string_agg(to_json(c.slug)::text, ', ' ORDER BY c.position_in_group, c.id) || ']))' AS expected
   FROM public.gradebook_column_groups g
+  JOIN public.gradebook_columns c ON c.gradebook_column_group_id = g.id
  WHERE NOT g.is_default
-   AND (SELECT count(*) FROM public.gradebook_columns c WHERE c.gradebook_column_group_id = g.id) >= 2
+   AND NOT COALESCE(c.dependencies -> 'gradebook_column_groups', '[]'::jsonb) @> jsonb_build_array(g.id)
+ GROUP BY g.id
+HAVING count(*) >= 2
  ORDER BY g.id
  LIMIT 1;
+DO $$ BEGIN
+  ASSERT EXISTS (SELECT 1 FROM _cg_down_fixture), 'seed a group with at least two regular members';
+END $$;
+INSERT INTO public.gradebook_columns
+       (class_id, gradebook_id, name, slug, max_score, score_expression, dependencies, gradebook_column_group_id)
+SELECT f.class_id, f.gradebook_id, 'Down path total ' || n, 'down-path-total-' || n, 100,
+       'mean(gradebook_column_group("' || g.slug || '"))',
+       jsonb_build_object('gradebook_column_groups', jsonb_build_array(g.id)), g.id
+  FROM _cg_down_fixture f
+  JOIN public.gradebook_column_groups g ON g.id = f.group_id
+ CROSS JOIN generate_series(1, 2) n;
 \endif
 
 \if :run_step_1
@@ -65,6 +77,12 @@ SELECT g.class_id, g.gradebook_id, 'Down path total', 'down-path-total', 100,
 -- ============================================================================
 -- Step 1: revert behavior, keep the group data
 -- ============================================================================
+
+-- Freeze membership before removing group references from any expression. Otherwise the
+-- next total would count a previous total after we removed its group dependency.
+CREATE TEMP TABLE _cg_down_columns ON COMMIT DROP AS SELECT * FROM public.gradebook_columns;
+DROP TRIGGER IF EXISTS gradebook_columns_merge_group_dependencies_tr ON public.gradebook_columns;
+DROP TRIGGER IF EXISTS gradebook_columns_sync_group_dependents_update ON public.gradebook_columns;
 
 \echo '=== 1a. expressions that name a group now name its members ==='
 -- gradebook_column_group("s") becomes gradebook_columns(["m1", "m2", ...]): the members the
@@ -93,9 +111,9 @@ BEGIN
         'gradebook_column_group\s*\(\s*(?:"' || regexp_replace(v_list, '([^a-zA-Z0-9])', '\\\1', 'g')
           || '"|''' || regexp_replace(v_list, '([^a-zA-Z0-9])', '\\\1', 'g') || ''')\s*\)',
         'gradebook_columns([' || COALESCE((
-          SELECT string_agg('"' || m.slug || '"', ', ' ORDER BY m.position_in_group, m.id)
+          SELECT string_agg(to_json(m.slug)::text, ', ' ORDER BY m.position_in_group, m.id)
             FROM public.gradebook_column_groups g
-            JOIN public.gradebook_columns m ON m.gradebook_column_group_id = g.id
+            JOIN _cg_down_columns m ON m.gradebook_column_group_id = g.id
            WHERE g.gradebook_id = r.gradebook_id
              AND g.slug = v_list
              AND m.id <> r.id
@@ -877,9 +895,6 @@ CREATE TRIGGER gradebook_columns_enforce_sort_order_tr BEFORE INSERT OR UPDATE O
 DO $$
 DECLARE
   v_bad integer;
-  v_col bigint;
-  v_class bigint;
-  v_gradebook bigint;
 BEGIN
   SELECT count(*) INTO v_bad FROM public.gradebook_columns WHERE sort_order IS NULL;
   ASSERT v_bad = 0, format('%s columns without a sort_order', v_bad);
@@ -899,24 +914,30 @@ BEGIN
      AND (SELECT prosrc FROM pg_proc WHERE proname = 'gradebook_column_move_left') !~ 'position_in_group',
     'gradebook_column_move_left still has the new body';
 
-  -- The previous code path: a column inserted with no group gets the next sort_order.
+  RAISE NOTICE 'step 1 holds: dense sort_order in the current order, old bodies restored';
+END $$;
+
+\if :rehearsal
+DO $$
+DECLARE v_col bigint; v_class bigint; v_gradebook bigint;
+BEGIN
+  -- Check the old insert path without adding a fixture during a real rollback.
   SELECT class_id, id INTO v_class, v_gradebook FROM public.gradebooks ORDER BY id LIMIT 1;
   INSERT INTO public.gradebook_columns (class_id, gradebook_id, name, slug, max_score)
   VALUES (v_class, v_gradebook, 'Down path', 'down-path-1', 10) RETURNING id INTO v_col;
   ASSERT (SELECT sort_order FROM public.gradebook_columns WHERE id = v_col)
        = (SELECT max(sort_order) FROM public.gradebook_columns WHERE gradebook_id = v_gradebook),
     'a new column did not get the last sort_order';
-  RAISE NOTICE 'step 1 holds: dense sort_order in the current order, old bodies back, old insert path works';
+  RAISE NOTICE 'old insert path works';
 END $$;
 
-\if :rehearsal
 DO $$
-DECLARE v_expr text;
+DECLARE v_count integer;
 BEGIN
-  SELECT score_expression INTO v_expr FROM public.gradebook_columns WHERE slug = 'down-path-total';
-  ASSERT v_expr ~ '^mean\(gradebook_columns\(\["[^"]+"(, "[^"]+")+\]\)\)$',
-    format('the rehearsal total was rewritten to %s', v_expr);
-  RAISE NOTICE 'rehearsal total now reads %', v_expr;
+  SELECT count(*) INTO v_count
+    FROM public.gradebook_columns c JOIN _cg_down_fixture f ON f.gradebook_id = c.gradebook_id
+   WHERE c.slug IN ('down-path-total-1', 'down-path-total-2') AND c.score_expression = f.expected;
+  ASSERT v_count = 2, 'rollback changed the inputs of a total inside its group';
 END $$;
 \endif
 \endif

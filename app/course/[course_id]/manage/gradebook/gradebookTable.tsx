@@ -3028,17 +3028,15 @@ export default function GradebookTable() {
         if (typeof version === "number") gradebookController.setLayoutVersion(version);
       };
       try {
-        try {
-          await saveAndRecordVersion();
-        } catch (e) {
-          // Someone else changed the layout between our read and our write: take their version and retry once.
-          if (!isLayoutConflict(e)) throw e;
-          await gradebookController.reconcileLayout();
-          await saveAndRecordVersion();
-        }
+        await saveAndRecordVersion();
       } catch (e) {
         rollbacks.forEach((rollback) => rollback());
-        toaster.error({ title: opts.failureTitle, description: describeError(e) });
+        toaster.error({
+          title: opts.failureTitle,
+          description: isLayoutConflict(e)
+            ? "Another instructor changed the layout. Review the refreshed order and try your move again."
+            : describeError(e)
+        });
       } finally {
         // Held until the reload lands: a reload read before a later drag committed would otherwise
         // replace that drag's optimistic rows and move its column back until its own reload.

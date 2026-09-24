@@ -137,6 +137,53 @@ BEGIN
   END;
 END $$;
 
+\echo '=== changing an existing member between a total and a manual column ==='
+INSERT INTO public.gradebook_columns
+  (class_id, gradebook_id, name, slug, max_score, score_expression, dependencies, gradebook_column_group_id)
+SELECT class_id, gradebook_id, 'Second total', 'harness-second-total', 100,
+       'mean(gradebook_column_group("harness-homework"))',
+       jsonb_build_object('gradebook_column_groups', jsonb_build_array(group_id)), group_id
+  FROM fx;
+
+DO $$
+DECLARE f record; v_second bigint;
+BEGIN
+  SELECT * INTO f FROM fx;
+  SELECT id INTO v_second FROM public.gradebook_columns
+   WHERE gradebook_id = f.gradebook_id AND slug = 'harness-second-total';
+  ASSERT NOT COALESCE((SELECT dependencies -> 'gradebook_columns' FROM public.gradebook_columns WHERE id = f.total_id), '[]'::jsonb)
+             @> jsonb_build_array(v_second), 'a total counted another total';
+
+  UPDATE public.gradebook_columns SET score_expression = NULL, dependencies = NULL WHERE id = v_second;
+  ASSERT (SELECT dependencies -> 'gradebook_columns' FROM public.gradebook_columns WHERE id = f.total_id)
+             @> jsonb_build_array(v_second), 'the former total did not become a dependency';
+
+  UPDATE public.gradebook_columns
+     SET score_expression = 'mean(gradebook_column_group("harness-homework"))',
+         dependencies = jsonb_build_object('gradebook_column_groups', jsonb_build_array(f.group_id))
+   WHERE id = v_second;
+  ASSERT NOT (SELECT dependencies -> 'gradebook_columns' FROM public.gradebook_columns WHERE id = f.total_id)
+             @> jsonb_build_array(v_second), 'converting a member to a total left its old dependency';
+END $$;
+
+\echo '=== reordering members enqueues group expressions ==='
+UPDATE public.gradebook_row_recalc_state s SET dirty = false FROM fx WHERE s.gradebook_id = fx.gradebook_id;
+UPDATE public.gradebook_columns c SET position_in_group = 0 FROM fx
+ WHERE c.id = fx.existing_column_id;
+DO $$
+DECLARE f record; v_expected integer; v_dirty integer;
+BEGIN
+  SELECT * INTO f FROM fx;
+  SELECT count(DISTINCT (student_id, is_private)) INTO v_expected
+    FROM public.gradebook_column_students WHERE gradebook_column_id = f.total_id;
+  SELECT count(*) INTO v_dirty FROM public.gradebook_row_recalc_state s
+   WHERE s.gradebook_id = f.gradebook_id AND s.dirty
+     AND EXISTS (SELECT 1 FROM public.gradebook_column_students c
+                  WHERE c.gradebook_column_id = f.total_id AND c.student_id = s.student_id
+                    AND c.is_private = s.is_private);
+  ASSERT v_expected > 0 AND v_dirty = v_expected, 'member reordering did not enqueue the dependent rows';
+END $$;
+
 \echo '=== 4. referenced slugs and groups are protected ==='
 DO $$
 DECLARE f record;
