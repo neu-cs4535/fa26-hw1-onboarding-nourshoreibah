@@ -3605,7 +3605,7 @@ export type Database = {
           is_default?: boolean;
           name: string;
           slug: string;
-          sort_order: number;
+          sort_order?: number;
           updated_at?: string;
         };
         Update: {
@@ -11860,6 +11860,10 @@ export type Database = {
         Args: { p_class_id: number; p_gradebook_id: number; p_slug: string };
         Returns: number;
       };
+      _gradebook_column_group_free_slug: {
+        Args: { p_base: string; p_gradebook_id: number };
+        Returns: string;
+      };
       _gradebook_column_group_slug_route: {
         Args: { p_class_id: number; p_slug: string };
         Returns: Record<string, unknown>;
@@ -13505,34 +13509,13 @@ export type Database = {
         Returns: undefined;
       };
       gradebook_column_assign_group: {
-        Args: { p_column_id: number; p_group_id: number; p_position?: number };
-        Returns: {
-          class_id: number;
-          created_at: string;
-          dependencies: Json | null;
-          description: string | null;
-          external_data: Json | null;
-          gradebook_column_group_id: number;
-          gradebook_id: number;
-          id: number;
-          instructor_only: boolean;
-          max_score: number | null;
-          name: string;
-          position_in_group: number;
-          released: boolean;
-          render_expression: string | null;
-          score_expression: string | null;
-          show_calculated_ranges: boolean;
-          show_max_score: boolean;
-          slug: string;
-          updated_at: string;
+        Args: {
+          p_column_id: number;
+          p_expected_version?: number;
+          p_group_id: number;
+          p_position?: number;
         };
-        SetofOptions: {
-          from: "*";
-          to: "gradebook_columns";
-          isOneToOne: true;
-          isSetofReturn: false;
-        };
+        Returns: number;
       };
       gradebook_column_base_group_name: {
         Args: { p_slug: string };
@@ -13550,6 +13533,10 @@ export type Database = {
         Args: { p_class_id: number; p_gradebook_id: number; p_slug: string };
         Returns: number;
       };
+      gradebook_column_group_generated_names: {
+        Args: { p_base: string };
+        Returns: string[];
+      };
       gradebook_column_group_preview_for_slug: {
         Args: { p_class_id: number; p_gradebook_id: number; p_slug: string };
         Returns: {
@@ -13557,6 +13544,14 @@ export type Database = {
           group_name: string;
           is_new: boolean;
         }[];
+      };
+      gradebook_column_group_slugify: {
+        Args: { p_text: string };
+        Returns: string;
+      };
+      gradebook_column_group_unlinked_assignment_name: {
+        Args: { p_slug: string };
+        Returns: string;
       };
       gradebook_column_groups_reorder: {
         Args: {

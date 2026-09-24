@@ -91,11 +91,11 @@ BEGIN
      AND EXISTS (SELECT 1 FROM public.gradebook_column_students g
                   WHERE g.gradebook_column_id = f.total_id AND g.student_id = s.student_id
                     AND g.is_private = s.is_private);
-  -- A new column's cells start NULL and group functions ignore NULLs, so joining by INSERT
-  -- changes no dependent's score and enqueues nothing. Section 1 below covers a move, which does.
+  -- A new column's cells start NULL, but countif counts every member it is given, so even an
+  -- empty join can change a dependent's score. Every dependent row is enqueued.
   ASSERT v_students > 0, 'fixture total has no student rows';
-  ASSERT v_dirty = 0, format('%s of %s dependent rows enqueued by an empty join', v_dirty, v_students);
-  RAISE NOTICE 'appended %, enqueued none of % rows for an empty new column', v_hw1, v_students;
+  ASSERT v_dirty = v_students, format('%s of %s dependent rows enqueued by a join by insert', v_dirty, v_students);
+  RAISE NOTICE 'appended %, enqueued all % dependent rows for an empty new column', v_hw1, v_students;
 END $$;
 
 \echo '=== 1. an existing column moves into the group ==='
